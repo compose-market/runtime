@@ -1,0 +1,39 @@
+{
+    "name": "manowar-server",
+    "version": "0.1.0",
+    "description": "Manowar Agent Orchestration Server - Agent execution and workflow management",
+    "type": "module",
+    "main": "dist/server.js",
+    "scripts": {
+        "dev": "npx tsx watch src/server.ts",
+        "build": "tsc",
+        "start": "node dist/server.js",
+        "clean": "rm -rf dist"
+    },
+    "dependencies": {
+        "@ai-sdk/openai-compatible": "^1.0.29",
+        "@google/genai": "^1.33.0",
+        "@huggingface/inference": "^4.13.5",
+        "@langchain/core": "^1.1.5",
+        "@langchain/langgraph": "^1.0.5",
+        "@langchain/langgraph-checkpoint": "^1.0.0",
+        "@langchain/openai": "^1.2.0",
+        "@langchain/textsplitters": "^1.0.1",
+        "cors": "^2.8.5",
+        "dotenv": "^17.2.3",
+        "express": "^5.2.1",
+        "langchain": "^1.2.0",
+        "mem0ai": "^2.1.38",
+        "thirdweb": "^5.116.1",
+        "viem": "^2.42.1",
+        "zod": "^4.2.0",
+        "zod-to-json-schema": "^3.25.0"
+    },
+    "devDependencies": {
+        "@types/cors": "^2.8.19",
+        "@types/express": "^5.0.6",
+        "@types/node": "^25.0.2",
+        "tsx": "^4.21.0",
+        "typescript": "^5.9.3"
+    }
+}
