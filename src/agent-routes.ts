@@ -98,7 +98,7 @@ router.post(
         const params = parseResult.data;
 
         try {
-            // walletAddress from request is the source of truth (from IPFS metadata)
+            // The walletAddress is derived from dnaHash and must match frontend derivation.
             const agent = await registerAgent({
                 walletAddress: params.walletAddress, // From IPFS metadata
                 walletTimestamp: params.walletTimestamp, // Optional - for signing capability
@@ -359,18 +359,28 @@ router.post(
             return;
         }
 
+
         // Extract user address from session/payment headers
         // x-session-user-address is populated by the Thirdweb client wrapper
         const userId = req.headers["x-session-user-address"] as string | undefined;
 
+        // Extract session headers for tool execution
+        const sessionActive = req.headers["x-session-active"] === "true";
+        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
+
         // Execute agent
-        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarId || 'none'}]`);
+        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarId || 'none'}, Session: ${sessionActive}]`);
 
         const result = await executeAgent(instance.id, message, {
             threadId,
             userId,
-            manowarId
+            manowarId,
+            sessionContext: {
+                sessionActive,
+                sessionBudgetRemaining
+            }
         });
+
         markAgentExecuted(identifier);
 
         res.json({

@@ -229,11 +229,16 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
 
     // Create LangChain runtime instance with selected plugins
     // Wallet is optional - chat works without it
+    // Model comes from blockchain metadata
+    if (!params.model) {
+        throw new Error(`Model is required for agent ${params.name}`);
+    }
+
     const config = {
         name: params.name,
         agentId,
         wallet, // May be undefined - that's OK for chat
-        model: params.model || "gpt-4o-mini",
+        model: params.model,
         plugins: params.plugins || [],
         systemPrompt: enhancedPrompt,
         memory: true,
