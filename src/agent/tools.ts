@@ -46,11 +46,13 @@ function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> 
  * 
  * @param pluginIds Plugin IDs to load (e.g. ["goat:coingecko", "mcp:github"])
  * @param agentWallet Agent wallet context
+ * @param sessionContext Session context for payment headers
  * @returns Array of LangChain DynamicStructuredTool instances
  */
 export async function createAgentTools(
     pluginIds: string[],
-    agentWallet?: AgentWallet
+    agentWallet?: AgentWallet,
+    sessionContext?: { sessionActive: boolean; sessionBudgetRemaining: number }
 ): Promise<DynamicStructuredTool[]> {
     if (!pluginIds || pluginIds.length === 0) return [];
 
@@ -58,13 +60,26 @@ export async function createAgentTools(
 
     for (const pluginId of pluginIds) {
         try {
-            // Parse plugin ID format: "goat:coingecko" or "mcp:github"
-            let [source, id] = pluginId.split(":");
+            // Normalize plugin ID to extract source and ID
+            // Supports: "goat-coingecko", "goat:coingecko", "goat:goat-coingecko", "coingecko"
+            //           "mcp-github", "mcp:github", "github"
+            let source = "goat"; // Default source
+            let id = pluginId;
 
-            // Strip "goat-" prefix if present (legacy format compatibility)
-            if (source === "goat" && id.startsWith("goat-")) {
-                id = id.substring(5); // Remove "goat-" prefix
+            // Strip ALL goat/mcp prefixes (handles double-prefix edge cases like "goat:goat-coingecko")
+            // Keep stripping until no more prefixes found
+            while (id.startsWith("goat-") || id.startsWith("goat:") ||
+                id.startsWith("mcp-") || id.startsWith("mcp:")) {
+                if (id.startsWith("goat-") || id.startsWith("goat:")) {
+                    source = "goat";
+                    id = id.replace(/^goat[-:]/, "");
+                } else if (id.startsWith("mcp-") || id.startsWith("mcp:")) {
+                    source = "mcp";
+                    id = id.replace(/^mcp[-:]/, "");
+                }
             }
+
+            console.log(`[createAgentTools] Normalized "${pluginId}" → source="${source}", id="${id}"`);
 
             if (source === "goat") {
                 // Fetch GOAT plugin tools from MCP service
@@ -85,11 +100,28 @@ export async function createAgentTools(
                         schema: toolDef.parameters ? createZodSchema(toolDef.parameters) : z.object({}),
                         func: async (args: Record<string, unknown>) => {
                             // Call MCP service to execute the tool
+                            const headers: Record<string, string> = {
+                                "Content-Type": "application/json"
+                            };
+
+                            // Forward session headers if available
+                            if (sessionContext?.sessionActive) {
+                                headers["x-session-active"] = "true";
+                                headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
+                            }
+
+                            // Add internal bypass header (user already paid for this conversation)
+                            const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
+                            headers["x-manowar-internal"] = MANOWAR_INTERNAL_SECRET;
+
+                            // Phase 1: Add pricing metadata for usage tracking
+                            headers["x-tool-price"] = "1000"; // $0.001 default
+
                             const execResponse = await fetch(
                                 `${MCP_SERVICE_URL}/goat/plugins/${id}/tools/${toolDef.name}`,
                                 {
                                     method: "POST",
-                                    headers: { "Content-Type": "application/json" },
+                                    headers,
                                     body: JSON.stringify({ args }),
                                 }
                             );
@@ -124,11 +156,28 @@ export async function createAgentTools(
                         schema: toolDef.inputSchema ? createZodSchema(toolDef.inputSchema) : z.object({}),
                         func: async (args: Record<string, unknown>) => {
                             // Call MCP service to execute the tool
+                            const headers: Record<string, string> = {
+                                "Content-Type": "application/json"
+                            };
+
+                            // Forward session headers if available
+                            if (sessionContext?.sessionActive) {
+                                headers["x-session-active"] = "true";
+                                headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
+                            }
+
+                            // Add internal bypass header (user already paid for this conversation)
+                            const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
+                            headers["x-manowar-internal"] = MANOWAR_INTERNAL_SECRET;
+
+                            // Phase 1: Add pricing metadata for usage tracking
+                            headers["x-tool-price"] = "1000"; // $0.001 default
+
                             const execResponse = await fetch(
                                 `${MCP_SERVICE_URL}/mcp/servers/${id}/tools/${toolDef.name}`,
                                 {
                                     method: "POST",
-                                    headers: { "Content-Type": "application/json" },
+                                    headers,
                                     body: JSON.stringify({ args }),
                                 }
                             );

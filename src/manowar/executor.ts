@@ -21,9 +21,6 @@ import type {
     ExecutorOptions,
     PaymentContext,
 } from "./types.js";
-import { MANOWAR_PRICES } from "./types.js";
-// NOTE: GOAT tool execution now happens via MCP service HTTP API
-// import { executeGoatTool, getPluginIds } from "../compose-runtime/runtimes/goat.js";
 import { fetchManowarOnchain } from "../onchain.js";
 
 // =============================================================================
@@ -160,12 +157,14 @@ function createMcpTool(connectorId: string, toolName: string, description: strin
         func: async ({ args }) => {
             const input = args || {};
             try {
-                // Call MCP service to execute the tool
                 const response = await fetch(
                     `${MCP_URL}/runtime/execute`,
                     {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: {
+                            "Content-Type": "application/json",
+                            "x-tool-price": "1000", // $0.001 default
+                        },
                         body: JSON.stringify({
                             source: connectorId.startsWith("mcp") ? "mcp" : "goat",
                             pluginId: connectorId,
@@ -220,7 +219,8 @@ function createAgentDelegationTool(
                 // Use internal secret to bypass x402 for nested calls (orchestration fee covers them)
                 const headers: Record<string, string> = {
                     "Content-Type": "application/json",
-                    "x-manowar-internal": "manowar-internal-v1-secret", // Internal bypass
+                    "x-manowar-internal": "manowar-internal-v1-secret",
+                    "x-tool-price": "2000", // $0.002 delegation fee
                 };
                 if (paymentContext.paymentData) {
                     headers["x-payment"] = paymentContext.paymentData;
@@ -608,7 +608,7 @@ ${dependencies.join("\n")}`;
                         content: m.content?.toString() || "",
                     })),
                 },
-                totalCostWei: MANOWAR_PRICES.ORCHESTRATION,
+                totalCostWei: "10000", // $0.01 orchestration fee
             };
 
             console.log(`[manowar] Workflow complete in ${Date.now() - this.startTime}ms`);

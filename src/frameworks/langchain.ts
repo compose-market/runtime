@@ -36,7 +36,12 @@ export interface AgentConfig {
   // Identity Context
   userId?: string;    // The user interacting with the agent
   manowarId?: string; // The workflow context (if any)
+  sessionContext?: {  // Session for payment
+    sessionActive: boolean;
+    sessionBudgetRemaining: number;
+  };
 }
+
 
 export interface AgentInstance {
   id: string;
@@ -206,9 +211,14 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
   //  1. Prepare Tools from on-chain plugins (GOAT + MCP + Eliza via Compose Runtime)
-  const composeTools = await createAgentTools(config.plugins || [], config.wallet);
+  const composeTools = await createAgentTools(
+    config.plugins || [],
+    config.wallet,
+    config.sessionContext  // Pass session context for tool execution
+  );
   const memTools = createMem0Tools(id, config.userId, config.manowarId);
   const tools = [...composeTools, ...memTools];
+
 
   // 2. Prepare Model - use model from on-chain metadata (NO FALLBACKS)
   // Use async factory to fetch dynamic config from Lambda
@@ -253,7 +263,12 @@ export interface ExecuteOptions {
   threadId?: string;
   userId?: string;
   manowarId?: string;
+  sessionContext?: {
+    sessionActive: boolean;
+    sessionBudgetRemaining: number;
+  };
 }
+
 
 export async function executeAgent(
   agentId: string,
@@ -273,6 +288,19 @@ export async function executeAgent(
   const start = Date.now();
 
   try {
+    // Update agent config with session context if provided
+    if (opts.sessionContext && agent.config) {
+      agent.config.sessionContext = opts.sessionContext;
+      // Recreate tools with session context
+      const composeTools = await createAgentTools(
+        agent.config.plugins || [],
+        agent.config.wallet,
+        opts.sessionContext
+      );
+      const memTools = createMem0Tools(agentId, opts.userId, opts.manowarId);
+      agent.tools = [...composeTools, ...memTools];
+    }
+
     // Setup Callbacks (Mem0) with full identity context
     const mem0Handler = new Mem0CallbackHandler(agentId, threadId, userId, manowarId);
 
