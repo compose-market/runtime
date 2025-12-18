@@ -58,12 +58,12 @@ const thirdwebFacilitator = serverClient && SERVER_WALLET_ADDRESS
 // =============================================================================
 
 export const DEFAULT_PRICES = {
-  MCP_TOOL_CALL: "1000",      // $0.001
-  GOAT_EXECUTE: "1000",       // $0.001
-  ELIZA_MESSAGE: "1000",      // $0.001
-  ELIZA_ACTION: "1000",       // $0.001
-  WORKFLOW_RUN: "10000",      // $0.01
-  AGENT_CHAT: "5000",         // $0.005 per message
+  MCP_TOOL_CALL: "1000",        // $0.001
+  GOAT_EXECUTE: "1000",         // $0.001  
+  ELIZA_MESSAGE: "1000",        // $0.001
+  ELIZA_ACTION: "2000",         // $0.002
+  WORKFLOW_RUN: "10000",        // $0.01
+  AGENT_CHAT: "5000",           // $0.005
 } as const;
 
 // =============================================================================

@@ -3,14 +3,6 @@ import { createThirdwebClient } from "thirdweb";
 
 import { extractPaymentInfo, buildPaymentRequiredHeaders, handleX402Payment } from "./payment.js";
 
-// Initialize Thirdweb Client
-const client = createThirdwebClient({
-    clientId: process.env.NEXT_PUBLIC_THIRDWEB_CLIENT_ID || process.env.THIRDWEB_CLIENT_ID || "",
-    secretKey: process.env.THIRDWEB_SECRET_KEY || "",
-});
-
-// Initialize Server Wallet (Facilitator)
-// This must be an ERC4337 Smart Account for x402 to work as a facilitator
 
 
 /**

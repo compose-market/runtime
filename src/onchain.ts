@@ -375,6 +375,12 @@ export async function buildManowarWorkflow(manowarId: number): Promise<{
         if (metadata?.walletAddress && !hasAgent(metadata.walletAddress)) {
             try {
                 console.log(`[onchain] Auto-registering agent ${metadata.name || agentId} (${metadata.walletAddress})...`);
+
+                // Model comes from blockchain metadata
+                if (!metadata.model) {
+                    throw new Error(`Agent ${metadata.name || agentId} has no model specified in blockchain metadata`);
+                }
+
                 await registerAgent({
                     dnaHash: agentData.dnaHash as `0x${string}`,
                     walletAddress: metadata.walletAddress,
@@ -382,7 +388,7 @@ export async function buildManowarWorkflow(manowarId: number): Promise<{
                     description: metadata.description || "",
                     agentCardUri: agentData.agentCardUri,
                     creator: "0x0000000000000000000000000000000000000000", // Unknown creator
-                    model: metadata.model || "gpt-4o-mini",
+                    model: metadata.model,
                     plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
                     systemPrompt: (metadata as any).systemPrompt,
                 });
