@@ -69,7 +69,8 @@ export function createAgentGraph(
     })();
 
     // Bind tools to model
-    // Note: model must support bindTools (ChatOpenAI does)
+    // For vLLM compatibility: don't specify tool_choice to avoid "auto tool choice requires --enable-auto-tool-choice" error
+    // The agent's system prompt instructs it when to use tools - LLM reasoning handles tool selection
     const modelWithTools = model.bindTools(tools);
 
     // DEBUG: Check if tools were bound - properly inspect the object
@@ -79,6 +80,8 @@ export function createAgentGraph(
     if (modelWithTools.kwargs) {
         console.log(`[DEBUG] kwargs.tools exists:`, !!modelWithTools.kwargs.tools);
         console.log(`[DEBUG] kwargs.tools length:`, modelWithTools.kwargs.tools?.length || 0);
+        // Check if tool_choice is being set
+        console.log(`[DEBUG] kwargs.tool_choice:`, modelWithTools.kwargs.tool_choice || 'not set');
     }
 
     const toolNode = new ToolNode(tools);

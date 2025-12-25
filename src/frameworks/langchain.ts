@@ -10,8 +10,10 @@
  */
 
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import fs from "fs";
 import path from "path";
 
@@ -153,10 +155,22 @@ function inferLocalConfig(modelId: string): RemoteModelConfig {
   return { baseURL: "https://router.huggingface.co/v1", apiKeyEnv: "HUGGING_FACE_INFERENCE_TOKEN", source: "huggingface" };
 }
 
-export function createModel(modelName: string, temperature: number = 0.7): ChatOpenAI {
+export function createModel(modelName: string, temperature: number = 0.7): BaseChatModel {
 
   const config = inferLocalConfig(modelName);
   const apiKey = process.env[config.apiKeyEnv || ""] || "";
+
+  // Use ChatGoogleGenerativeAI for Gemini models - it properly handles Gemini's function calling format
+  if (config.source === "google") {
+    console.log(`[LangChain] Creating Gemini model: ${modelName}`);
+    return new ChatGoogleGenerativeAI({
+      model: modelName,
+      temperature,
+      apiKey,
+      // Gemini-specific options for better tool calling
+      convertSystemMessageToHumanContent: true,
+    });
+  }
 
   const modelKwargs: any = {};
 
@@ -176,9 +190,20 @@ export function createModel(modelName: string, temperature: number = 0.7): ChatO
 }
 
 // Async version to be used in createAgent
-export async function createModelAsync(modelName: string, temperature: number = 0.7): Promise<ChatOpenAI> {
+export async function createModelAsync(modelName: string, temperature: number = 0.7): Promise<BaseChatModel> {
   const config = await fetchModelConfig(modelName);
   const apiKey = process.env[config.apiKeyEnv || ""] || "";
+
+  // Use ChatGoogleGenerativeAI for Gemini models - it properly handles Gemini's function calling format
+  if (config.source === "google") {
+    console.log(`[LangChain] Creating Gemini model (async): ${modelName}`);
+    return new ChatGoogleGenerativeAI({
+      model: modelName,
+      temperature,
+      apiKey,
+      convertSystemMessageToHumanContent: true,
+    });
+  }
 
   const modelKwargs: any = {};
   if (config.source === "asi-cloud") {
@@ -317,13 +342,51 @@ export async function executeAgent(
     // Parse Result
     const messages = result.messages || [];
     const lastMsg = messages[messages.length - 1];
-    const output = lastMsg?.content?.toString() || "";
+
+    // Handle different content formats (Gemini returns content as array of parts, OpenAI as string)
+    let output = "";
+    if (lastMsg?.content) {
+      if (typeof lastMsg.content === "string") {
+        output = lastMsg.content;
+      } else if (Array.isArray(lastMsg.content)) {
+        // Gemini/multimodal format: array of { type: "text", text: "..." } parts
+        output = lastMsg.content
+          .map((part: any) => {
+            if (typeof part === "string") return part;
+            if (part.type === "text") return part.text;
+            if (part.text) return part.text;
+            return JSON.stringify(part);
+          })
+          .join("");
+      } else if (typeof lastMsg.content === "object") {
+        // Fallback: stringify the object
+        output = JSON.stringify(lastMsg.content);
+      }
+    }
 
     console.log(`[LangChain] Finished in ${Date.now() - start}ms. Output: ${output.substring(0, 100)}...`);
 
+    // Also fix message content parsing for the response
     return {
       success: true,
-      messages: messages.map((m: any) => ({ role: m._getType(), content: m.content.toString() })),
+      messages: messages.map((m: any) => {
+        let content = "";
+        if (typeof m.content === "string") {
+          content = m.content;
+        } else if (Array.isArray(m.content)) {
+          content = m.content
+            .map((part: any) => {
+              if (typeof part === "string") return part;
+              if (part.type === "text") return part.text;
+              if (part.text) return part.text;
+              return JSON.stringify(part);
+            })
+            .join("");
+        } else if (m.content) {
+          content = JSON.stringify(m.content);
+        }
+        return { role: m._getType?.() || "unknown", content };
+      }),
       output,
       executionTime: Date.now() - start
     };

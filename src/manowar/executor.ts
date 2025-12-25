@@ -537,7 +537,7 @@ ${dependencies.join("\n")}`;
             // Create coordinator model - import createModel from langchain.ts
             const { createModel } = await import("../frameworks/langchain.js");
             const model = createModel(coordinatorModel, 0.3); // Lower temp for deterministic coordination
-            const modelWithTools = model.bindTools(tools);
+            const modelWithTools = (model as any).bindTools(tools);
 
             // Create tool node
             const toolNode = new ToolNode(tools);
