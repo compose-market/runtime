@@ -138,14 +138,17 @@ export async function createAgentTools(
                     tools.push(tool);
                 }
             } else if (source === "mcp") {
-                // Fetch MCP server tools
+                // Make single request - MCP server and connector handle flexible resolution
+                console.log(`[createAgentTools] Fetching tools for MCP server "${id}"`);
+
                 const response = await fetch(`${MCP_SERVICE_URL}/mcp/servers/${id}/tools`);
                 if (!response.ok) {
-                    console.warn(`[createAgentTools] MCP server ${id} not found`);
+                    console.warn(`[createAgentTools] ✗ MCP server "${id}" returned ${response.status}`);
                     continue;
                 }
 
                 const serverData = await response.json();
+                console.log(`[createAgentTools] ✓ Found MCP server "${id}" with ${serverData.tools?.length || 0} tools`);
                 const serverTools = serverData.tools || [];
 
                 // Create a LangChain tool for each MCP tool
