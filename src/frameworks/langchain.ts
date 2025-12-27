@@ -41,6 +41,7 @@ export interface AgentConfig {
   sessionContext?: {  // Session for payment
     sessionActive: boolean;
     sessionBudgetRemaining: number;
+    grantedPermissions?: string[];
   };
 }
 
@@ -291,6 +292,7 @@ export interface ExecuteOptions {
   sessionContext?: {
     sessionActive: boolean;
     sessionBudgetRemaining: number;
+    grantedPermissions?: string[];
   };
 }
 
