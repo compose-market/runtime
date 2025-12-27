@@ -10,7 +10,7 @@ import cors from "cors";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 import agentRoutes from "./agent-routes.js";
 import {
-    executeManowar,
+    executeWithOrchestrator,
     MANOWAR_PRICES,
     type Workflow,
     type PaymentContext,
@@ -137,8 +137,8 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         userId: req.headers["x-session-user-address"] as string | undefined,
     };
 
-    // Execute workflow
-    const result = await executeManowar(workflow, {
+    // Execute workflow with Shadow Orchestra (new orchestrator)
+    const result = await executeWithOrchestrator(workflow, {
         input: payload.input || {},
         payment: paymentContext,
     });
