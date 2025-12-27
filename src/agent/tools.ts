@@ -13,6 +13,83 @@ const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market
 const MCP_SERVICE_URL = process.env.MCP_SERVICE_URL || "https://mcp.compose.market";
 
 // =============================================================================
+// Dynamic Consent Detection
+// =============================================================================
+
+/**
+ * Infer consent type needed from error message or tool semantics.
+ * Agent proactively understands what permissions are needed.
+ * No hardcoded server names - works with any of 8000+ MCP servers.
+ */
+function inferConsentFromError(errorText: string): string | null {
+    const lowerError = errorText.toLowerCase();
+
+    // Filesystem indicators
+    if (lowerError.includes("eacces") ||
+        lowerError.includes("permission denied") ||
+        lowerError.includes("file") && (lowerError.includes("access") || lowerError.includes("read") || lowerError.includes("write")) ||
+        lowerError.includes("directory") ||
+        lowerError.includes("filesystem")) {
+        return "filesystem";
+    }
+
+    // Camera indicators
+    if (lowerError.includes("camera") ||
+        lowerError.includes("video") && lowerError.includes("capture") ||
+        lowerError.includes("notreadableerror") && lowerError.includes("video")) {
+        return "camera";
+    }
+
+    // Microphone indicators
+    if (lowerError.includes("microphone") ||
+        lowerError.includes("audio") && lowerError.includes("recording") ||
+        lowerError.includes("notreadableerror") && lowerError.includes("audio")) {
+        return "microphone";
+    }
+
+    // Location indicators
+    if (lowerError.includes("geolocation") ||
+        lowerError.includes("location") && lowerError.includes("denied") ||
+        lowerError.includes("gps")) {
+        return "geolocation";
+    }
+
+    // Clipboard indicators
+    if (lowerError.includes("clipboard") && lowerError.includes("denied")) {
+        return "clipboard";
+    }
+
+    return null;
+}
+
+/**
+ * Infer consent type from tool name/description (proactive check).
+ * Agent can check this BEFORE execution to prompt user upfront.
+ */
+function inferConsentFromToolSemantics(toolName: string, toolDescription?: string): string | null {
+    const text = `${toolName} ${toolDescription || ""}`.toLowerCase();
+
+    if (text.includes("file") || text.includes("directory") || text.includes("folder") || text.includes("read_") || text.includes("write_") || text.includes("list_dir")) {
+        return "filesystem";
+    }
+    if (text.includes("camera") || text.includes("photo") || text.includes("video") && text.includes("capture")) {
+        return "camera";
+    }
+    if (text.includes("microphone") || text.includes("record") && text.includes("audio") || text.includes("voice")) {
+        return "microphone";
+    }
+    if (text.includes("location") || text.includes("gps") || text.includes("coordinates")) {
+        return "geolocation";
+    }
+    if (text.includes("clipboard") && (text.includes("paste") || text.includes("copy"))) {
+        return "clipboard";
+    }
+
+    return null;
+}
+
+
+// =============================================================================
 // Helper: Schema Conversion
 // =============================================================================
 
