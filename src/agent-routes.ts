@@ -64,6 +64,7 @@ const ChatSchema = z.object({
     manowarId: z.string().optional(),
     image: z.string().optional(), // base64 encoded image for multimodal
     audio: z.string().optional(), // base64 encoded audio for multimodal
+    grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
 });
 
 const MultimodalSchema = z.object({
@@ -325,7 +326,7 @@ router.post(
             return;
         }
 
-        const { message, threadId, manowarId, image, audio } = parseResult.data;
+        const { message, threadId, manowarId, image, audio, grantedPermissions } = parseResult.data;
 
         // Detect if this is a multimodal model
         const task = await detectModelTask(agent.model);
@@ -377,7 +378,8 @@ router.post(
             manowarId,
             sessionContext: {
                 sessionActive,
-                sessionBudgetRemaining
+                sessionBudgetRemaining,
+                grantedPermissions: grantedPermissions || []
             }
         });
 
