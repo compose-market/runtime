@@ -13,6 +13,48 @@ const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market
 const MCP_SERVICE_URL = process.env.MCP_SERVICE_URL || "https://mcp.compose.market";
 
 // =============================================================================
+// Failed Tool Tracking
+// =============================================================================
+
+interface FailedTool {
+    failures: number;
+    lastFailure: Date;
+    reason: string;
+}
+
+// Cache of tools that have failed - prevents LLM from repeatedly trying broken tools
+const failedTools = new Map<string, FailedTool>();
+const TOOL_FAILURE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_TOOL_FAILURES = 2;
+
+function markToolFailed(toolKey: string, reason: string): void {
+    const existing = failedTools.get(toolKey);
+    const now = new Date();
+
+    if (existing && (now.getTime() - existing.lastFailure.getTime() < TOOL_FAILURE_TTL_MS)) {
+        failedTools.set(toolKey, { failures: existing.failures + 1, lastFailure: now, reason });
+    } else {
+        failedTools.set(toolKey, { failures: 1, lastFailure: now, reason });
+    }
+}
+
+function isToolFailed(toolKey: string): { failed: boolean; reason?: string } {
+    const entry = failedTools.get(toolKey);
+    if (!entry) return { failed: false };
+
+    // Clear stale entries
+    if (Date.now() - entry.lastFailure.getTime() > TOOL_FAILURE_TTL_MS) {
+        failedTools.delete(toolKey);
+        return { failed: false };
+    }
+
+    if (entry.failures >= MAX_TOOL_FAILURES) {
+        return { failed: true, reason: entry.reason };
+    }
+    return { failed: false };
+}
+
+// =============================================================================
 // Dynamic Consent Detection
 // =============================================================================
 
@@ -105,7 +147,7 @@ function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> 
             case "number": case "integer": zodType = z.number().describe(prop.description || key); break;
             case "boolean": zodType = z.boolean().describe(prop.description || key); break;
             case "array": zodType = z.array(z.any()).describe(prop.description || key); break;
-            case "object": zodType = z.record(z.string(), z.any()).describe(prop.description || key); break;
+            case "object": zodType = z.object({}).passthrough().describe(prop.description || key); break;
             default: zodType = z.any().describe(prop.description || key);
         }
         if (!required.includes(key)) zodType = zodType.optional();
@@ -215,64 +257,127 @@ export async function createAgentTools(
                     tools.push(tool);
                 }
             } else if (source === "mcp") {
-                // Make single request - MCP server and connector handle flexible resolution
+                // Proxy Executor Pattern: One tool per MCP server to prevent context bloat
+                // Instead of binding 50+ individual tools, we bind ONE executor that routes to sub-tools
                 console.log(`[createAgentTools] Fetching tools for MCP server "${id}"`);
 
-                const response = await fetch(`${MCP_SERVICE_URL}/mcp/servers/${id}/tools`);
+                // Add timeout to prevent indefinite blocking on spawn failures
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+                let response: Response;
+                try {
+                    response = await fetch(`${MCP_SERVICE_URL}/mcp/servers/${id}/tools`, {
+                        signal: controller.signal
+                    });
+                } catch (err: any) {
+                    if (err.name === 'AbortError') {
+                        console.warn(`[createAgentTools] ✗ MCP server "${id}" timed out after 10s, skipping`);
+                    } else {
+                        console.warn(`[createAgentTools] ✗ MCP server "${id}" fetch failed:`, err.message);
+                    }
+                    continue; // Skip this server, don't fail entire agent
+                } finally {
+                    clearTimeout(timeoutId);
+                }
+
                 if (!response.ok) {
                     console.warn(`[createAgentTools] ✗ MCP server "${id}" returned ${response.status}`);
                     continue;
                 }
 
                 const serverData = await response.json();
-                console.log(`[createAgentTools] ✓ Found MCP server "${id}" with ${serverData.tools?.length || 0} tools`);
                 const serverTools = serverData.tools || [];
 
-                // Create a LangChain tool for each MCP tool
-                for (const toolDef of serverTools) {
-                    const tool = new DynamicStructuredTool({
-                        name: toolDef.name,
-                        description: toolDef.description || `Execute ${toolDef.name} on ${id}`,
-                        schema: toolDef.inputSchema ? createZodSchema(toolDef.inputSchema) : z.object({}),
-                        func: async (args: Record<string, unknown>) => {
-                            // Call MCP service to execute the tool
-                            const headers: Record<string, string> = {
-                                "Content-Type": "application/json"
-                            };
+                if (serverTools.length === 0) {
+                    console.warn(`[createAgentTools] ✗ MCP server "${id}" has no tools, skipping`);
+                    continue;
+                }
 
-                            // Forward session headers if available
-                            if (sessionContext?.sessionActive) {
-                                headers["x-session-active"] = "true";
-                                headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
-                            }
+                console.log(`[createAgentTools] ✓ Found MCP server "${id}" with ${serverTools.length} tools`);
 
-                            // Add internal bypass header (user already paid for this conversation)
-                            const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
-                            headers["x-manowar-internal"] = MANOWAR_INTERNAL_SECRET;
+                // Build tool list description for the model (compact format)
+                const toolDescriptions = serverTools.map((t: any) =>
+                    `${t.name}${t.description ? ` - ${t.description.slice(0, 80)}` : ""}`
+                ).join("; ");
 
-                            // Phase 1: Add pricing metadata for usage tracking
-                            headers["x-tool-price"] = "1000"; // $0.001 default
+                // Create SINGLE Proxy Executor for this MCP server
+                const mcpExecutorName = `mcp_${id.replace(/[^a-zA-Z0-9]/g, "_")}`;
 
+                const mcpExecutor = new DynamicStructuredTool({
+                    name: mcpExecutorName,
+                    description: `Execute tools on MCP server "${id}". Available tools: ${toolDescriptions}`,
+                    schema: z.object({
+                        tool: z.string().describe("Name of the tool to execute (from the available tools list)"),
+                        args: z.object({}).passthrough().describe("Arguments object to pass to the tool"),
+                    }),
+                    func: async (input: { tool: string; args: Record<string, unknown> }) => {
+                        const toolKey = `${id}:${input.tool}`;
+
+                        // Check if this tool is marked as failed - don't waste cycles retrying
+                        const failCheck = isToolFailed(toolKey);
+                        if (failCheck.failed) {
+                            return `Tool "${input.tool}" is temporarily unavailable (${failCheck.reason}). Please try a different approach or tool.`;
+                        }
+
+                        // Route to MCP service for actual tool execution
+                        const headers: Record<string, string> = {
+                            "Content-Type": "application/json"
+                        };
+
+                        // Forward session headers if available
+                        if (sessionContext?.sessionActive) {
+                            headers["x-session-active"] = "true";
+                            headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
+                        }
+
+                        // Add internal bypass header (user already paid for this conversation)
+                        const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
+                        headers["x-manowar-internal"] = MANOWAR_INTERNAL_SECRET;
+
+                        // Phase 1: Add pricing metadata for usage tracking
+                        headers["x-tool-price"] = "1000"; // $0.001 default
+
+                        console.log(`[MCP Executor] ${mcpExecutorName} -> ${input.tool}(${JSON.stringify(input.args)})`);
+
+                        try {
                             const execResponse = await fetch(
-                                `${MCP_SERVICE_URL}/mcp/servers/${id}/tools/${toolDef.name}`,
+                                `${MCP_SERVICE_URL}/mcp/servers/${id}/tools/${input.tool}`,
                                 {
                                     method: "POST",
                                     headers,
-                                    body: JSON.stringify({ args }),
+                                    body: JSON.stringify({ args: input.args }),
                                 }
                             );
 
                             if (!execResponse.ok) {
                                 const error = await execResponse.text();
-                                throw new Error(`Tool execution failed: ${error}`);
+
+                                // Check if this is a spawn/availability error vs input error
+                                if (error.includes("temporarily unavailable") ||
+                                    error.includes("spawn") ||
+                                    error.includes("Failed to get tools") ||
+                                    execResponse.status === 503) {
+                                    markToolFailed(toolKey, "server unavailable");
+                                    return `Tool "${input.tool}" failed: MCP server unavailable. Try a different approach.`;
+                                }
+
+                                // For other errors (bad input), don't mark as failed
+                                return `Tool "${input.tool}" failed: ${error}. Check arguments and try again.`;
                             }
 
                             const result = await execResponse.json();
                             return JSON.stringify(result.result);
-                        },
-                    });
-                    tools.push(tool);
-                }
+                        } catch (err: any) {
+                            // Network/timeout errors - mark as failed
+                            markToolFailed(toolKey, err.message || "network error");
+                            return `Tool "${input.tool}" failed (${err.message}). Try a different approach.`;
+                        }
+                    },
+                });
+
+                tools.push(mcpExecutor);
+                console.log(`[createAgentTools] ✓ Created proxy executor "${mcpExecutorName}" for ${serverTools.length} tools`);
             }
         } catch (error) {
             console.error(`[createAgentTools] Failed to load plugin ${pluginId}:`, error);

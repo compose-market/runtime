@@ -315,17 +315,12 @@ export async function executeAgent(
   const start = Date.now();
 
   try {
-    // Update agent config with session context if provided
+    // Update session context in config (but DON'T recreate tools - they're already bound)
+    // Session context is passed through headers during tool execution, not via recreation
     if (opts.sessionContext && agent.config) {
       agent.config.sessionContext = opts.sessionContext;
-      // Recreate tools with session context
-      const composeTools = await createAgentTools(
-        agent.config.plugins || [],
-        agent.config.wallet,
-        opts.sessionContext
-      );
-      const memTools = createMem0Tools(agentId, opts.userId, opts.manowarId);
-      agent.tools = [...composeTools, ...memTools];
+      // Tools are created once during createAgent() and cached in agent.tools
+      // Recreating them on every message causes repeated MCP spawns → looping
     }
 
     // Setup Callbacks (Mem0) with full identity context
@@ -334,7 +329,8 @@ export async function executeAgent(
     const input = { messages: [new HumanMessage(message)] };
     const config = {
       configurable: { thread_id: threadId },
-      callbacks: [mem0Handler]
+      callbacks: [mem0Handler],
+      recursionLimit: 50, // Increase from default 25 for multi-tool tasks
     };
 
     // Invoke
