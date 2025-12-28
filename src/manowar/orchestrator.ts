@@ -502,6 +502,7 @@ ${agentDescriptions || "No agents configured."}
                 {
                     ...createLangSmithConfig(this.workflow.id, this.runId),
                     callbacks: this.langsmithTracker ? [this.langsmithTracker] : [],
+                    recursionLimit: 50, // Increase from default 25 for complex workflows
                 }
             );
 

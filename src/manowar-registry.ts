@@ -35,6 +35,8 @@ export interface RegisteredManowar {
     coordinatorModel?: string;
     /** Total price in USDC (formatted) */
     totalPrice?: string;
+    /** Agent IDs in this workflow (from on-chain getAgents) */
+    agentWalletAddresses?: string[];
     /** Registration timestamp */
     createdAt: Date;
     /** Last execution timestamp */
@@ -52,6 +54,7 @@ export interface RegisterManowarParams {
     hasCoordinator?: boolean;
     coordinatorModel?: string;
     totalPrice?: string;
+    agentWalletAddresses?: string[];
 }
 
 // =============================================================================
@@ -98,6 +101,7 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
         hasCoordinator: params.hasCoordinator,
         coordinatorModel: params.coordinatorModel,
         totalPrice: params.totalPrice,
+        agentWalletAddresses: params.agentWalletAddresses,
         createdAt: new Date(),
     };
 
@@ -108,6 +112,7 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
     console.log(`[manowar-registry]   Wallet: ${walletAddress}`);
     console.log(`[manowar-registry]   ID: ${params.manowarId}`);
     console.log(`[manowar-registry]   Coordinator: ${params.coordinatorModel || "none"}`);
+    console.log(`[manowar-registry]   Agents: [${params.agentWalletAddresses?.join(", ") || "none"}]`);
 
     return registered;
 }
