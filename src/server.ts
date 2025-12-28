@@ -158,6 +158,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
     const result = await executeWithOrchestrator(workflow, {
         input: payload.input || {},
         payment: paymentContext,
+        coordinatorModel: manowar.coordinatorModel,
     });
 
     // Mark as executed
@@ -317,15 +318,16 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     const result = await executeWithOrchestrator(workflow, {
         input: { message, threadId, image, audio },
         payment: paymentContext,
+        coordinatorModel: manowar.coordinatorModel,
     });
 
     // Mark as executed
     markManowarExecuted(identifier);
 
     // Extract output from context (the orchestrator stores results in context)
-    const output = result.context?.coordinatorResponse ||
-        result.context?.message ||
-        result.context?.output ||
+    // Check 'output' BEFORE 'message' - 'message' is the user's input!
+    const output = result.context?.output ||
+        result.context?.coordinatorResponse ||
         (result.status === "success" ? "Workflow completed" : result.error || "");
 
     if (typeof output === "string" && output.length > 0) {

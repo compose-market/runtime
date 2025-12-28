@@ -558,3 +558,385 @@ export async function getGraphInsights(
         topRelations: result.relations.slice(0, 20),
     };
 }
+
+// =============================================================================
+// Token Optimization: Sliding Window with Summary
+// =============================================================================
+
+/**
+ * Constants for sliding window optimization
+ */
+export const SLIDING_WINDOW_SIZE = 4;  // Keep last N messages
+export const TOKEN_THRESHOLD_PERCENT = 60;  // Trigger compression at 60% of effective window
+export const CHARS_PER_TOKEN = 4;  // Approximate characters per token
+
+/**
+ * Estimate token count from content using character-based approximation
+ * More accurate than simple division for mixed content
+ */
+export function estimateTokenCount(content: string): number {
+    if (!content) return 0;
+
+    // JSON and code typically have more tokens per character
+    const isJsonLike = content.startsWith('{') || content.startsWith('[');
+    const multiplier = isJsonLike ? 3 : CHARS_PER_TOKEN;
+
+    return Math.ceil(content.length / multiplier);
+}
+
+/**
+ * Estimate total tokens from LangChain messages
+ */
+export function estimateMessagesTokens(messages: BaseMessage[]): number {
+    return messages.reduce((sum, m) => {
+        const content = String(m.content || '');
+        // Add overhead for message structure
+        return sum + estimateTokenCount(content) + 10;
+    }, 0);
+}
+
+/**
+ * Summarize older messages for sliding window context compression
+ * Uses efficient local summarization without LLM when possible
+ */
+export async function summarizeMessagesForWindow(
+    messages: BaseMessage[],
+    workflowId: string,
+    runId: string,
+    options?: {
+        useLLM?: boolean;
+        model?: string;
+        maxSummaryTokens?: number;
+    }
+): Promise<{
+    summary: string;
+    keyFacts: string[];
+    tokensBefore: number;
+    tokensAfter: number;
+}> {
+    const tokensBefore = estimateMessagesTokens(messages);
+
+    // Extract essential content from each message
+    const extractedContent: string[] = [];
+    const keyFacts: string[] = [];
+
+    for (const msg of messages) {
+        const content = String(msg.content || '');
+        const msgType = msg._getType?.() || 'unknown';
+
+        if (msgType === 'human') {
+            // User messages: keep full text, it's the goal
+            extractedContent.push(`User: ${content.slice(0, 200)}`);
+        } else if (msgType === 'ai') {
+            // AI messages: extract conclusion only
+            const conclusion = extractConclusion(content);
+            if (conclusion) {
+                extractedContent.push(`AI: ${conclusion}`);
+            }
+        } else if (msgType === 'tool') {
+            // Tool messages: extract result only
+            const result = extractToolResult(content);
+            if (result) {
+                extractedContent.push(`Tool: ${result}`);
+                keyFacts.push(result);
+            }
+        }
+    }
+
+    // Build compressed summary
+    const summary = extractedContent.join('\n');
+    const tokensAfter = estimateTokenCount(summary);
+
+    console.log(`[SlidingWindow] Compressed ${tokensBefore} tokens → ${tokensAfter} tokens (${Math.round((1 - tokensAfter / tokensBefore) * 100)}% reduction)`);
+
+    // Store summary in memory for future retrieval
+    await addMemoryWithGraph({
+        messages: [
+            { role: 'system', content: `Sliding window summary for ${workflowId}` },
+            { role: 'assistant', content: summary },
+        ],
+        agent_id: `manowar-${workflowId}`,
+        run_id: runId,
+        metadata: {
+            type: 'sliding_window_summary',
+            tokens_before: tokensBefore,
+            tokens_after: tokensAfter,
+            message_count: messages.length,
+        },
+    });
+
+    return {
+        summary,
+        keyFacts,
+        tokensBefore,
+        tokensAfter,
+    };
+}
+
+/**
+ * Extract conclusion/result from AI message content
+ */
+function extractConclusion(content: string): string {
+    // If content is short, keep it
+    if (content.length < 300) return content;
+
+    // Look for conclusion patterns
+    const conclusionPatterns = [
+        /(?:in conclusion|to summarize|the result is|therefore|thus)[:\s]*(.*?)(?:\n\n|$)/is,
+        /(?:answer|result|output)[:\s]*(.*?)(?:\n\n|$)/is,
+        /(?:here's what|here is)[:\s]*(.*?)(?:\n\n|$)/is,
+    ];
+
+    for (const pattern of conclusionPatterns) {
+        const match = content.match(pattern);
+        if (match?.[1]) {
+            return match[1].slice(0, 300).trim();
+        }
+    }
+
+    // Fallback: take last paragraph or first 300 chars
+    const paragraphs = content.split('\n\n');
+    const lastPara = paragraphs[paragraphs.length - 1];
+
+    return lastPara.length < 300 ? lastPara : content.slice(0, 300) + '...';
+}
+
+/**
+ * Extract essential result from tool output
+ */
+function extractToolResult(content: string): string {
+    // Try to parse as JSON first
+    try {
+        const parsed = JSON.parse(content);
+
+        // Common patterns in tool responses
+        if (parsed.output) return String(parsed.output).slice(0, 500);
+        if (parsed.result) return String(parsed.result).slice(0, 500);
+        if (parsed.content) return String(parsed.content).slice(0, 500);
+        if (parsed.data) return typeof parsed.data === 'string'
+            ? parsed.data.slice(0, 500)
+            : JSON.stringify(parsed.data).slice(0, 500);
+        if (parsed.messages?.length) {
+            const lastMsg = parsed.messages[parsed.messages.length - 1];
+            return String(lastMsg.content || '').slice(0, 500);
+        }
+
+        // Fallback: stringify but limit size
+        return JSON.stringify(parsed).slice(0, 500);
+    } catch {
+        // Not JSON, return truncated
+        return content.slice(0, 500);
+    }
+}
+
+// =============================================================================
+// Token Optimization: Tool Output Compression
+// =============================================================================
+
+/**
+ * Compress tool output to essential content only
+ * Removes duplicate data, metadata, and irrelevant fields
+ */
+export function compressToolOutput(
+    rawOutput: unknown,
+    agentName: string,
+    options?: {
+        maxLength?: number;
+        preserveStructure?: boolean;
+    }
+): string {
+    const maxLength = options?.maxLength || 800;
+
+    // Handle string input
+    if (typeof rawOutput === 'string') {
+        // Try to parse as JSON
+        try {
+            const parsed = JSON.parse(rawOutput);
+            return compressToolOutput(parsed, agentName, options);
+        } catch {
+            // Not JSON, compress as text
+            return `[${agentName}]: ${rawOutput.slice(0, maxLength)}`;
+        }
+    }
+
+    // Handle object input
+    if (typeof rawOutput === 'object' && rawOutput !== null) {
+        const obj = rawOutput as Record<string, unknown>;
+
+        // Priority extraction order
+        const essentialFields = ['output', 'result', 'content', 'data', 'answer', 'response'];
+
+        for (const field of essentialFields) {
+            if (obj[field]) {
+                const value = obj[field];
+                const extracted = typeof value === 'string'
+                    ? value
+                    : JSON.stringify(value);
+                return `[${agentName}]: ${extracted.slice(0, maxLength)}`;
+            }
+        }
+
+        // Handle messages array (common in agent responses)
+        if (Array.isArray(obj.messages) && obj.messages.length > 0) {
+            const lastMessage = obj.messages[obj.messages.length - 1];
+            if (typeof lastMessage === 'object' && lastMessage.content) {
+                return `[${agentName}]: ${String(lastMessage.content).slice(0, maxLength)}`;
+            }
+        }
+
+        // Fallback: construct minimal summary
+        const status = obj.success !== undefined
+            ? (obj.success ? 'completed' : 'failed')
+            : 'executed';
+        const name = obj.name || agentName;
+
+        // Get any text content
+        const textContent = findTextContent(obj, maxLength - 100);
+
+        return `[${name}] ${status}: ${textContent || 'Task completed'}`;
+    }
+
+    // Primitive types
+    return `[${agentName}]: ${String(rawOutput).slice(0, maxLength)}`;
+}
+
+/**
+ * Recursively find text content in object
+ */
+function findTextContent(obj: Record<string, unknown>, maxLength: number): string {
+    const textFields = ['text', 'message', 'description', 'summary', 'body'];
+
+    for (const field of textFields) {
+        if (typeof obj[field] === 'string') {
+            return obj[field] as string;
+        }
+    }
+
+    // Look in nested objects
+    for (const value of Object.values(obj)) {
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            const nested = findTextContent(value as Record<string, unknown>, maxLength);
+            if (nested) return nested.slice(0, maxLength);
+        }
+    }
+
+    return '';
+}
+
+// =============================================================================
+// Token Optimization: Memory-Based Context Retrieval
+// =============================================================================
+
+/**
+ * Get relevant context from memory instead of replaying full message history
+ * This is the Mem0-style 90% token savings approach
+ */
+export async function getRelevantContextFromMemory(
+    workflowId: string,
+    runId: string,
+    currentGoal: string,
+    options?: {
+        limit?: number;
+        includePatterns?: boolean;
+        userId?: string;
+    }
+): Promise<{
+    contextString: string;
+    memories: MemoryItem[];
+    tokensUsed: number;
+}> {
+    const limit = options?.limit || 5;
+
+    // Parallel fetch: current run context + relevant patterns
+    const [runContext, patterns] = await Promise.all([
+        searchMemoryWithGraph({
+            query: currentGoal,
+            agent_id: `manowar-${workflowId}`,
+            run_id: runId,
+            limit: limit,
+        }),
+        options?.includePatterns
+            ? findSimilarSolutions(workflowId, currentGoal, { limit: 3, outcomeFilter: 'success' })
+            : Promise.resolve([]),
+    ]);
+
+    // Build context string
+    const contextParts: string[] = [];
+
+    // Add memories
+    if (runContext.memories.length > 0) {
+        contextParts.push('## Workflow Context');
+        for (const mem of runContext.memories) {
+            contextParts.push(`- ${mem.memory}`);
+        }
+    }
+
+    // Add relevant patterns
+    if (patterns.length > 0) {
+        contextParts.push('## Successful Patterns');
+        for (const pattern of patterns) {
+            contextParts.push(`- ${pattern.task}: ${pattern.toolSequence.join(' → ')}`);
+        }
+    }
+
+    // Add relationships if present
+    if (runContext.relations.length > 0) {
+        contextParts.push('## Key Relationships');
+        for (const rel of runContext.relations.slice(0, 5)) {
+            contextParts.push(`- ${rel.source} → ${rel.relation} → ${rel.target}`);
+        }
+    }
+
+    const contextString = contextParts.join('\n');
+    const tokensUsed = estimateTokenCount(contextString);
+
+    console.log(`[MemoryRetrieval] Retrieved ${runContext.memories.length} memories, ${tokensUsed} tokens`);
+
+    return {
+        contextString,
+        memories: runContext.memories,
+        tokensUsed,
+    };
+}
+
+// =============================================================================
+// Token Optimization: Structured Task Decomposition
+// =============================================================================
+
+/**
+ * Generate a minimal, structured task prompt for an agent
+ * Reduces reasoning overhead by being explicit about expectations
+ */
+export function generateStructuredTaskPrompt(
+    agentName: string,
+    task: string,
+    context?: {
+        previousStepOutput?: string;
+        currentStep?: number;
+        totalSteps?: number;
+        expectedOutputFormat?: string;
+    }
+): string {
+    const parts: string[] = [];
+
+    // Step context
+    if (context?.currentStep && context?.totalSteps) {
+        parts.push(`[Step ${context.currentStep}/${context.totalSteps}]`);
+    }
+
+    // Task
+    parts.push(`Task: ${task}`);
+
+    // Previous context (compressed)
+    if (context?.previousStepOutput) {
+        const compressed = context.previousStepOutput.slice(0, 500);
+        parts.push(`Previous: ${compressed}`);
+    }
+
+    // Output format hint
+    if (context?.expectedOutputFormat) {
+        parts.push(`Format: ${context.expectedOutputFormat}`);
+    }
+
+    return parts.join('\n');
+}

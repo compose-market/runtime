@@ -20,6 +20,7 @@ import type {
 } from "./state.js";
 import { getModelContextSpec } from "./context.js";
 import { searchRegistryTools, inspectToolCapability } from "./context.js";
+import { getDefaultCoordinatorModel } from "./agentic.js";
 
 // =============================================================================
 // Configuration
@@ -130,7 +131,7 @@ export async function windowTrackerNode(
         0
     );
 
-    const coordinatorModel = state.agentModels?.["coordinator"] || "minimax/minimax-m2.1";
+    const coordinatorModel = state.agentModels?.["coordinator"] || getDefaultCoordinatorModel();
     const coordSpec = await getModelContextSpec(coordinatorModel);
     const coordUsagePercent = (messageTokenEstimate / coordSpec.effectiveWindow) * 100;
 

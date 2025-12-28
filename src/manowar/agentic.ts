@@ -27,11 +27,11 @@ export interface AgenticModel {
  */
 export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
     {
-        id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        name: "Nemotron Super 49B",
+        id: "nvidia/nemotron-3-nano-30b-a3b:free",
+        name: "Nemotron 3 Nano 30B",
         provider: "nvidia",
         contextLength: 128000,
-        activeParams: "49B",
+        activeParams: "30B",
         keyStrength: "Multi-step tool orchestration, RAG, reasoning",
         description: "Post-trained for agentic workflows with SFT across math, code, and science. Uses RPO, RLVR, and DPO for tool-use refinement.",
     },

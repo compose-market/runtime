@@ -40,6 +40,8 @@ export interface WorkflowStep {
 
     // For trigger/schedule steps
     triggerId?: string;
+    /** Coordinator model (from manowar registry) */
+    coordinatorModel?: string;
     triggerConfig?: TriggerDefinition;
 
     // For hook steps
@@ -329,6 +331,8 @@ export interface ExecutorOptions {
     resumeState?: WorkflowStateSummary;
     /** Trigger ID if auto-triggered */
     triggerId?: string;
+    /** Coordinator model (from manowar registry) */
+    coordinatorModel?: string;
 }
 
 // =============================================================================

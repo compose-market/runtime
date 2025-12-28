@@ -130,6 +130,14 @@ async function fetchModelConfig(modelId: string): Promise<RemoteModelConfig> {
         baseURL = "https://generativelanguage.googleapis.com/v1beta";
         apiKeyEnv = "GOOGLE_GENERATIVE_AI_API_KEY";
         break;
+      case "openrouter":
+        baseURL = "https://openrouter.ai/api/v1";
+        apiKeyEnv = "OPEN_ROUTER_API_KEY";
+        break;
+      case "aiml":
+        baseURL = "https://api.aimlapi.com/v1";
+        apiKeyEnv = "AI_ML_API_KEY";
+        break;
     }
 
     const config = { baseURL, apiKeyEnv, source: data.source };
@@ -152,6 +160,11 @@ function inferLocalConfig(modelId: string): RemoteModelConfig {
     return { baseURL: "https://api.anthropic.com/v1", apiKeyEnv: "ANTHROPIC_API_KEY", source: "anthropic" };
   } else if (modelId.startsWith("gemini")) {
     return { baseURL: "https://generativelanguage.googleapis.com/v1beta", apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY", source: "google" };
+  }
+  // OpenRouter models (from agentic coordinator list and all org/model format models)
+  // These include nvidia/, minimax/, moonshotai/, nex-agi/, allenai/, arcee-ai/, nousresearch/, phind/, perplexity/
+  if (modelId.includes("/")) {
+    return { baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPEN_ROUTER_API_KEY", source: "openrouter" };
   }
   return { baseURL: "https://router.huggingface.co/v1", apiKeyEnv: "HUGGING_FACE_INFERENCE_TOKEN", source: "huggingface" };
 }
