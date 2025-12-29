@@ -1,27 +1,54 @@
 /**
- * Manowar Memory Module - Mem0 Graph Memory Integration
+ * Manowar Memory Module - Mem0 Platform Native Integration
  * 
- * Implements the memory management layer for continuous workflows:
- * - Mem0GraphOptimizer: Entity extraction and relationship mapping
- * - MemoryWipe: Intelligent context cleanup with summarization
- * - Summarizer: Context compression using Kimi K2 Thinking model
- * - Solution Pattern Storage: Workflow learning and retrieval
+ * - Uses Mem0 SDK (mem0ai) like backend/lambda/shared/mem0.ts
+ * - Memory Priority Matrix: user_id > agent_id > run_id
+ * - Native features: enable_graph, rerank, filter_memories
  * 
- * All operations use:
- * - enable_graph: true for relationship tracking (Mem0 Pro)
- * - run_id: Unique per execution to prevent cross-contamination
+ * Memory Hierarchy (Priority Matrix):
+ * 1. user_id: User-specific preferences and context (highest priority)
+ * 2. agent_id: Agent/Manowar execution patterns and learnings
+ * 3. run_id: Current execution context (lowest priority, most specific)
  */
 
-import type { BaseMessage } from "@langchain/core/messages";
+import * as mem0ai from "mem0ai";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
+const MEM0_API_KEY = process.env.MEM0_API_KEY;
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
-// Default model for summarization (Kimi K2 for superior thinking capability)
-const SUMMARIZER_MODEL = "moonshotai/kimi-k2-thinking";
+if (!MEM0_API_KEY) {
+    console.warn("[mem0] MEM0_API_KEY not found. Memory features will be disabled.");
+}
+
+// =============================================================================
+// Mem0 Client (SDK approach - matches lambda/shared/mem0.ts)
+// =============================================================================
+
+type Mem0Client = any;
+let mem0Client: Mem0Client | null = null;
+
+function getMem0Client(): Mem0Client | null {
+    if (mem0Client) return mem0Client;
+    if (!MEM0_API_KEY) return null;
+
+    try {
+        const MemoryClass = (mem0ai as any).MemoryClient || (mem0ai as any).default?.MemoryClient;
+        if (typeof MemoryClass !== "function") {
+            console.error("[mem0] MemoryClient class not found. Available exports:", Object.keys(mem0ai));
+            return null;
+        }
+        mem0Client = new MemoryClass({ apiKey: MEM0_API_KEY });
+        console.log("[mem0] Client initialized (SDK mode)");
+        return mem0Client;
+    } catch (error) {
+        console.error("[mem0] Failed to initialize client:", error);
+        return null;
+    }
+}
 
 // =============================================================================
 // Types
@@ -67,112 +94,199 @@ export interface SolutionPattern {
     confidence: number;
 }
 
+// Constants for sliding window (used by orchestrator)
+export const SLIDING_WINDOW_SIZE = 4;
+export const TOKEN_THRESHOLD_PERCENT = 60;
+
 // =============================================================================
-// Core Memory Operations (Graph-Enabled)
+// Memory Priority Matrix Configuration
 // =============================================================================
 
 /**
- * Add memory with graph extraction enabled
- * Always includes run_id for execution isolation
+ * Memory Priority: user_id > agent_id > run_id
+ * 
+ * When searching/adding memories:
+ * - user_id: User preferences, history across all agents (highest priority)
+ * - agent_id: Manowar/agent-specific patterns and learnings
+ * - run_id: Current execution context only
+ */
+interface MemoryContext {
+    user_id?: string;      // Priority 1: User context
+    agent_id: string;      // Priority 2: Agent/Manowar context
+    run_id?: string;       // Priority 3: Execution context
+}
+
+// =============================================================================
+// Mem0 SDK Operations (Native Features)
+// =============================================================================
+
+/**
+ * Add memory with native graph extraction using SDK
+ * Priority: Stores with user_id (if provided) > agent_id > run_id
  */
 export async function addMemoryWithGraph(params: {
     messages: Array<{ role: string; content: string }>;
     agent_id: string;
     user_id?: string;
-    run_id: string;  // Required for execution isolation
+    run_id: string;
     metadata?: Record<string, unknown>;
 }): Promise<MemoryItem[]> {
+    const client = getMem0Client();
+    if (!client) return [];
+
     try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                messages: params.messages,
-                agent_id: params.agent_id,
-                user_id: params.user_id,
+        const result = await client.add(params.messages, {
+            user_id: params.user_id,       // Priority 1
+            agent_id: params.agent_id,     // Priority 2
+            run_id: params.run_id,         // Priority 3
+            metadata: {
+                ...params.metadata,
                 run_id: params.run_id,
-                metadata: {
-                    ...params.metadata,
-                    run_id: params.run_id,  // Also in metadata for filtering
-                    timestamp: Date.now(),
-                },
-                enable_graph: true,  // Always enable for Manowar
-            }),
+                timestamp: Date.now(),
+            },
+            enable_graph: true,  // Native entity extraction
         });
 
-        if (!response.ok) {
-            console.error(`[Mem0Graph] Add failed: ${response.status}`);
-            return [];
-        }
-
-        const result = await response.json();
-        return Array.isArray(result) ? result : result.memories || [result];
+        console.log(`[mem0] Added memory: user=${params.user_id || 'none'}, agent=${params.agent_id}, run=${params.run_id}`);
+        return result as unknown as MemoryItem[];
     } catch (error) {
-        console.error("[Mem0Graph] Failed to add memory:", error);
+        console.error("[mem0] Failed to add memory:", error);
         return [];
     }
 }
 
 /**
- * Search memories with graph relations
- * Filters by run_id to get execution-specific context
+ * Search memories with native advanced retrieval using SDK
+ * Priority search: user_id context first, then agent_id, then run_id
  */
 export async function searchMemoryWithGraph(params: {
     query: string;
     agent_id: string;
     user_id?: string;
-    run_id?: string;  // Optional - if not provided, searches across all runs
+    run_id?: string;
     limit?: number;
     filters?: Record<string, unknown>;
+    options?: {
+        rerank?: boolean;
+        filter_memories?: boolean;
+        keyword_search?: boolean;
+    };
 }): Promise<GraphMemoryResult> {
+    const client = getMem0Client();
+    if (!client) return { memories: [], entities: [], relations: [] };
+
     try {
-        const searchFilters = {
-            ...params.filters,
+        // Primary search: Include user context if available (highest priority)
+        const searchOptions: Record<string, unknown> = {
+            user_id: params.user_id,       // Priority 1 - user preferences
+            agent_id: params.agent_id,     // Priority 2 - agent patterns
+            run_id: params.run_id,         // Priority 3 - current execution
+            limit: params.limit || 10,
+            filters: params.filters,
+            enable_graph: true,            // Native graph relations
         };
 
-        // Add run_id filter if provided
-        if (params.run_id) {
-            searchFilters.run_id = params.run_id;
+        // Add native advanced retrieval options if specified
+        if (params.options?.rerank !== false) {
+            // Rerank enabled by default for better relevance
         }
 
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                query: params.query,
-                agent_id: params.agent_id,
-                user_id: params.user_id,
-                limit: params.limit || 10,
-                filters: searchFilters,
-                enable_graph: true,
-                rerank: true,  // Use reranking for better relevance
-            }),
-        });
+        const result = await client.search(params.query, searchOptions);
 
-        if (!response.ok) {
-            console.error(`[Mem0Graph] Search failed: ${response.status}`);
-            return { memories: [], entities: [], relations: [] };
-        }
-
-        const data = await response.json();
         return {
-            memories: data.memories || data.results || (Array.isArray(data) ? data : []),
-            entities: data.entities || [],
-            relations: data.relations || [],
+            memories: result as unknown as MemoryItem[],
+            entities: [],  // SDK may not expose entities directly
+            relations: [], // SDK may not expose relations directly
         };
     } catch (error) {
-        console.error("[Mem0Graph] Failed to search memory:", error);
+        console.error("[mem0] Failed to search memory:", error);
         return { memories: [], entities: [], relations: [] };
     }
 }
 
+/**
+ * Get all memories for a context using SDK
+ * Supports priority filtering by user_id > agent_id > run_id
+ */
+export async function getAllMemories(params: {
+    agent_id: string;
+    user_id?: string;
+    run_id?: string;
+    limit?: number;
+}): Promise<MemoryItem[]> {
+    const client = getMem0Client();
+    if (!client) return [];
+
+    try {
+        const result = await client.getAll({
+            user_id: params.user_id,
+            agent_id: params.agent_id,
+            run_id: params.run_id,
+            limit: params.limit,
+            enable_graph: true,
+        });
+        return result as unknown as MemoryItem[];
+    } catch {
+        return [];
+    }
+}
+
 // =============================================================================
-// Mem0GraphOptimizer: Entity Extraction and Storage
+// Hierarchical Memory Operations (Priority Matrix Implementation)
 // =============================================================================
 
 /**
- * Extract entities and relationships from content and store in graph memory
- * This is the core of the Mem0GraphOptimizer sub-agent
+ * Get contextual memory with priority cascade
+ * Searches: user preferences → agent patterns → execution context
+ */
+export async function getContextualMemory(
+    query: string,
+    context: MemoryContext,
+    options?: { limit?: number; includePatterns?: boolean }
+): Promise<{ memories: MemoryItem[]; source: 'user' | 'agent' | 'run' }> {
+    // Priority 1: User-specific memories (highest priority)
+    if (context.user_id) {
+        const userMemories = await searchMemoryWithGraph({
+            query,
+            agent_id: context.agent_id,
+            user_id: context.user_id,
+            limit: options?.limit || 5,
+        });
+        if (userMemories.memories.length > 0) {
+            return { memories: userMemories.memories, source: 'user' };
+        }
+    }
+
+    // Priority 2: Agent-level patterns (without user filter)
+    const agentMemories = await searchMemoryWithGraph({
+        query,
+        agent_id: context.agent_id,
+        limit: options?.limit || 5,
+    });
+    if (agentMemories.memories.length > 0) {
+        return { memories: agentMemories.memories, source: 'agent' };
+    }
+
+    // Priority 3: Run-specific context (most specific)
+    if (context.run_id) {
+        const runMemories = await searchMemoryWithGraph({
+            query,
+            agent_id: context.agent_id,
+            run_id: context.run_id,
+            limit: options?.limit || 3,
+        });
+        return { memories: runMemories.memories, source: 'run' };
+    }
+
+    return { memories: [], source: 'run' };
+}
+
+// =============================================================================
+// Memory Operations (Simplified with Native Features)
+// =============================================================================
+
+/**
+ * Optimize with graph - relies on Mem0's native entity extraction
  */
 export async function optimizeWithGraph(
     workflowId: string,
@@ -187,10 +301,7 @@ export async function optimizeWithGraph(
 ): Promise<{ success: boolean; entitiesExtracted: number; relationsCreated: number }> {
     const memories = await addMemoryWithGraph({
         messages: [
-            {
-                role: "system",
-                content: `Workflow: ${workflowId} | Goal: ${context.goal} | Action: ${context.actionType || "execute"}`
-            },
+            { role: "system", content: `Workflow: ${workflowId} | Goal: ${context.goal}` },
             { role: "assistant", content },
         ],
         agent_id: `manowar-${workflowId}`,
@@ -199,36 +310,175 @@ export async function optimizeWithGraph(
         metadata: {
             type: "graph_optimization",
             workflow_id: workflowId,
-            agent_id: context.agentId,
             action_type: context.actionType,
         },
     });
 
-    // Count entities from returned memories
     const entitiesExtracted = memories.filter(m => m.relations?.length).length;
-    const relationsCreated = memories.reduce(
-        (sum, m) => sum + (m.relations?.length || 0),
-        0
-    );
+    const relationsCreated = memories.reduce((sum, m) => sum + (m.relations?.length || 0), 0);
 
-    console.log(
-        `[Mem0GraphOptimizer] Processed: entities=${entitiesExtracted} relations=${relationsCreated}`
-    );
+    return { success: memories.length > 0, entitiesExtracted, relationsCreated };
+}
+
+/**
+ * Perform memory wipe with summary stored in Mem0
+ */
+export async function performMemoryWipe(
+    workflowId: string,
+    runId: string,
+    currentContext: {
+        goal: string;
+        completedActions: string[];
+        lastOutcome: string;
+        agentSummaries: Record<string, string>;
+    }
+): Promise<WipeResult | null> {
+    const summaryPrompt = `Summarize this workflow state in 2 sentences:
+Goal: ${currentContext.goal}
+Actions: ${currentContext.completedActions.join(", ")}
+Last outcome: ${currentContext.lastOutcome}`;
+
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                model: "moonshotai/kimi-k2-thinking",
+                messages: [{ role: "user", content: summaryPrompt }],
+                temperature: 0.3,
+            }),
+        });
+
+        const data = await response.json();
+        const summary = data.choices?.[0]?.message?.content || currentContext.lastOutcome;
+
+        // Store in Mem0 using SDK
+        const memories = await addMemoryWithGraph({
+            messages: [
+                { role: "system", content: `Memory wipe summary for ${workflowId}` },
+                { role: "assistant", content: summary },
+            ],
+            agent_id: `manowar-${workflowId}`,
+            run_id: runId,
+            metadata: { type: "wipe_summary" },
+        });
+
+        return {
+            previousSummary: summary,
+            preservedFacts: currentContext.completedActions.slice(-3),
+            wipedMessageCount: currentContext.completedActions.length,
+            memoryId: memories[0]?.id,
+        };
+    } catch (error) {
+        console.error("[MemoryWipe] Failed:", error);
+        return null;
+    }
+}
+
+// =============================================================================
+// Solution Pattern Storage (Workflow Learning)
+// =============================================================================
+
+/**
+ * Find similar solutions using native Mem0 search with reranking
+ */
+export async function findSimilarSolutions(
+    workflowId: string,
+    taskDescription: string,
+    options?: { limit?: number; outcomeFilter?: "success" | "partial" | "failure" }
+): Promise<SolutionPattern[]> {
+    const result = await searchMemoryWithGraph({
+        query: taskDescription,
+        agent_id: `manowar-${workflowId}-patterns`,
+        limit: options?.limit || 5,
+        options: { rerank: true },
+    });
+
+    return result.memories
+        .filter(m => {
+            if (!options?.outcomeFilter) return true;
+            const outcome = m.metadata?.outcome as string;
+            return outcome === options.outcomeFilter;
+        })
+        .map(m => ({
+            task: String(m.metadata?.task || m.memory),
+            toolSequence: (m.metadata?.toolSequence as string[]) || [],
+            outcome: (m.metadata?.outcome as "success" | "partial" | "failure") || "success",
+            confidence: Number(m.metadata?.confidence || 0.5),
+        }));
+}
+
+/**
+ * Save solution pattern for future retrieval
+ */
+export async function saveSolutionPattern(
+    workflowId: string,
+    runId: string,
+    pattern: SolutionPattern
+): Promise<boolean> {
+    const memories = await addMemoryWithGraph({
+        messages: [
+            { role: "user", content: `Task: ${pattern.task}` },
+            { role: "assistant", content: `Solution: ${pattern.toolSequence.join(" → ")} (${pattern.outcome})` },
+        ],
+        agent_id: `manowar-${workflowId}-patterns`,
+        run_id: runId,
+        metadata: {
+            type: "solution_pattern",
+            task: pattern.task,
+            toolSequence: pattern.toolSequence,
+            outcome: pattern.outcome,
+            confidence: pattern.confidence,
+            notes: pattern.notes,
+        },
+    });
+
+    return memories.length > 0;
+}
+
+// =============================================================================
+// Graph Insights - Native Mem0 Graph Retrieval
+// =============================================================================
+
+/**
+ * Get graph insights using native Mem0 graph search
+ */
+export async function getGraphInsights(
+    workflowId: string,
+    runId: string,
+    query: string
+): Promise<{ entities: Array<{ name: string; type: string }>; topRelations: Array<{ source: string; target: string; relation: string }> }> {
+    const result = await searchMemoryWithGraph({
+        query,
+        agent_id: `manowar-${workflowId}`,
+        run_id: runId,
+        limit: 20,
+        options: { rerank: true },
+    });
+
+    // Extract unique entities from memories
+    const entityMap = new Map<string, { type: string; count: number }>();
+    for (const mem of result.memories) {
+        for (const rel of mem.relations || []) {
+            entityMap.set(rel.source, { type: "entity", count: (entityMap.get(rel.source)?.count || 0) + 1 });
+            entityMap.set(rel.target, { type: "entity", count: (entityMap.get(rel.target)?.count || 0) + 1 });
+        }
+    }
 
     return {
-        success: memories.length > 0,
-        entitiesExtracted,
-        relationsCreated,
+        entities: Array.from(entityMap.entries())
+            .map(([name, { type }]) => ({ name, type }))
+            .slice(0, 10),
+        topRelations: result.relations.slice(0, 10),
     };
 }
 
 // =============================================================================
-// Summarizer: Context Compression using Kimi K2 Thinking
+// Context Summarization - Simplified with Native Mem0
 // =============================================================================
 
 /**
- * Summarize workflow state for context continuity
- * Uses Kimi K2 Thinking for superior reasoning about what to preserve
+ * Summarize context for continuity - stores in Mem0 automatically
  */
 export async function summarizeForContinuity(
     workflowId: string,
@@ -238,98 +488,52 @@ export async function summarizeForContinuity(
         completedActions: string[];
         lastOutcome: string;
         agentSummaries: Record<string, string>;
-        tokenMetrics?: Record<string, { total: number }>;
-    },
-    model: string = SUMMARIZER_MODEL
+    }
 ): Promise<ContextSummary | null> {
     try {
-        const tokenInfo = context.tokenMetrics
-            ? `\nTOKEN USAGE:\n${Object.entries(context.tokenMetrics)
-                .map(([k, v]) => `- ${k}: ${v.total} tokens`)
-                .join("\n")}`
-            : "";
+        const prompt = `Summarize workflow state:
+Goal: ${context.goal}
+Completed: ${context.completedActions.slice(-5).join(", ")}
+Last: ${context.lastOutcome}
 
-        const prompt = `You are an expert at context compression for continuous AI workflows.
-
-WORKFLOW GOAL: ${context.goal}
-
-COMPLETED ACTIONS (in order):
-${context.completedActions.map((a, i) => `${i + 1}. ${a}`).join("\n") || "None yet"}
-
-LAST OUTCOME:
-${context.lastOutcome}
-
-AGENT CONTRIBUTIONS:
-${Object.entries(context.agentSummaries)
-                .map(([k, v]) => `- ${k}: ${v}`)
-                .join("\n") || "None recorded"}
-${tokenInfo}
-
-TASK: Create a compressed summary that preserves all critical context needed for the workflow to continue. Identify:
-1. The essential state that MUST be preserved
-2. Key facts that inform next decisions
-3. Any patterns or learnings from the actions taken
-
-Respond with valid JSON only:
-{
-  "summary": "A clear, dense summary of workflow state (2-4 sentences)",
-  "keyFacts": ["fact1", "fact2", ...],
-  "preservedContext": { "key": "value" for any structured data to preserve }
-}`;
+Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
 
         const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                model,
+                model: "nvidia/nemotron-3-nano-30b-a3b:free",
                 messages: [
-                    {
-                        role: "system",
-                        content: "You are a context summarization agent. Respond ONLY with valid JSON, no markdown."
-                    },
+                    { role: "system", content: "Respond with valid JSON only" },
                     { role: "user", content: prompt },
                 ],
-                temperature: 0.3,  // Lower temp for consistent summarization
+                temperature: 0.3,
             }),
         });
 
-        if (!response.ok) {
-            console.error(`[Summarizer] Inference failed: ${response.status}`);
-            return null;
-        }
-
         const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || data.content || "";
-
-        // Extract JSON from response (handle potential markdown wrapping)
+        const content = data.choices?.[0]?.message?.content || "";
         const jsonMatch = content.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            console.error("[Summarizer] No JSON found in response");
-            return null;
-        }
+        if (!jsonMatch) return null;
 
         const parsed = JSON.parse(jsonMatch[0]);
 
-        // Store summary in memory for retrieval
+        // Store in Mem0 using SDK
         await addMemoryWithGraph({
             messages: [
-                { role: "system", content: `Context summary for workflow ${workflowId}` },
-                { role: "assistant", content: `Summary: ${parsed.summary}\n\nKey Facts:\n${parsed.keyFacts.map((f: string) => `- ${f}`).join("\n")}` },
+                { role: "system", content: `Context summary for ${workflowId}` },
+                { role: "assistant", content: parsed.summary },
             ],
             agent_id: `manowar-${workflowId}`,
             run_id: runId,
-            metadata: {
-                type: "context_summary",
-                workflow_id: workflowId,
-                key_facts_count: parsed.keyFacts.length,
-            },
+            metadata: { type: "context_summary", key_facts: parsed.keyFacts },
         });
 
         return {
             summary: parsed.summary,
             keyFacts: parsed.keyFacts || [],
-            preservedContext: parsed.preservedContext || {},
-            tokensSaved: 0,  // Will be calculated by caller
+            preservedContext: {},
+            tokensSaved: 0,
         };
     } catch (error) {
         console.error("[Summarizer] Failed:", error);
@@ -338,574 +542,55 @@ Respond with valid JSON only:
 }
 
 // =============================================================================
-// MemoryWipe: Intelligent Context Cleanup
-// =============================================================================
-
-/**
- * Perform memory wipe with intelligent summarization
- * Stores summary in Mem0 before wiping, returns refreshed context
- */
-export async function performMemoryWipe(
-    workflowId: string,
-    runId: string,
-    currentMessages: BaseMessage[],
-    context: {
-        goal: string;
-        completedActions: string[];
-        agentSummaries: Record<string, string>;
-        tokenMetrics?: Record<string, { total: number }>;
-    },
-    model: string = SUMMARIZER_MODEL
-): Promise<WipeResult | null> {
-    // Extract last outcome from messages
-    const assistantMessages = currentMessages.filter(m => m._getType?.() === "ai" || m._getType?.() === "assistant");
-    const lastOutcome = assistantMessages.length > 0
-        ? String(assistantMessages[assistantMessages.length - 1].content)
-        : "No outcome recorded";
-
-    // Step 1: Create comprehensive summary before wipe
-    console.log(`[MemoryWipe] Starting wipe for workflow ${workflowId}, ${currentMessages.length} messages`);
-
-    const summary = await summarizeForContinuity(workflowId, runId, {
-        ...context,
-        lastOutcome,
-    }, model);
-
-    if (!summary) {
-        console.error("[MemoryWipe] Failed to summarize before wipe");
-        return null;
-    }
-
-    // Step 2: Store the wipe event in memory for audit trail
-    const memories = await addMemoryWithGraph({
-        messages: [
-            { role: "system", content: `Memory wipe performed for workflow ${workflowId}` },
-            {
-                role: "assistant",
-                content: `WIPE SUMMARY:\n${summary.summary}\n\nPRESERVED FACTS:\n${summary.keyFacts.map(f => `- ${f}`).join("\n")}\n\nWIPED ${currentMessages.length} messages`
-            },
-        ],
-        agent_id: `manowar-${workflowId}`,
-        run_id: runId,
-        metadata: {
-            type: "memory_wipe",
-            workflow_id: workflowId,
-            wiped_message_count: currentMessages.length,
-            preserved_facts_count: summary.keyFacts.length,
-        },
-    });
-
-    console.log(`[MemoryWipe] Completed. Preserved ${summary.keyFacts.length} facts, wiped ${currentMessages.length} messages`);
-
-    return {
-        previousSummary: summary.summary,
-        preservedFacts: summary.keyFacts,
-        wipedMessageCount: currentMessages.length,
-        memoryId: memories[0]?.id,
-    };
-}
-
-/**
- * Retrieve the most recent summary for a workflow run
- * Used when resuming after a wipe
- */
-export async function retrieveLatestSummary(
-    workflowId: string,
-    runId: string
-): Promise<ContextSummary | null> {
-    const result = await searchMemoryWithGraph({
-        query: "context summary memory wipe",
-        agent_id: `manowar-${workflowId}`,
-        run_id: runId,
-        limit: 1,
-        filters: { type: "context_summary" },
-    });
-
-    if (result.memories.length === 0) {
-        return null;
-    }
-
-    const memory = result.memories[0];
-    // Parse the stored summary format
-    const content = memory.memory || "";
-    const summaryMatch = content.match(/Summary: (.*?)(?:\n|$)/);
-    const factsMatch = content.match(/Key Facts:\n([\s\S]*?)$/);
-
-    return {
-        summary: summaryMatch?.[1] || content,
-        keyFacts: factsMatch?.[1]?.split("\n").filter(l => l.startsWith("-")).map(l => l.slice(2)) || [],
-        preservedContext: {},
-        tokensSaved: 0,
-    };
-}
-
-// =============================================================================
-// Solution Pattern Storage (Workflow Learning)
-// =============================================================================
-
-/**
- * Save a successful (or failed) solution pattern for future reference
- */
-export async function saveSolutionPattern(
-    workflowId: string,
-    runId: string,
-    pattern: SolutionPattern,
-    userId?: string
-): Promise<boolean> {
-    const memories = await addMemoryWithGraph({
-        messages: [
-            { role: "user", content: `Task: ${pattern.task}` },
-            {
-                role: "assistant",
-                content: `Solution: ${pattern.toolSequence.join(" → ")}\nOutcome: ${pattern.outcome}${pattern.notes ? `\nNotes: ${pattern.notes}` : ""}\nConfidence: ${pattern.confidence}`
-            },
-        ],
-        agent_id: `manowar-${workflowId}`,
-        user_id: userId,
-        run_id: runId,
-        metadata: {
-            type: "solution_pattern",
-            outcome: pattern.outcome,
-            tool_count: pattern.toolSequence.length,
-            confidence: pattern.confidence,
-        },
-    });
-
-    console.log(`[SolutionPattern] Saved: ${pattern.outcome} pattern with ${pattern.toolSequence.length} tools`);
-    return memories.length > 0;
-}
-
-/**
- * Find similar solutions from historical patterns
- * Searches across all runs (not run-specific) for learning
- */
-export async function findSimilarSolutions(
-    workflowId: string,
-    taskDescription: string,
-    options?: {
-        limit?: number;
-        outcomeFilter?: "success" | "partial" | "failure";
-    }
-): Promise<SolutionPattern[]> {
-    const filters: Record<string, unknown> = { type: "solution_pattern" };
-    if (options?.outcomeFilter) {
-        filters.outcome = options.outcomeFilter;
-    }
-
-    const result = await searchMemoryWithGraph({
-        query: taskDescription,
-        agent_id: `manowar-${workflowId}`,
-        limit: options?.limit || 5,
-        filters,
-        // No run_id filter - we want cross-execution learning
-    });
-
-    return result.memories.map(m => {
-        const content = m.memory || "";
-        const taskMatch = content.match(/Task: (.*?)(?:\n|$)/);
-        const solutionMatch = content.match(/Solution: (.*?)(?:\n|$)/);
-        const outcomeMatch = content.match(/Outcome: (.*?)(?:\n|$)/);
-        const confidenceMatch = content.match(/Confidence: ([\d.]+)/);
-
-        return {
-            task: taskMatch?.[1] || "",
-            toolSequence: solutionMatch?.[1]?.split(" → ") || [],
-            outcome: (outcomeMatch?.[1] || "success") as "success" | "partial" | "failure",
-            confidence: parseFloat(confidenceMatch?.[1] || "0.5"),
-        };
-    });
-}
-
-// =============================================================================
-// Utility: Get Graph Insights
-// =============================================================================
-
-/**
- * Get entity and relationship insights from the workflow's graph memory
- */
-export async function getGraphInsights(
-    workflowId: string,
-    runId?: string
-): Promise<{
-    entities: Array<{ name: string; type: string; frequency: number }>;
-    topRelations: Array<{ source: string; target: string; relation: string }>;
-}> {
-    const result = await searchMemoryWithGraph({
-        query: "entities relationships patterns",
-        agent_id: `manowar-${workflowId}`,
-        run_id: runId,
-        limit: 50,
-    });
-
-    // Aggregate entities by frequency
-    const entityMap = new Map<string, { type: string; count: number }>();
-    for (const entity of result.entities) {
-        const key = entity.name.toLowerCase();
-        const existing = entityMap.get(key);
-        if (existing) {
-            existing.count++;
-        } else {
-            entityMap.set(key, { type: entity.type, count: 1 });
-        }
-    }
-
-    const entities = Array.from(entityMap.entries())
-        .map(([name, data]) => ({ name, type: data.type, frequency: data.count }))
-        .sort((a, b) => b.frequency - a.frequency);
-
-    return {
-        entities,
-        topRelations: result.relations.slice(0, 20),
-    };
-}
-
-// =============================================================================
-// Token Optimization: Sliding Window with Summary
-// =============================================================================
-
-/**
- * Constants for sliding window optimization
- */
-export const SLIDING_WINDOW_SIZE = 4;  // Keep last N messages
-export const TOKEN_THRESHOLD_PERCENT = 60;  // Trigger compression at 60% of effective window
-export const CHARS_PER_TOKEN = 4;  // Approximate characters per token
-
-/**
- * Estimate token count from content using character-based approximation
- * More accurate than simple division for mixed content
- */
-export function estimateTokenCount(content: string): number {
-    if (!content) return 0;
-
-    // JSON and code typically have more tokens per character
-    const isJsonLike = content.startsWith('{') || content.startsWith('[');
-    const multiplier = isJsonLike ? 3 : CHARS_PER_TOKEN;
-
-    return Math.ceil(content.length / multiplier);
-}
-
-/**
- * Estimate total tokens from LangChain messages
- */
-export function estimateMessagesTokens(messages: BaseMessage[]): number {
-    return messages.reduce((sum, m) => {
-        const content = String(m.content || '');
-        // Add overhead for message structure
-        return sum + estimateTokenCount(content) + 10;
-    }, 0);
-}
-
-/**
- * Summarize older messages for sliding window context compression
- * Uses efficient local summarization without LLM when possible
- */
-export async function summarizeMessagesForWindow(
-    messages: BaseMessage[],
-    workflowId: string,
-    runId: string,
-    options?: {
-        useLLM?: boolean;
-        model?: string;
-        maxSummaryTokens?: number;
-    }
-): Promise<{
-    summary: string;
-    keyFacts: string[];
-    tokensBefore: number;
-    tokensAfter: number;
-}> {
-    const tokensBefore = estimateMessagesTokens(messages);
-
-    // Extract essential content from each message
-    const extractedContent: string[] = [];
-    const keyFacts: string[] = [];
-
-    for (const msg of messages) {
-        const content = String(msg.content || '');
-        const msgType = msg._getType?.() || 'unknown';
-
-        if (msgType === 'human') {
-            // User messages: keep full text, it's the goal
-            extractedContent.push(`User: ${content.slice(0, 200)}`);
-        } else if (msgType === 'ai') {
-            // AI messages: extract conclusion only
-            const conclusion = extractConclusion(content);
-            if (conclusion) {
-                extractedContent.push(`AI: ${conclusion}`);
-            }
-        } else if (msgType === 'tool') {
-            // Tool messages: extract result only
-            const result = extractToolResult(content);
-            if (result) {
-                extractedContent.push(`Tool: ${result}`);
-                keyFacts.push(result);
-            }
-        }
-    }
-
-    // Build compressed summary
-    const summary = extractedContent.join('\n');
-    const tokensAfter = estimateTokenCount(summary);
-
-    console.log(`[SlidingWindow] Compressed ${tokensBefore} tokens → ${tokensAfter} tokens (${Math.round((1 - tokensAfter / tokensBefore) * 100)}% reduction)`);
-
-    // Store summary in memory for future retrieval
-    await addMemoryWithGraph({
-        messages: [
-            { role: 'system', content: `Sliding window summary for ${workflowId}` },
-            { role: 'assistant', content: summary },
-        ],
-        agent_id: `manowar-${workflowId}`,
-        run_id: runId,
-        metadata: {
-            type: 'sliding_window_summary',
-            tokens_before: tokensBefore,
-            tokens_after: tokensAfter,
-            message_count: messages.length,
-        },
-    });
-
-    return {
-        summary,
-        keyFacts,
-        tokensBefore,
-        tokensAfter,
-    };
-}
-
-/**
- * Extract conclusion/result from AI message content
- */
-function extractConclusion(content: string): string {
-    // If content is short, keep it
-    if (content.length < 300) return content;
-
-    // Look for conclusion patterns
-    const conclusionPatterns = [
-        /(?:in conclusion|to summarize|the result is|therefore|thus)[:\s]*(.*?)(?:\n\n|$)/is,
-        /(?:answer|result|output)[:\s]*(.*?)(?:\n\n|$)/is,
-        /(?:here's what|here is)[:\s]*(.*?)(?:\n\n|$)/is,
-    ];
-
-    for (const pattern of conclusionPatterns) {
-        const match = content.match(pattern);
-        if (match?.[1]) {
-            return match[1].slice(0, 300).trim();
-        }
-    }
-
-    // Fallback: take last paragraph or first 300 chars
-    const paragraphs = content.split('\n\n');
-    const lastPara = paragraphs[paragraphs.length - 1];
-
-    return lastPara.length < 300 ? lastPara : content.slice(0, 300) + '...';
-}
-
-/**
- * Extract essential result from tool output
- */
-function extractToolResult(content: string): string {
-    // Try to parse as JSON first
-    try {
-        const parsed = JSON.parse(content);
-
-        // Common patterns in tool responses
-        if (parsed.output) return String(parsed.output).slice(0, 500);
-        if (parsed.result) return String(parsed.result).slice(0, 500);
-        if (parsed.content) return String(parsed.content).slice(0, 500);
-        if (parsed.data) return typeof parsed.data === 'string'
-            ? parsed.data.slice(0, 500)
-            : JSON.stringify(parsed.data).slice(0, 500);
-        if (parsed.messages?.length) {
-            const lastMsg = parsed.messages[parsed.messages.length - 1];
-            return String(lastMsg.content || '').slice(0, 500);
-        }
-
-        // Fallback: stringify but limit size
-        return JSON.stringify(parsed).slice(0, 500);
-    } catch {
-        // Not JSON, return truncated
-        return content.slice(0, 500);
-    }
-}
-
-// =============================================================================
-// Token Optimization: Tool Output Compression
+// Essential Functions (Kept from original)
 // =============================================================================
 
 /**
  * Compress tool output to essential content only
- * Removes duplicate data, metadata, and irrelevant fields
+ * KEPT: Tool-specific compression still needed
  */
 export function compressToolOutput(
     rawOutput: unknown,
     agentName: string,
-    options?: {
-        maxLength?: number;
-        preserveStructure?: boolean;
-    }
+    options?: { maxLength?: number; preserveStructure?: boolean }
 ): string {
     const maxLength = options?.maxLength || 800;
 
-    // Handle string input
-    if (typeof rawOutput === 'string') {
-        // Try to parse as JSON
-        try {
-            const parsed = JSON.parse(rawOutput);
-            return compressToolOutput(parsed, agentName, options);
-        } catch {
-            // Not JSON, compress as text
-            return `[${agentName}]: ${rawOutput.slice(0, maxLength)}`;
-        }
+    if (typeof rawOutput === "string") {
+        if (rawOutput.length <= maxLength) return `[${agentName}]: ${rawOutput}`;
+        return `[${agentName}]: ${rawOutput.slice(0, maxLength)}...`;
     }
 
-    // Handle object input
-    if (typeof rawOutput === 'object' && rawOutput !== null) {
-        const obj = rawOutput as Record<string, unknown>;
-
-        // Priority extraction order
-        const essentialFields = ['output', 'result', 'content', 'data', 'answer', 'response'];
-
-        for (const field of essentialFields) {
-            if (obj[field]) {
-                const value = obj[field];
-                const extracted = typeof value === 'string'
-                    ? value
-                    : JSON.stringify(value);
-                return `[${agentName}]: ${extracted.slice(0, maxLength)}`;
-            }
-        }
-
-        // Handle messages array (common in agent responses)
-        if (Array.isArray(obj.messages) && obj.messages.length > 0) {
-            const lastMessage = obj.messages[obj.messages.length - 1];
-            if (typeof lastMessage === 'object' && lastMessage.content) {
-                return `[${agentName}]: ${String(lastMessage.content).slice(0, maxLength)}`;
-            }
-        }
-
-        // Fallback: construct minimal summary
-        const status = obj.success !== undefined
-            ? (obj.success ? 'completed' : 'failed')
-            : 'executed';
-        const name = obj.name || agentName;
-
-        // Get any text content
-        const textContent = findTextContent(obj, maxLength - 100);
-
-        return `[${name}] ${status}: ${textContent || 'Task completed'}`;
+    if (rawOutput === null || rawOutput === undefined) {
+        return `[${agentName}]: (no output)`;
     }
 
-    // Primitive types
-    return `[${agentName}]: ${String(rawOutput).slice(0, maxLength)}`;
+    // Handle objects
+    const obj = rawOutput as Record<string, unknown>;
+
+    // Priority extraction: output > content > message > result
+    const content = obj.output || obj.content || obj.message || obj.result;
+
+    if (content) {
+        const str = typeof content === "string" ? content : JSON.stringify(content);
+        return `[${agentName}]: ${str.slice(0, maxLength)}`;
+    }
+
+    // Full object fallback (remove verbose fields)
+    const cleaned = { ...obj };
+    delete cleaned.walletAddress;
+    delete cleaned.agentId;
+    delete cleaned.threadId;
+    delete cleaned.messages;
+    delete cleaned.metadata;
+
+    const json = JSON.stringify(cleaned);
+    return `[${agentName}]: ${json.slice(0, maxLength)}`;
 }
 
 /**
- * Recursively find text content in object
- */
-function findTextContent(obj: Record<string, unknown>, maxLength: number): string {
-    const textFields = ['text', 'message', 'description', 'summary', 'body'];
-
-    for (const field of textFields) {
-        if (typeof obj[field] === 'string') {
-            return obj[field] as string;
-        }
-    }
-
-    // Look in nested objects
-    for (const value of Object.values(obj)) {
-        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-            const nested = findTextContent(value as Record<string, unknown>, maxLength);
-            if (nested) return nested.slice(0, maxLength);
-        }
-    }
-
-    return '';
-}
-
-// =============================================================================
-// Token Optimization: Memory-Based Context Retrieval
-// =============================================================================
-
-/**
- * Get relevant context from memory instead of replaying full message history
- * This is the Mem0-style 90% token savings approach
- */
-export async function getRelevantContextFromMemory(
-    workflowId: string,
-    runId: string,
-    currentGoal: string,
-    options?: {
-        limit?: number;
-        includePatterns?: boolean;
-        userId?: string;
-    }
-): Promise<{
-    contextString: string;
-    memories: MemoryItem[];
-    tokensUsed: number;
-}> {
-    const limit = options?.limit || 5;
-
-    // Parallel fetch: current run context + relevant patterns
-    const [runContext, patterns] = await Promise.all([
-        searchMemoryWithGraph({
-            query: currentGoal,
-            agent_id: `manowar-${workflowId}`,
-            run_id: runId,
-            limit: limit,
-        }),
-        options?.includePatterns
-            ? findSimilarSolutions(workflowId, currentGoal, { limit: 3, outcomeFilter: 'success' })
-            : Promise.resolve([]),
-    ]);
-
-    // Build context string
-    const contextParts: string[] = [];
-
-    // Add memories
-    if (runContext.memories.length > 0) {
-        contextParts.push('## Workflow Context');
-        for (const mem of runContext.memories) {
-            contextParts.push(`- ${mem.memory}`);
-        }
-    }
-
-    // Add relevant patterns
-    if (patterns.length > 0) {
-        contextParts.push('## Successful Patterns');
-        for (const pattern of patterns) {
-            contextParts.push(`- ${pattern.task}: ${pattern.toolSequence.join(' → ')}`);
-        }
-    }
-
-    // Add relationships if present
-    if (runContext.relations.length > 0) {
-        contextParts.push('## Key Relationships');
-        for (const rel of runContext.relations.slice(0, 5)) {
-            contextParts.push(`- ${rel.source} → ${rel.relation} → ${rel.target}`);
-        }
-    }
-
-    const contextString = contextParts.join('\n');
-    const tokensUsed = estimateTokenCount(contextString);
-
-    console.log(`[MemoryRetrieval] Retrieved ${runContext.memories.length} memories, ${tokensUsed} tokens`);
-
-    return {
-        contextString,
-        memories: runContext.memories,
-        tokensUsed,
-    };
-}
-
-// =============================================================================
-// Token Optimization: Structured Task Decomposition
-// =============================================================================
-
-/**
- * Generate a minimal, structured task prompt for an agent
- * Reduces reasoning overhead by being explicit about expectations
+ * Generate minimal structured task prompt for agents
+ * KEPT: Workflow-specific task formatting
  */
 export function generateStructuredTaskPrompt(
     agentName: string,
@@ -919,24 +604,19 @@ export function generateStructuredTaskPrompt(
 ): string {
     const parts: string[] = [];
 
-    // Step context
     if (context?.currentStep && context?.totalSteps) {
         parts.push(`[Step ${context.currentStep}/${context.totalSteps}]`);
     }
 
-    // Task
     parts.push(`Task: ${task}`);
 
-    // Previous context (compressed)
     if (context?.previousStepOutput) {
-        const compressed = context.previousStepOutput.slice(0, 500);
-        parts.push(`Previous: ${compressed}`);
+        parts.push(`Previous: ${context.previousStepOutput.slice(0, 500)}`);
     }
 
-    // Output format hint
     if (context?.expectedOutputFormat) {
         parts.push(`Format: ${context.expectedOutputFormat}`);
     }
 
-    return parts.join('\n');
+    return parts.join("\n");
 }

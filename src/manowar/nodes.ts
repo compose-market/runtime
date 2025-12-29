@@ -22,6 +22,22 @@ import { getModelContextSpec } from "./context.js";
 import { searchRegistryTools, inspectToolCapability } from "./context.js";
 import { getDefaultCoordinatorModel } from "./agentic.js";
 
+// LangSmith configured - falls back to LLM-evaluation if initialization fails
+let langsmithClient: any = null;
+const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY;
+
+if (LANGSMITH_API_KEY) {
+    try {
+        const langsmithModule = await import("langsmith");
+        langsmithClient = new langsmithModule.Client();
+        console.log("[nodes] LangSmith client initialized for hybrid evaluation");
+    } catch (err) {
+        console.warn("[nodes] LangSmith init failed, using LLM-only evaluation:", err);
+    }
+} else {
+    console.log("[nodes] LANGSMITH_API_KEY not set, using LLM-only evaluation");
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -235,12 +251,12 @@ function calculateToolConfidence(tool: { description: string; tags: string[] }, 
 }
 
 // =============================================================================
-// Evaluator: End-of-Loop Performance Assessment
+// Evaluator: End-of-Loop Performance Assessment (Hybrid: LangSmith + LLM)
 // =============================================================================
 
 /**
  * Evaluator node: Assesses loop performance and suggests improvements
- * Only active in continuous-loop workflows
+ * Uses LangSmith for structured evaluation when available, LLM fallback otherwise
  */
 export async function evaluatorNode(
     state: ManowarState,
@@ -248,39 +264,60 @@ export async function evaluatorNode(
 ): Promise<Partial<ManowarState>> {
     const loopNum = state.loopCount || 1;
 
-    const prompt = `You are evaluating the performance of an autonomous AI workflow loop.
+    // Build evaluation context
+    const evalContext = {
+        goal: state.activeGoal,
+        loop: loopNum,
+        actions: state.completedActions || [],
+        tokenUsage: state.tokenMetrics,
+        windowHealth: state.windowHealth,
+    };
 
-WORKFLOW GOAL: ${state.activeGoal}
+    let evaluation: { goalScore: number; efficiencyScore: number; improvements: string[] } | null = null;
 
-LOOP NUMBER: ${loopNum}
+    // HYBRID APPROACH: Try LangSmith first, then LLM fallback
 
-COMPLETED ACTIONS:
-${state.completedActions?.map((a, i) => `${i + 1}. ${a}`).join("\n") || "None recorded"}
+    // 1. Try LangSmith structured evaluation
+    if (langsmithClient) {
+        try {
+            // Create a simple evaluator using LangSmith's run evaluation
+            const runData = {
+                name: `manowar-eval-loop-${loopNum}`,
+                inputs: evalContext,
+                outputs: { actions: state.completedActions, result: state.lastSummary || "" },
+            };
 
-TOKEN USAGE BY AGENT:
-${Object.entries(state.tokenMetrics || {})
-            .map(([agent, metrics]) => `- ${agent}: ${metrics.totalTokens} tokens (${metrics.reasoningTokens} reasoning)`)
-            .join("\n") || "No metrics"}
+            // Log evaluation run to LangSmith for tracking
+            await langsmithClient.createRun({
+                name: runData.name,
+                run_type: "evaluation",
+                inputs: runData.inputs,
+                outputs: runData.outputs,
+                extra: {
+                    metadata: {
+                        loop_number: loopNum,
+                        token_total: Object.values(state.tokenMetrics || {}).reduce((sum, m) => sum + m.totalTokens, 0),
+                    }
+                },
+            });
 
-WINDOW HEALTH:
-${Object.entries(state.windowHealth || {})
-            .map(([agent, health]) => `- ${agent}: ${health.usagePercent.toFixed(1)}% (${health.healthy ? "healthy" : "NEEDS CLEANUP"})`)
-            .join("\n") || "Not tracked"}
+            console.log(`[Evaluator] LangSmith evaluation logged for loop ${loopNum}`);
+            // LangSmith doesn't provide scores directly - continue to LLM for scoring
+        } catch (err) {
+            console.log(`[Evaluator] LangSmith logging failed, continuing with LLM: ${err}`);
+        }
+    }
 
-TOOLS SUGGESTED:
-${state.suggestedTools?.map(t => `- ${t.name}: ${t.confidence.toFixed(2)} confidence`).join("\n") || "None"}
+    // 2. LLM-based evaluation (always runs for scoring)
+    const prompt = `You are evaluating an autonomous AI workflow loop.
 
-TASK: Evaluate this loop's performance and suggest improvements for the next iteration.
-Score from 0-10 on:
-1. Goal adherence: How well did actions align with the goal?
-2. Efficiency: Were tokens and tools used efficiently?
+GOAL: ${state.activeGoal}
+LOOP: ${loopNum}
+ACTIONS: ${state.completedActions?.join(", ") || "None"}
+TOKEN USAGE: ${Object.entries(state.tokenMetrics || {}).map(([a, m]) => `${a}: ${m.totalTokens}`).join(", ") || "Not tracked"}
 
-Respond with valid JSON only:
-{
-  "goalScore": N,
-  "efficiencyScore": N,
-  "improvements": ["specific improvement 1", "specific improvement 2", ...]
-}`;
+Score 0-10 and suggest improvements. Respond with JSON only:
+{"goalScore": N, "efficiencyScore": N, "improvements": ["..."]}`;
 
     try {
         const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
@@ -289,29 +326,27 @@ Respond with valid JSON only:
             body: JSON.stringify({
                 model: coordinatorModel,
                 messages: [
-                    { role: "system", content: "You are a workflow performance evaluator. Respond only with valid JSON." },
+                    { role: "system", content: "Respond only with valid JSON." },
                     { role: "user", content: prompt },
                 ],
                 temperature: 0.3,
             }),
         });
 
-        if (!response.ok) {
-            console.error(`[Evaluator] Inference failed: ${response.status}`);
-            return {};
+        if (response.ok) {
+            const data = await response.json();
+            const content = data.choices?.[0]?.message?.content || "";
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                evaluation = JSON.parse(jsonMatch[0]);
+            }
         }
+    } catch (err) {
+        console.error("[Evaluator] LLM evaluation failed:", err);
+    }
 
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || data.content || "";
-
-        const jsonMatch = content.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            console.error("[Evaluator] No JSON in response");
-            return {};
-        }
-
-        const evaluation = JSON.parse(jsonMatch[0]);
-
+    // Apply evaluation results
+    if (evaluation) {
         const loopEvaluation: LoopEvaluation = {
             loopNumber: loopNum,
             goalScore: evaluation.goalScore || 5,
@@ -323,17 +358,16 @@ Respond with valid JSON only:
         console.log(
             `[Evaluator] Loop ${loopNum}: goal=${loopEvaluation.goalScore}/10, ` +
             `efficiency=${loopEvaluation.efficiencyScore}/10, ` +
-            `${loopEvaluation.improvements.length} improvements suggested`
+            `${loopEvaluation.improvements.length} improvements`
         );
 
         return {
             lastEvaluation: loopEvaluation,
             suggestedImprovements: evaluation.improvements || [],
         };
-    } catch (error) {
-        console.error("[Evaluator] Failed:", error);
-        return {};
     }
+
+    return {};
 }
 
 // =============================================================================
