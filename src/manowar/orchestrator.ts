@@ -16,7 +16,7 @@
  */
 
 import { StateGraph, START, END } from "@langchain/langgraph";
-import { HumanMessage, SystemMessage, AIMessage, type BaseMessage } from "@langchain/core/messages";
+import { HumanMessage, SystemMessage, AIMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { z } from "zod";
@@ -53,7 +53,7 @@ import { TokenLedger, getModelContextSpec } from "./context.js";
 import { createRun, startRun, completeRun, failRun } from "./run-tracker.js";
 
 // Existing imports
-import type { Workflow, WorkflowStep, WorkflowExecutionState, ExecutorOptions, PaymentContext } from "./types.js";
+import type { Workflow, WorkflowStep, WorkflowExecutionState, ExecutorOptions, PaymentContext, SSEProgressEvent } from "./types.js";
 
 // =============================================================================
 // Configuration
@@ -123,7 +123,8 @@ function createAgentDelegationTool(
     paymentContext: PaymentContext,
     manowarId: string,
     runId: string,
-    stepContext?: { currentStep?: number; totalSteps?: number; previousOutput?: string }
+    stepContext?: { currentStep?: number; totalSteps?: number; previousOutput?: string },
+    onProgress?: (event: SSEProgressEvent) => void
 ): DynamicStructuredTool {
     const agentName = agentStep.name.replace(/[^a-zA-Z0-9_]/g, "_");
 
@@ -139,6 +140,22 @@ function createAgentDelegationTool(
                 if (!agentId) throw new Error("Agent ID not found");
 
                 console.log(`[orchestrator] Delegating to ${agentStep.name}: ${task.substring(0, 80)}...`);
+
+                const stepProgress = stepContext?.currentStep && stepContext.totalSteps
+                    ? Math.round((stepContext.currentStep / stepContext.totalSteps) * 80) + 10 // 10-90% range
+                    : 50;
+
+                // SSE: Emit agent start event
+                onProgress?.({
+                    type: "agent",
+                    timestamp: Date.now(),
+                    data: {
+                        agentName: agentStep.name,
+                        stepName: `Step ${stepContext?.currentStep || '?'}/${stepContext?.totalSteps || '?'}`,
+                        message: `Calling agent "${agentStep.name}"...`,
+                        progress: stepProgress,
+                    },
+                });
 
                 // Base headers
                 const headers: Record<string, string> = {
@@ -186,6 +203,17 @@ function createAgentDelegationTool(
                 if (!response.ok) throw new Error(`Agent invocation failed: ${await response.text()}`);
                 const result = await response.json();
 
+                // SSE: Emit agent complete event
+                onProgress?.({
+                    type: "step",
+                    timestamp: Date.now(),
+                    data: {
+                        agentName: agentStep.name,
+                        message: `Agent "${agentStep.name}" completed`,
+                        progress: stepProgress + 5,
+                    },
+                });
+
                 // Track multimodal output
                 if (result.type && result.data && result.type !== "text") {
                     setMultimodalOutput({ output: result.data, outputType: result.type, fromAgent: agentStep.name });
@@ -198,6 +226,15 @@ function createAgentDelegationTool(
 
                 return compressed;
             } catch (err) {
+                // SSE: Emit error event
+                onProgress?.({
+                    type: "error",
+                    timestamp: Date.now(),
+                    data: {
+                        agentName: agentStep.name,
+                        error: err instanceof Error ? err.message : String(err),
+                    },
+                });
                 return `Error delegating to ${agentStep.name}: ${err instanceof Error ? err.message : String(err)}`;
             }
         },
@@ -267,6 +304,34 @@ export class ManowarOrchestrator {
     }
 
     /**
+     * Emit SSE progress event if callback is registered
+     */
+    private emitProgress(
+        type: "start" | "step" | "agent" | "tool" | "response" | "error" | "complete",
+        data: {
+            stepName?: string;
+            agentName?: string;
+            toolName?: string;
+            message?: string;
+            output?: string;
+            error?: string;
+            tokenCount?: number;
+            progress?: number;
+        }
+    ): void {
+        if (this.options.onProgress) {
+            this.options.onProgress({
+                type,
+                timestamp: Date.now(),
+                data: {
+                    runId: this.runId,
+                    ...data,
+                },
+            });
+        }
+    }
+
+    /**
      * Build coordinator tools from workflow definition
      * Includes step context for structured task decomposition
      */
@@ -284,7 +349,8 @@ export class ManowarOrchestrator {
                 this.options.payment,
                 this.workflow.id,
                 this.runId,
-                { currentStep: i + 1, totalSteps }
+                { currentStep: i + 1, totalSteps },
+                this.options.onProgress
             ));
         }
 
@@ -302,49 +368,88 @@ export class ManowarOrchestrator {
     }
 
     /**
-     * Build the coordinator system prompt with full workflow context
-     * Uses caching to avoid rebuilding on each coordinator invocation
+     * Build the coordinator system prompt with COMPLETE workflow context
+     * Includes full agent card metadata so coordinator can orchestrate properly
      */
     private buildSystemPrompt(): string {
-        // Return cached version if available (saves tokens on repeated calls)
+        // Return cached version if available
         if (this.cachedSystemPrompt) {
             return this.cachedSystemPrompt;
         }
 
         const agentSteps = this.workflow.steps.filter(s => s.type === "agent");
 
-        // Build minimal agent pipeline - only essential info
+        // Build complete agent pipeline with full metadata from inputTemplate
         const agentPipeline = agentSteps.map((s, i) => {
             const toolName = `delegate_to_${s.name.replace(/[^a-zA-Z0-9_]/g, "_")}`;
-            return `${i + 1}. **${s.name}** → \`${toolName}\``;
-        }).join("\n");
+            const meta = s.inputTemplate || {};
 
-        // Extract user input for context - ensure it's a string
-        const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
-        const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
-        const hasAttachment = !!(this.options.input.image || this.options.input.audio);
-        const attachmentNote = hasAttachment
-            ? ` [Attachment: ${this.options.input.image ? "Image" : ""}${this.options.input.audio ? "Audio" : ""}]`
+            // Extract agent card metadata (from buildManowarWorkflow in onchain.ts)
+            const model = meta.model || "default";
+
+            // Plugins are the MCP tools/connectors the agent has access to
+            const plugins = Array.isArray(meta.plugins)
+                ? meta.plugins.map((p: any) => typeof p === 'string' ? p : (p.name || p.registryId)).join(", ")
+                : "none";
+
+            // Skills describe what the agent can do
+            const skills = Array.isArray(meta.skills) && meta.skills.length > 0
+                ? meta.skills.join(", ")
+                : "";
+
+            return `### ${i + 1}. ${s.name}
+- **Delegation Tool**: \`${toolName}\`
+- **Model**: ${model}
+- **Plugins/Tools**: ${plugins}${skills ? `\n- **Skills**: ${skills}` : ""}`;
+        }).join("\n\n");
+
+        // MCP/Connector tools in workflow
+        const mcpSteps = this.workflow.steps.filter(s => s.type === "mcpTool" || s.type === "connectorTool");
+        const mcpTools = mcpSteps.length > 0
+            ? `\n\n## MCP TOOLS AVAILABLE\n${mcpSteps.map(s => `- ${s.name}: ${s.toolName} (${s.connectorId})`).join("\n")}`
             : "";
 
-        // Optimized system prompt - minimal but complete
-        this.cachedSystemPrompt = `You are the Manowar Coordinator for "${this.workflow.name}".
+        // User input with attachments (now Pinata URLs, not base64)
+        const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
+        const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
 
-## GOAL
-${this.workflow.description || "Execute workflow"}
+        // Handle new attachment format: { type: "image"|"audio", url: "https://..." }
+        const attachment = this.options.input.attachment as { type?: string; url?: string } | undefined;
+        let attachmentNote = "";
+        if (attachment?.url) {
+            attachmentNote = ` [${attachment.type || 'file'} attached: ${attachment.url}]`;
+        } else if (this.options.input.image || this.options.input.audio) {
+            // Legacy format fallback
+            const attachments: string[] = [];
+            if (this.options.input.image) attachments.push("Image attached");
+            if (this.options.input.audio) attachments.push("Audio attached");
+            attachmentNote = attachments.length > 0 ? ` [${attachments.join(", ")}]` : "";
+        }
 
-## PIPELINE
-${agentPipeline}
+        // Complete system prompt with full context
+        this.cachedSystemPrompt = `You are the **Shadow Orchestra Coordinator** for "${this.workflow.name}".
 
-## INPUT
-"${userMessage.slice(0, 500)}"${attachmentNote}
+## WORKFLOW GOAL
+${this.workflow.description || "Execute the workflow steps in sequence"}
 
-## RULES
-1. Execute SEQUENTIALLY (1→2→3) unless blocked
-2. Pass each output to the next step
-3. Return ONLY the final result`;
+## USER REQUEST
+"${userMessage}"${attachmentNote}
 
-        console.log(`[orchestrator] System prompt: ${Math.ceil(this.cachedSystemPrompt.length / 4)} tokens`);
+## COMPONENT AGENTS PIPELINE
+Execute these agents SEQUENTIALLY. Each agent is self-sufficient with its own tools.
+Pass each agent's output to the next step. Evaluate responses to determine if additional work is needed.
+
+${agentPipeline}${mcpTools}
+
+## ORCHESTRATION RULES
+1. **SEQUENTIAL EXECUTION**: Call agents in order (1 → 2 → 3...)
+2. **PASS OUTPUT FORWARD**: Each agent's response becomes context for the next
+3. **EVALUATE RESPONSES**: Check if step completed successfully before proceeding
+4. **USE AGENT CAPABILITIES**: Each agent has specific tools - delegate appropriately
+5. **HANDLE MISSING DATA**: If data is incomplete, use available tools or ask the appropriate agent
+6. **FINAL RESPONSE**: Return the completed result to the user`;
+
+        console.log(`[orchestrator] System prompt built: ${Math.ceil(this.cachedSystemPrompt.length / 4)} tokens`);
         return this.cachedSystemPrompt;
     }
 
@@ -356,6 +461,12 @@ ${agentPipeline}
         resetMultimodalOutput();
 
         console.log(`[orchestrator] Starting workflow ${this.workflow.id} (run: ${this.runId})`);
+
+        // SSE: Emit start event
+        this.emitProgress("start", {
+            message: `Starting workflow "${this.workflow.name}"`,
+            progress: 0,
+        });
 
         // Create tracked run
         const manowarId = this.workflow.id.startsWith("manowar-")
@@ -461,10 +572,8 @@ ${agentPipeline}
                     const modelWithTools = (model as any).bindTools(progressiveTools);
 
                     // =========================================================
-                    // Simplified Context Management (Mem0 Native Features)
-                    // =========================================================
 
-                    // 1. Simple token estimation (LangSmith provides accurate counts via usage_metadata)
+                    // 1. Token estimation
                     const estimatedTokens = Math.ceil(
                         systemPrompt.length / 4 +
                         state.messages.reduce((sum, m) => sum + String(m.content || '').length / 4, 0)
@@ -475,7 +584,7 @@ ${agentPipeline}
 
                     console.log(`[orchestrator] Context: ~${estimatedTokens} tokens (${usagePercent.toFixed(1)}% of ${modelSpec.effectiveWindow})`);
 
-                    // 2. Sliding window - keep recent messages only when approaching limit
+                    // 2. Standard sliding window at 60%
                     let messagesToUse: BaseMessage[] = state.messages;
 
                     if (usagePercent > TOKEN_THRESHOLD_PERCENT && state.messages.length > SLIDING_WINDOW_SIZE) {
@@ -505,10 +614,53 @@ ${agentPipeline}
                         }
                     }
 
-                    // 4. Build final messages
+                    // 4. SANITIZE messages - extract Pinata URLs from attachments
+                    // Orchestrator only needs: hasAttachment=true + pinataUrl (NOT base64 data)
+                    const sanitizeMessage = (m: BaseMessage): BaseMessage => {
+                        const content = String(m.content || '');
+
+                        // Skip short messages
+                        if (content.length < 2000) return m;
+
+                        // Try to extract Pinata URL or image metadata
+                        const pinataMatch = content.match(/https:\/\/[^"'\s]*pinata[^"'\s]*/i);
+                        const ipfsMatch = content.match(/ipfs:\/\/[^"'\s]+/i);
+                        const typeMatch = content.match(/"type"\s*:\s*"(image|audio|video)"/);
+                        const nameMatch = content.match(/"name"\s*:\s*"([^"]+)"/);
+
+                        // If this looks like a tool response with image data
+                        if (content.includes('"data"') && content.length > 5000) {
+                            const url = pinataMatch?.[0] || ipfsMatch?.[0];
+                            const mediaType = typeMatch?.[1] || 'image';
+                            const name = nameMatch?.[1] || 'attachment';
+
+                            // Create compact reference
+                            const compactContent = JSON.stringify({
+                                hasAttachment: true,
+                                type: mediaType,
+                                name: name,
+                                pinataUrl: url || '[uploaded to Pinata]',
+                                success: true,
+                            });
+
+                            if (m._getType() === 'tool') {
+                                console.log(`[orchestrator] Sanitized ${mediaType} attachment → compact reference`);
+                                return new ToolMessage({
+                                    content: compactContent,
+                                    tool_call_id: (m as any).tool_call_id,
+                                    name: (m as any).name,
+                                });
+                            }
+                        }
+                        return m;
+                    };
+
+                    const sanitizedMessages = messagesToUse.map(sanitizeMessage);
+
+                    // 5. Build final messages
                     const messagesWithSystem = [
                         new SystemMessage(systemPrompt + enhancements + memoryContext),
-                        ...messagesToUse,
+                        ...sanitizedMessages,
                     ];
 
                     if (this.langsmithTracker) {
@@ -519,8 +671,25 @@ ${agentPipeline}
                     return { messages: [response], completedActions: [`Coordinator response`] };
                 })
 
-                // 4. Tool execution node ONLY uses workflowTools (Data Plane)
-                .addNode("tools", new ToolNode(workflowTools))
+                // 4. Tool execution node - dynamically includes suggestedTools to match coordinator
+                .addNode("tools", async (state: ManowarState) => {
+                    // Build complete tool set: workflow tools + any suggested tools
+                    const allTools: DynamicStructuredTool[] = [...workflowTools];
+
+                    // Add suggested tools from ToolBoxer (same logic as coordinator)
+                    if (state.suggestedTools?.length) {
+                        for (const rec of state.suggestedTools) {
+                            if (rec.spawnParams) {
+                                allTools.push(createMcpTool(rec.registryId, rec.name, rec.description));
+                            }
+                        }
+                    }
+
+                    // Create and invoke ToolNode with complete tool set
+                    const toolNode = new ToolNode(allTools);
+                    return toolNode.invoke(state);
+                })
+
 
                 // Shadow Orchestra: NoteTaker
                 .addNode("noteTaker", async (state: ManowarState) => {
@@ -642,6 +811,14 @@ ${agentPipeline}
             const output = lastMessage?.content?.toString() || "";
 
             console.log(`[orchestrator] Complete in ${Date.now() - this.startTime}ms`);
+
+            // SSE: Emit complete event
+            this.emitProgress("complete", {
+                message: "Workflow completed successfully",
+                output: output.substring(0, 500), // Preview only
+                progress: 100,
+                tokenCount: this.tokenLedger.getCumulativeTotal(),
+            });
 
             // Complete tracked run
             completeRun(trackedRun.runId, { output }, {

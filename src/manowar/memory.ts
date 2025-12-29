@@ -1,53 +1,24 @@
 /**
- * Manowar Memory Module - Mem0 Platform Native Integration
+ * Manowar Memory Module - Mem0 Platform API Integration
  * 
- * - Uses Mem0 SDK (mem0ai) like backend/lambda/shared/mem0.ts
- * - Memory Priority Matrix: user_id > agent_id > run_id
- * - Native features: enable_graph, rerank, filter_memories
+ * Uses direct fetch to Mem0 Platform API (SDK is browser-only)
  * 
- * Memory Hierarchy (Priority Matrix):
+ * Memory Priority Matrix: user_id > agent_id > run_id
  * 1. user_id: User-specific preferences and context (highest priority)
  * 2. agent_id: Agent/Manowar execution patterns and learnings
  * 3. run_id: Current execution context (lowest priority, most specific)
  */
 
-import * as mem0ai from "mem0ai";
-
 // =============================================================================
-// Configuration
+// Configuration - Mem0 Platform API (Direct fetch, no SDK)
 // =============================================================================
 
 const MEM0_API_KEY = process.env.MEM0_API_KEY;
+const MEM0_API_URL = "https://api.mem0.ai/v1";
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
 if (!MEM0_API_KEY) {
     console.warn("[mem0] MEM0_API_KEY not found. Memory features will be disabled.");
-}
-
-// =============================================================================
-// Mem0 Client (SDK approach - matches lambda/shared/mem0.ts)
-// =============================================================================
-
-type Mem0Client = any;
-let mem0Client: Mem0Client | null = null;
-
-function getMem0Client(): Mem0Client | null {
-    if (mem0Client) return mem0Client;
-    if (!MEM0_API_KEY) return null;
-
-    try {
-        const MemoryClass = (mem0ai as any).MemoryClient || (mem0ai as any).default?.MemoryClient;
-        if (typeof MemoryClass !== "function") {
-            console.error("[mem0] MemoryClient class not found. Available exports:", Object.keys(mem0ai));
-            return null;
-        }
-        mem0Client = new MemoryClass({ apiKey: MEM0_API_KEY });
-        console.log("[mem0] Client initialized (SDK mode)");
-        return mem0Client;
-    } catch (error) {
-        console.error("[mem0] Failed to initialize client:", error);
-        return null;
-    }
 }
 
 // =============================================================================
@@ -102,14 +73,6 @@ export const TOKEN_THRESHOLD_PERCENT = 60;
 // Memory Priority Matrix Configuration
 // =============================================================================
 
-/**
- * Memory Priority: user_id > agent_id > run_id
- * 
- * When searching/adding memories:
- * - user_id: User preferences, history across all agents (highest priority)
- * - agent_id: Manowar/agent-specific patterns and learnings
- * - run_id: Current execution context only
- */
 interface MemoryContext {
     user_id?: string;      // Priority 1: User context
     agent_id: string;      // Priority 2: Agent/Manowar context
@@ -117,12 +80,12 @@ interface MemoryContext {
 }
 
 // =============================================================================
-// Mem0 SDK Operations (Native Features)
+// Mem0 Platform API - Direct Fetch (No SDK - SDK is browser-only)
 // =============================================================================
 
 /**
- * Add memory with native graph extraction using SDK
- * Priority: Stores with user_id (if provided) > agent_id > run_id
+ * Add memory with native graph extraction
+ * Priority: user_id > agent_id > run_id
  */
 export async function addMemoryWithGraph(params: {
     messages: Array<{ role: string; content: string }>;
@@ -131,24 +94,39 @@ export async function addMemoryWithGraph(params: {
     run_id: string;
     metadata?: Record<string, unknown>;
 }): Promise<MemoryItem[]> {
-    const client = getMem0Client();
-    if (!client) return [];
+    if (!MEM0_API_KEY) {
+        console.warn("[mem0] API key not configured, skipping memory add");
+        return [];
+    }
 
     try {
-        const result = await client.add(params.messages, {
-            user_id: params.user_id,       // Priority 1
-            agent_id: params.agent_id,     // Priority 2
-            run_id: params.run_id,         // Priority 3
-            metadata: {
-                ...params.metadata,
-                run_id: params.run_id,
-                timestamp: Date.now(),
+        const response = await fetch(`${MEM0_API_URL}/memories/`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Token ${MEM0_API_KEY}`,
             },
-            enable_graph: true,  // Native entity extraction
+            body: JSON.stringify({
+                messages: params.messages,
+                user_id: params.user_id,       // Priority 1
+                agent_id: params.agent_id,     // Priority 2
+                run_id: params.run_id,         // Priority 3
+                metadata: {
+                    ...params.metadata,
+                    run_id: params.run_id,
+                    timestamp: Date.now(),
+                },
+                enable_graph: true,
+            }),
         });
 
-        console.log(`[mem0] Added memory: user=${params.user_id || 'none'}, agent=${params.agent_id}, run=${params.run_id}`);
-        return result as unknown as MemoryItem[];
+        if (!response.ok) {
+            console.error(`[mem0] Add failed: ${response.status}`);
+            return [];
+        }
+
+        const result = await response.json();
+        return Array.isArray(result) ? result : result.memories || [result];
     } catch (error) {
         console.error("[mem0] Failed to add memory:", error);
         return [];
@@ -156,8 +134,8 @@ export async function addMemoryWithGraph(params: {
 }
 
 /**
- * Search memories with native advanced retrieval using SDK
- * Priority search: user_id context first, then agent_id, then run_id
+ * Search memories with native advanced retrieval
+ * Priority: user_id > agent_id > run_id
  */
 export async function searchMemoryWithGraph(params: {
     query: string;
@@ -172,31 +150,44 @@ export async function searchMemoryWithGraph(params: {
         keyword_search?: boolean;
     };
 }): Promise<GraphMemoryResult> {
-    const client = getMem0Client();
-    if (!client) return { memories: [], entities: [], relations: [] };
+    if (!MEM0_API_KEY) {
+        return { memories: [], entities: [], relations: [] };
+    }
 
     try {
-        // Primary search: Include user context if available (highest priority)
-        const searchOptions: Record<string, unknown> = {
-            user_id: params.user_id,       // Priority 1 - user preferences
-            agent_id: params.agent_id,     // Priority 2 - agent patterns
-            run_id: params.run_id,         // Priority 3 - current execution
-            limit: params.limit || 10,
-            filters: params.filters,
-            enable_graph: true,            // Native graph relations
-        };
+        // Build V2 filters with priority
+        const filterConditions: unknown[] = [];
+        if (params.agent_id) filterConditions.push({ agent_id: params.agent_id });
+        if (params.user_id) filterConditions.push({ user_id: params.user_id });
+        if (params.run_id) filterConditions.push({ run_id: params.run_id });
 
-        // Add native advanced retrieval options if specified
-        if (params.options?.rerank !== false) {
-            // Rerank enabled by default for better relevance
+        const response = await fetch(`${MEM0_API_URL}/memories/search/`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Token ${MEM0_API_KEY}`,
+            },
+            body: JSON.stringify({
+                query: params.query,
+                agent_id: params.agent_id,
+                user_id: params.user_id,
+                limit: params.limit || 10,
+                filters: filterConditions.length > 0 ? { AND: filterConditions } : params.filters,
+                enable_graph: true,
+                rerank: params.options?.rerank ?? true,
+            }),
+        });
+
+        if (!response.ok) {
+            console.error(`[mem0] Search failed: ${response.status}`);
+            return { memories: [], entities: [], relations: [] };
         }
 
-        const result = await client.search(params.query, searchOptions);
-
+        const data = await response.json();
         return {
-            memories: result as unknown as MemoryItem[],
-            entities: [],  // SDK may not expose entities directly
-            relations: [], // SDK may not expose relations directly
+            memories: data.memories || data.results || (Array.isArray(data) ? data : []),
+            entities: data.entities || [],
+            relations: data.relations || [],
         };
     } catch (error) {
         console.error("[mem0] Failed to search memory:", error);
@@ -205,34 +196,37 @@ export async function searchMemoryWithGraph(params: {
 }
 
 /**
- * Get all memories for a context using SDK
- * Supports priority filtering by user_id > agent_id > run_id
+ * Get all memories for a context
  */
 export async function getAllMemories(params: {
     agent_id: string;
     user_id?: string;
     run_id?: string;
-    limit?: number;
 }): Promise<MemoryItem[]> {
-    const client = getMem0Client();
-    if (!client) return [];
+    if (!MEM0_API_KEY) return [];
 
     try {
-        const result = await client.getAll({
-            user_id: params.user_id,
-            agent_id: params.agent_id,
-            run_id: params.run_id,
-            limit: params.limit,
-            enable_graph: true,
+        const url = new URL(`${MEM0_API_URL}/memories/`);
+        if (params.agent_id) url.searchParams.set("agent_id", params.agent_id);
+        if (params.user_id) url.searchParams.set("user_id", params.user_id);
+
+        const response = await fetch(url.toString(), {
+            method: "GET",
+            headers: {
+                "Authorization": `Token ${MEM0_API_KEY}`,
+            },
         });
-        return result as unknown as MemoryItem[];
+
+        if (!response.ok) return [];
+        const data = await response.json();
+        return data.memories || data.results || [];
     } catch {
         return [];
     }
 }
 
 // =============================================================================
-// Hierarchical Memory Operations (Priority Matrix Implementation)
+// Hierarchical Memory (Priority Matrix Implementation)
 // =============================================================================
 
 /**
@@ -242,9 +236,9 @@ export async function getAllMemories(params: {
 export async function getContextualMemory(
     query: string,
     context: MemoryContext,
-    options?: { limit?: number; includePatterns?: boolean }
+    options?: { limit?: number }
 ): Promise<{ memories: MemoryItem[]; source: 'user' | 'agent' | 'run' }> {
-    // Priority 1: User-specific memories (highest priority)
+    // Priority 1: User-specific memories
     if (context.user_id) {
         const userMemories = await searchMemoryWithGraph({
             query,
@@ -257,7 +251,7 @@ export async function getContextualMemory(
         }
     }
 
-    // Priority 2: Agent-level patterns (without user filter)
+    // Priority 2: Agent-level patterns
     const agentMemories = await searchMemoryWithGraph({
         query,
         agent_id: context.agent_id,
@@ -267,7 +261,7 @@ export async function getContextualMemory(
         return { memories: agentMemories.memories, source: 'agent' };
     }
 
-    // Priority 3: Run-specific context (most specific)
+    // Priority 3: Run-specific context
     if (context.run_id) {
         const runMemories = await searchMemoryWithGraph({
             query,
@@ -282,11 +276,11 @@ export async function getContextualMemory(
 }
 
 // =============================================================================
-// Memory Operations (Simplified with Native Features)
+// Memory Operations
 // =============================================================================
 
 /**
- * Optimize with graph - relies on Mem0's native entity extraction
+ * Optimize with graph - uses Mem0's native entity extraction
  */
 export async function optimizeWithGraph(
     workflowId: string,
@@ -343,7 +337,7 @@ Last outcome: ${currentContext.lastOutcome}`;
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                model: "moonshotai/kimi-k2-thinking",
+                model: "nvidia/nemotron-3-nano-30b-a3b:free",
                 messages: [{ role: "user", content: summaryPrompt }],
                 temperature: 0.3,
             }),
@@ -352,7 +346,6 @@ Last outcome: ${currentContext.lastOutcome}`;
         const data = await response.json();
         const summary = data.choices?.[0]?.message?.content || currentContext.lastOutcome;
 
-        // Store in Mem0 using SDK
         const memories = await addMemoryWithGraph({
             messages: [
                 { role: "system", content: `Memory wipe summary for ${workflowId}` },
@@ -376,12 +369,9 @@ Last outcome: ${currentContext.lastOutcome}`;
 }
 
 // =============================================================================
-// Solution Pattern Storage (Workflow Learning)
+// Solution Pattern Storage
 // =============================================================================
 
-/**
- * Find similar solutions using native Mem0 search with reranking
- */
 export async function findSimilarSolutions(
     workflowId: string,
     taskDescription: string,
@@ -408,9 +398,6 @@ export async function findSimilarSolutions(
         }));
 }
 
-/**
- * Save solution pattern for future retrieval
- */
 export async function saveSolutionPattern(
     workflowId: string,
     runId: string,
@@ -429,7 +416,6 @@ export async function saveSolutionPattern(
             toolSequence: pattern.toolSequence,
             outcome: pattern.outcome,
             confidence: pattern.confidence,
-            notes: pattern.notes,
         },
     });
 
@@ -437,12 +423,9 @@ export async function saveSolutionPattern(
 }
 
 // =============================================================================
-// Graph Insights - Native Mem0 Graph Retrieval
+// Graph Insights
 // =============================================================================
 
-/**
- * Get graph insights using native Mem0 graph search
- */
 export async function getGraphInsights(
     workflowId: string,
     runId: string,
@@ -456,7 +439,6 @@ export async function getGraphInsights(
         options: { rerank: true },
     });
 
-    // Extract unique entities from memories
     const entityMap = new Map<string, { type: string; count: number }>();
     for (const mem of result.memories) {
         for (const rel of mem.relations || []) {
@@ -474,12 +456,9 @@ export async function getGraphInsights(
 }
 
 // =============================================================================
-// Context Summarization - Simplified with Native Mem0
+// Context Summarization
 // =============================================================================
 
-/**
- * Summarize context for continuity - stores in Mem0 automatically
- */
 export async function summarizeForContinuity(
     workflowId: string,
     runId: string,
@@ -518,7 +497,6 @@ Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
 
         const parsed = JSON.parse(jsonMatch[0]);
 
-        // Store in Mem0 using SDK
         await addMemoryWithGraph({
             messages: [
                 { role: "system", content: `Context summary for ${workflowId}` },
@@ -542,13 +520,9 @@ Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
 }
 
 // =============================================================================
-// Essential Functions (Kept from original)
+// Essential Functions
 // =============================================================================
 
-/**
- * Compress tool output to essential content only
- * KEPT: Tool-specific compression still needed
- */
 export function compressToolOutput(
     rawOutput: unknown,
     agentName: string,
@@ -565,10 +539,7 @@ export function compressToolOutput(
         return `[${agentName}]: (no output)`;
     }
 
-    // Handle objects
     const obj = rawOutput as Record<string, unknown>;
-
-    // Priority extraction: output > content > message > result
     const content = obj.output || obj.content || obj.message || obj.result;
 
     if (content) {
@@ -576,7 +547,6 @@ export function compressToolOutput(
         return `[${agentName}]: ${str.slice(0, maxLength)}`;
     }
 
-    // Full object fallback (remove verbose fields)
     const cleaned = { ...obj };
     delete cleaned.walletAddress;
     delete cleaned.agentId;
@@ -588,10 +558,6 @@ export function compressToolOutput(
     return `[${agentName}]: ${json.slice(0, maxLength)}`;
 }
 
-/**
- * Generate minimal structured task prompt for agents
- * KEPT: Workflow-specific task formatting
- */
 export function generateStructuredTaskPrompt(
     agentName: string,
     task: string,
