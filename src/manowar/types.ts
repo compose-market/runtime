@@ -312,6 +312,23 @@ export interface PaymentContext {
 // Executor Options
 // =============================================================================
 
+/** SSE Progress Event types for streaming */
+export interface SSEProgressEvent {
+    type: "start" | "step" | "agent" | "tool" | "response" | "error" | "complete";
+    timestamp: number;
+    data: {
+        runId?: string;
+        stepName?: string;
+        agentName?: string;
+        toolName?: string;
+        message?: string;
+        output?: string;
+        error?: string;
+        tokenCount?: number;
+        progress?: number; // 0-100
+    };
+}
+
 export interface ExecutorOptions {
     /** Payment context for x402 */
     payment: PaymentContext;
@@ -319,6 +336,8 @@ export interface ExecutorOptions {
     input: Record<string, unknown>;
     /** Callback for step status updates */
     onStepUpdate?: (result: StepExecutionResult) => void;
+    /** SSE progress callback for real-time streaming */
+    onProgress?: (event: SSEProgressEvent) => void;
     /** Whether to continue on step errors */
     continueOnError?: boolean;
     /** Maximum execution time in ms */

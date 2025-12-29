@@ -317,7 +317,13 @@ export async function createAgentTools(
                         // Check if this tool is marked as failed - don't waste cycles retrying
                         const failCheck = isToolFailed(toolKey);
                         if (failCheck.failed) {
-                            return `Tool "${input.tool}" is temporarily unavailable (${failCheck.reason}). Please try a different approach or tool.`;
+                            return JSON.stringify({
+                                error: true,
+                                status: "TOOL_UNAVAILABLE",
+                                message: `Tool "${input.tool}" is temporarily unavailable: ${failCheck.reason}`,
+                                retryable: false,
+                                suggestion: "Use an alternative approach or inform the user this capability is unavailable."
+                            });
                         }
 
                         // Route to MCP service for actual tool execution
@@ -353,13 +359,18 @@ export async function createAgentTools(
                             if (!execResponse.ok) {
                                 const error = await execResponse.text();
 
-                                // Check if this is a spawn/availability error vs input error
                                 if (error.includes("temporarily unavailable") ||
                                     error.includes("spawn") ||
                                     error.includes("Failed to get tools") ||
                                     execResponse.status === 503) {
                                     markToolFailed(toolKey, "server unavailable");
-                                    return `Tool "${input.tool}" failed: MCP server unavailable. Try a different approach.`;
+                                    return JSON.stringify({
+                                        error: true,
+                                        status: "SERVER_UNAVAILABLE",
+                                        message: `Tool "${input.tool}" failed: MCP server unavailable`,
+                                        retryable: false,
+                                        suggestion: "Do NOT retry this tool. Use alternative tools or inform the user."
+                                    });
                                 }
 
                                 // For other errors (bad input), don't mark as failed
@@ -371,7 +382,13 @@ export async function createAgentTools(
                         } catch (err: any) {
                             // Network/timeout errors - mark as failed
                             markToolFailed(toolKey, err.message || "network error");
-                            return `Tool "${input.tool}" failed (${err.message}). Try a different approach.`;
+                            return JSON.stringify({
+                                error: true,
+                                status: "NETWORK_ERROR",
+                                message: `Tool "${input.tool}" failed: ${err.message || "network error"}`,
+                                retryable: false,
+                                suggestion: "Do NOT retry. Use alternative approach or inform the user."
+                            });
                         }
                     },
                 });
