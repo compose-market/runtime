@@ -298,8 +298,8 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
         steps,
     };
 
-    // Parse request
-    const { message, threadId, image, audio } = req.body;
+    // Parse request - handle both legacy (image/audio) and new (attachment) formats
+    const { message, threadId, image, audio, attachment } = req.body;
     if (!message) {
         res.status(400).json({ error: "message is required" });
         return;
@@ -314,38 +314,46 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
         userId: req.headers["x-session-user-address"] as string | undefined,
     };
 
-    // Execute workflow with orchestrator
+    // Set up SSE response for long-running workflows
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
+    res.flushHeaders();
+
+    // Send initial SSE event
+    res.write(`event: start\ndata: ${JSON.stringify({ runId: `run-${Date.now()}`, message: "Starting workflow..." })}\n\n`);
+
+    // Execute workflow with SSE progress callback
     const result = await executeWithOrchestrator(workflow, {
-        input: { message, threadId, image, audio },
+        input: { message, threadId, attachment, image, audio },
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
+        onProgress: (event) => {
+            // Send SSE event for each progress update
+            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+        },
     });
 
     // Mark as executed
     markManowarExecuted(identifier);
 
-    // Extract output from context (the orchestrator stores results in context)
-    // Check 'output' BEFORE 'message' - 'message' is the user's input!
+    // Extract output from context
     const output = result.context?.output ||
         result.context?.coordinatorResponse ||
         (result.status === "success" ? "Workflow completed" : result.error || "");
 
-    if (typeof output === "string" && output.length > 0) {
-        // Stream as text/plain for frontend compatibility (matches agent pattern)
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.setHeader("Transfer-Encoding", "chunked");
-        res.write(output);
-        res.end();
-    } else {
-        res.json({
-            success: result.status === "success",
-            output: result.context,
-            manowarId: manowar.manowarId,
-            walletAddress: manowar.walletAddress,
-            tokenState: result.tokenState,
-            error: result.error,
-        });
-    }
+    // Send final result as SSE event
+    const finalData = {
+        success: result.status === "success",
+        output: typeof output === "string" ? output : JSON.stringify(output),
+        manowarId: manowar.manowarId,
+        walletAddress: manowar.walletAddress,
+        error: result.error,
+    };
+    res.write(`event: result\ndata: ${JSON.stringify(finalData)}\n\n`);
+    res.write(`event: done\ndata: {}\n\n`);
+    res.end();
 }));
 
 // ============================================================================
