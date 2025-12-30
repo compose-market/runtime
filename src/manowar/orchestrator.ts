@@ -298,25 +298,38 @@ export class ManowarOrchestrator {
         this.options = options;
         this.runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         this.tokenLedger = new TokenLedger();
-        // Use coordinator model from options (passed from registry) or default from agentic.ts
-        this.coordinatorModel = options.coordinatorModel || getDefaultCoordinatorModel();
+
+        // Coordinator model comes from on-chain manowar data
+        if (!options.coordinatorModel) {
+            throw new Error("coordinatorModel is required. User must select a coordinator model when minting the manowar.");
+        }
+        this.coordinatorModel = options.coordinatorModel;
         console.log(`[orchestrator] Using coordinator model: ${this.coordinatorModel}`);
     }
 
     /**
      * Emit SSE progress event if callback is registered
+     * 
+     * Event types: start, progress, step, agent, tool_start, tool_end, response, result, error, done
      */
     private emitProgress(
-        type: "start" | "step" | "agent" | "tool" | "response" | "error" | "complete",
+        type: "start" | "progress" | "step" | "agent" | "tool_start" | "tool_end" | "response" | "result" | "error" | "done",
         data: {
             stepName?: string;
+            stepIndex?: number;
+            totalSteps?: number;
             agentName?: string;
+            agentWallet?: string;
             toolName?: string;
             message?: string;
             output?: string;
             error?: string;
             tokenCount?: number;
+            tokensUsed?: number;
+            tokenBudget?: number;
+            cost?: number;
             progress?: number;
+            duration?: number;
         }
     ): void {
         if (this.options.onProgress) {
@@ -370,6 +383,8 @@ export class ManowarOrchestrator {
     /**
      * Build the coordinator system prompt with COMPLETE workflow context
      * Includes full agent card metadata so coordinator can orchestrate properly
+     * 
+     * CRITICAL: Instructs coordinator to PING agents, NOT execute tasks
      */
     private buildSystemPrompt(): string {
         // Return cached version if available
@@ -379,13 +394,14 @@ export class ManowarOrchestrator {
 
         const agentSteps = this.workflow.steps.filter(s => s.type === "agent");
 
-        // Build complete agent pipeline with full metadata from inputTemplate
+        // Build complete agent pipeline with full metadata from agentCardUri
         const agentPipeline = agentSteps.map((s, i) => {
             const toolName = `delegate_to_${s.name.replace(/[^a-zA-Z0-9_]/g, "_")}`;
             const meta = s.inputTemplate || {};
 
-            // Extract agent card metadata (from buildManowarWorkflow in onchain.ts)
-            const model = meta.model || "default";
+            // Extract agent card metadata (resolved from manowarCardUri at registration)
+            const model = meta.model;
+            const description = meta.description;
 
             // Plugins are the MCP tools/connectors the agent has access to
             const plugins = Array.isArray(meta.plugins)
@@ -397,39 +413,37 @@ export class ManowarOrchestrator {
                 ? meta.skills.join(", ")
                 : "";
 
-            // Agent card URI for full context
-            const cardUri = meta.agentCardUri || s.agentAddress || "";
+            // Agent card URI for full context (IPFS source of truth)
+            const cardUri = meta.agentCardUri;
 
             return `### ${i + 1}. ${s.name}
 - **Delegation Tool**: \`${toolName}\`
 - **Model**: ${model}
-- **Plugins/Tools**: ${plugins}${skills ? `\n- **Skills**: ${skills}` : ""}${cardUri ? `\n- **Agent Card**: ${cardUri}` : ""}`;
+- **Plugins/Tools**: ${plugins}
+- **Skills**: ${skills}${description ? `\n- **Description**: ${description}` : ""}${cardUri ? `\n- **Agent Card**: ${cardUri}` : ""}
+- **Invoke**: Call \`${toolName}\` with structured task context and any attachments`;
         }).join("\n\n");
 
-        // MCP/Connector tools in workflow
+        // MCP/Connector tools in workflow (available for direct use if needed)
         const mcpSteps = this.workflow.steps.filter(s => s.type === "mcpTool" || s.type === "connectorTool");
         const mcpTools = mcpSteps.length > 0
             ? `\n\n## MCP TOOLS AVAILABLE\n${mcpSteps.map(s => `- ${s.name}: ${s.toolName} (${s.connectorId})`).join("\n")}`
             : "";
 
-        // User input with attachments (now Pinata URLs, not base64)
+        // User input with attachments (always Pinata URLs, never base64)
         const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
         const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
 
-        // Handle new attachment format: { type: "image"|"audio", url: "https://..." }
+        // Handle attachment format: { type: string, url: string }
+        // Orchestrator ONLY sees URL reference - never raw file data
         const attachment = this.options.input.attachment as { type?: string; url?: string } | undefined;
         let attachmentNote = "";
         if (attachment?.url) {
-            attachmentNote = ` [${attachment.type || 'file'} attached: ${attachment.url}]`;
-        } else if (this.options.input.image || this.options.input.audio) {
-            // Legacy format fallback
-            const attachments: string[] = [];
-            if (this.options.input.image) attachments.push("Image attached");
-            if (this.options.input.audio) attachments.push("Audio attached");
-            attachmentNote = attachments.length > 0 ? ` [${attachments.join(", ")}]` : "";
+            // Only pass URL reference to coordinator - agent handles actual file
+            attachmentNote = `\n\n## ATTACHMENT\n- **Type**: ${attachment.type || 'file'}\n- **URL**: ${attachment.url}\n- **Note**: Pass this URL to the appropriate agent for processing. Do NOT attempt to read file contents yourself.`;
         }
 
-        // Complete system prompt with full context
+        // Complete system prompt with CRITICAL orchestration rules
         this.cachedSystemPrompt = `You are the **Shadow Orchestra Coordinator** for "${this.workflow.name}".
 
 ## WORKFLOW GOAL
@@ -439,18 +453,42 @@ ${this.workflow.description || "Execute the workflow steps in sequence"}
 "${userMessage}"${attachmentNote}
 
 ## COMPONENT AGENTS PIPELINE
-Execute these agents SEQUENTIALLY. Each agent is self-sufficient with its own tools.
-Pass each agent's output to the next step. Evaluate responses to determine if additional work is needed.
-
 ${agentPipeline}${mcpTools}
 
-## ORCHESTRATION RULES
-1. **SEQUENTIAL EXECUTION**: Call agents in order (1 → 2 → 3...)
-2. **PASS OUTPUT FORWARD**: Each agent's response becomes context for the next
-3. **EVALUATE RESPONSES**: Check if step completed successfully before proceeding
-4. **USE AGENT CAPABILITIES**: Each agent has specific tools - delegate appropriately
-5. **HANDLE MISSING DATA**: If data is incomplete, use available tools or ask the appropriate agent
-6. **FINAL RESPONSE**: Return the completed result to the user`;
+## CRITICAL ORCHESTRATION RULES
+
+### 1. PING, DON'T EXECUTE
+You are the **COORDINATOR**, NOT an executor. You MUST delegate all tasks to the component agents above.
+- Call each agent using their delegation tool (e.g., \`delegate_to_AgentName\`)
+- Do NOT attempt to perform agent tasks yourself
+- Do NOT use generic tools when an agent is designed for that task
+
+### 2. SEQUENTIAL DELEGATION
+Execute agents in pipeline order: 1 → 2 → 3...
+- Pass each agent's complete output as context to the next agent
+- Include any relevant attachments (as URLs) in the delegation
+
+### 3. STRUCTURED INSTRUCTIONS
+When calling an agent, provide:
+- Clear task description based on user request
+- Previous agent(s) output/results
+- Attachment URLs if applicable
+- Any constraints or requirements
+
+### 4. WAIT FOR RESPONSE
+After calling an agent, WAIT for their response before proceeding.
+- Evaluate if the response satisfies the step requirements
+- If incomplete, you may re-call the same agent with clarification
+
+### 5. A2A RESOLUTION (Agent-to-Agent)
+If an agent needs clarification or has questions:
+- Resolve it by providing more context or re-delegating
+- Do NOT ask the user interactively mid-workflow
+- Use your knowledge of the workflow and previous outputs to answer agent queries
+- ONLY provide the USER with the final, complete result
+
+### 6. FINAL RESPONSE
+After all agents complete, synthesize their outputs into a coherent final response for the user.`;
 
         console.log(`[orchestrator] System prompt built: ${Math.ceil(this.cachedSystemPrompt.length / 4)} tokens`);
         return this.cachedSystemPrompt;
@@ -730,6 +768,7 @@ ${agentPipeline}${mcpTools}
                     const result = await performMemoryWipe(
                         this.workflow.id,
                         this.runId,
+                        this.coordinatorModel,  // Use the coordinator model from options
                         {
                             goal: state.activeGoal,
                             completedActions: state.completedActions || [],
@@ -817,8 +856,8 @@ ${agentPipeline}${mcpTools}
 
             console.log(`[orchestrator] Complete in ${Date.now() - this.startTime}ms`);
 
-            // SSE: Emit complete event
-            this.emitProgress("complete", {
+            // SSE: Emit done event
+            this.emitProgress("done", {
                 message: "Workflow completed successfully",
                 output: output.substring(0, 500), // Preview only
                 progress: 100,
