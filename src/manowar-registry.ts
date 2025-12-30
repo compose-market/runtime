@@ -5,9 +5,10 @@
  * Links on-chain Manowar NFTs to their backend runtime instances.
  * 
  * Key features:
- * - Uses wallet address as primary identifier (not progressive IDs)
+ * - Uses wallet address as PRIMARY and ONLY identifier
  * - O(1) lookup by wallet address (matching agent pattern)
  * - Caches workflow metadata from IPFS
+ * - manowarId is stored for on-chain reference but NOT used for lookups
  */
 
 // =============================================================================
@@ -15,10 +16,10 @@
 // =============================================================================
 
 export interface RegisteredManowar {
-    /** On-chain manowar ID (ERC721 NFT ID) */
-    manowarId: number;
-    /** Derived wallet address (PRIMARY IDENTIFIER) */
+    /** Derived wallet address (PRIMARY IDENTIFIER - used for all lookups) */
     walletAddress: string;
+    /** On-chain manowar ID (ERC721 NFT ID) - stored for on-chain reference only */
+    onchainTokenId: number;
     /** DNA hash from contract */
     dnaHash?: string;
     /** Manowar title */
@@ -35,7 +36,7 @@ export interface RegisteredManowar {
     coordinatorModel?: string;
     /** Total price in USDC (formatted) */
     totalPrice?: string;
-    /** Agent IDs in this workflow (from on-chain getAgents) */
+    /** Agent wallet addresses in this workflow */
     agentWalletAddresses?: string[];
     /** Registration timestamp */
     createdAt: Date;
@@ -44,8 +45,10 @@ export interface RegisteredManowar {
 }
 
 export interface RegisterManowarParams {
-    manowarId: number;
+    /** PRIMARY IDENTIFIER - wallet address derived from on-chain data */
     walletAddress: string;
+    /** On-chain token ID (for display/on-chain reference only) */
+    onchainTokenId: number;
     dnaHash?: string;
     title: string;
     description: string;
@@ -61,11 +64,8 @@ export interface RegisterManowarParams {
 // Storage (in-memory)
 // =============================================================================
 
-/** Registered manowars by wallet address */
+/** Registered manowars by wallet address (ONLY lookup method) */
 const registeredManowars = new Map<string, RegisteredManowar>();
-
-/** Manowar ID to wallet address mapping (for backward compatibility) */
-const manowarIdToWallet = new Map<string, string>();
 
 // =============================================================================
 // Registration
@@ -74,7 +74,7 @@ const manowarIdToWallet = new Map<string, string>();
 /**
  * Register a manowar workflow
  * 
- * walletAddress is the primary identifier (from IPFS metadata)
+ * walletAddress is the PRIMARY and ONLY identifier
  */
 export function registerManowar(params: RegisterManowarParams): RegisteredManowar {
     const walletAddress = params.walletAddress;
@@ -84,15 +84,14 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
 
     // Check if already registered by wallet address
     if (registeredManowars.has(walletAddress)) {
-        // Update existing registration
         const existing = registeredManowars.get(walletAddress)!;
         console.log(`[manowar-registry] Already registered: ${params.title} (${walletAddress})`);
         return existing;
     }
 
     const registered: RegisteredManowar = {
-        manowarId: params.manowarId,
         walletAddress,
+        onchainTokenId: params.onchainTokenId,
         dnaHash: params.dnaHash,
         title: params.title,
         description: params.description,
@@ -106,11 +105,10 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
     };
 
     registeredManowars.set(walletAddress, registered);
-    manowarIdToWallet.set(params.manowarId.toString(), walletAddress);
 
     console.log(`[manowar-registry] Registered manowar: ${params.title}`);
     console.log(`[manowar-registry]   Wallet: ${walletAddress}`);
-    console.log(`[manowar-registry]   ID: ${params.manowarId}`);
+    console.log(`[manowar-registry]   On-chain Token ID: ${params.onchainTokenId}`);
     console.log(`[manowar-registry]   Coordinator: ${params.coordinatorModel || "none"}`);
     console.log(`[manowar-registry]   Agents: [${params.agentWalletAddresses?.join(", ") || "none"}]`);
 
@@ -118,23 +116,13 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
 }
 
 // =============================================================================
-// Lookup Functions
+// Lookup Functions (wallet address ONLY)
 // =============================================================================
 
 /**
- * Get registered manowar by wallet address (preferred)
+ * Get registered manowar by wallet address
  */
-export function getManowarByWallet(walletAddress: string): RegisteredManowar | undefined {
-    return registeredManowars.get(walletAddress);
-}
-
-/**
- * Get registered manowar by ID (backward compatibility)
- */
-export function getManowarById(manowarId: number | string): RegisteredManowar | undefined {
-    const key = manowarId.toString();
-    const walletAddress = manowarIdToWallet.get(key);
-    if (!walletAddress) return undefined;
+export function getManowar(walletAddress: string): RegisteredManowar | undefined {
     return registeredManowars.get(walletAddress);
 }
 
@@ -146,27 +134,10 @@ export function listRegisteredManowars(): RegisteredManowar[] {
 }
 
 /**
- * Check if wallet or manowar ID exists
+ * Check if manowar exists by wallet address
  */
-export function hasManowar(identifier: string): boolean {
-    // Check if it's a wallet address
-    if (identifier.startsWith("0x") && identifier.length === 42) {
-        return registeredManowars.has(identifier);
-    }
-    // Otherwise treat as manowar ID
-    return manowarIdToWallet.has(identifier);
-}
-
-/**
- * Resolve identifier (wallet or ID) to manowar
- */
-export function resolveManowar(identifier: string): RegisteredManowar | undefined {
-    // Check if it's a wallet address (0x + 40 hex chars)
-    if (identifier.startsWith("0x") && identifier.length === 42) {
-        return registeredManowars.get(identifier);
-    }
-    // Otherwise treat as manowar ID
-    return getManowarById(identifier);
+export function hasManowar(walletAddress: string): boolean {
+    return registeredManowars.has(walletAddress);
 }
 
 // =============================================================================
@@ -176,8 +147,8 @@ export function resolveManowar(identifier: string): RegisteredManowar | undefine
 /**
  * Update manowar last executed timestamp
  */
-export function markManowarExecuted(identifier: string): void {
-    const manowar = resolveManowar(identifier);
+export function markManowarExecuted(walletAddress: string): void {
+    const manowar = registeredManowars.get(walletAddress);
     if (manowar) {
         manowar.lastExecutedAt = new Date();
     }
@@ -186,12 +157,8 @@ export function markManowarExecuted(identifier: string): void {
 /**
  * Unregister a manowar
  */
-export function unregisterManowar(identifier: string): boolean {
-    const manowar = resolveManowar(identifier);
-    if (!manowar) return false;
-
-    manowarIdToWallet.delete(manowar.manowarId.toString());
-    return registeredManowars.delete(manowar.walletAddress);
+export function unregisterManowar(walletAddress: string): boolean {
+    return registeredManowars.delete(walletAddress);
 }
 
 // =============================================================================

@@ -17,7 +17,7 @@ import {
 } from "./manowar/index.js";
 import {
     registerManowar,
-    resolveManowar,
+    getManowar,
     listRegisteredManowars,
     markManowarExecuted,
 } from "./manowar-registry.js";
@@ -111,12 +111,12 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         return;
     }
 
-    // Parse manowar identifier and resolve from registry (matches agent pattern)
-    const identifier = String(payload.manowarId || payload.workflow || payload.id);
-    const manowar = resolveManowar(identifier);
+    // Parse manowar identifier - must be wallet address
+    const walletAddress = String(payload.walletAddress || payload.manowarWallet || payload.id);
+    const manowar = getManowar(walletAddress);
 
     if (!manowar) {
-        res.status(404).json({ error: `Manowar "${identifier}" not found` });
+        res.status(404).json({ error: `Manowar "${walletAddress}" not found` });
         return;
     }
 
@@ -137,10 +137,10 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
     }
     console.log(`[manowar] Built ${steps.length} agent steps from wallets: [${manowar.agentWalletAddresses?.join(", ") || "none"}]`);
 
-    // Build workflow from registry data
+    // Build workflow from registry data - use wallet address as ID
     const workflow: Workflow = {
-        id: `manowar-${manowar.manowarId}`,
-        name: manowar.title || `Manowar #${manowar.manowarId}`,
+        id: `manowar-${manowar.walletAddress}`,
+        name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
         description: manowar.description || "",
         steps,
     };
@@ -191,10 +191,10 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
     try {
         // Register directly from frontend data (matches agent pattern)
         const registrationResult = registerManowar({
-            manowarId: manowarId || 0,
             walletAddress,
+            onchainTokenId: manowarId,
             dnaHash,
-            title: title || `Manowar #${manowarId}`,
+            title: title || "",
             description: description || "",
             banner: image,
             creator: creator || "0x0000000000000000000000000000000000000000",
@@ -206,8 +206,8 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
 
         res.status(201).json({
             success: true,
-            manowarId: registrationResult.manowarId,
             walletAddress: registrationResult.walletAddress,
+            onchainTokenId: registrationResult.onchainTokenId,
             chatUrl: `/manowar/${registrationResult.walletAddress}/chat`,
         });
     } catch (err) {
@@ -226,8 +226,8 @@ app.get("/manowar", (_req: Request, res: Response) => {
     const manowars = listRegisteredManowars();
     res.json({
         manowars: manowars.map((m) => ({
-            manowarId: m.manowarId,
             walletAddress: m.walletAddress,
+            onchainTokenId: m.onchainTokenId,
             title: m.title,
             description: m.description,
             creator: m.creator,
@@ -264,10 +264,8 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
         return;
     }
 
-    // Resolve manowar from in-memory registry (matches agent pattern)
-    // Agent uses: const agent = resolveAgent(identifier);
-    // Manowar uses: const manowar = resolveManowar(identifier);
-    const manowar = resolveManowar(identifier);
+    // Resolve manowar from in-memory registry - wallet address only
+    const manowar = getManowar(identifier);
     if (!manowar) {
         res.status(404).json({ error: `Manowar "${identifier}" not found` });
         return;
@@ -290,10 +288,10 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     }
     console.log(`[manowar] Built ${steps.length} agent steps from wallets: [${manowar.agentWalletAddresses?.join(", ") || "none"}]`);
 
-    // Build workflow from registry data
+    // Build workflow from registry data - use wallet address as ID
     const workflow: Workflow = {
-        id: `manowar-${manowar.manowarId}`,
-        name: manowar.title || `Manowar #${manowar.manowarId}`,
+        id: `manowar-${manowar.walletAddress}`,
+        name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
         description: manowar.description || "",
         steps,
     };
@@ -319,6 +317,10 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
+    // Explicit CORS for SSE (browsers require this)
+    const origin = req.headers.origin;
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
     res.flushHeaders();
 
     // Send initial SSE event
@@ -347,8 +349,8 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     const finalData = {
         success: result.status === "success",
         output: typeof output === "string" ? output : JSON.stringify(output),
-        manowarId: manowar.manowarId,
         walletAddress: manowar.walletAddress,
+        onchainTokenId: manowar.onchainTokenId,
         error: result.error,
     };
     res.write(`event: result\ndata: ${JSON.stringify(finalData)}\n\n`);
