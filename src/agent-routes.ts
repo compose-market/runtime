@@ -62,8 +62,11 @@ const ChatSchema = z.object({
     message: z.string().min(1, "message is required"),
     threadId: z.string().optional(),
     manowarWallet: z.string().optional(), // Wallet address of the orchestrating Manowar (if any)
-    image: z.string().optional(), // base64 encoded image for multimodal
-    audio: z.string().optional(), // base64 encoded audio for multimodal
+    // New attachment format (Pinata URL)
+    attachment: z.object({
+        type: z.enum(["image", "audio"]),
+        url: z.string().url(),
+    }).optional(),
     grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
 });
 
@@ -326,7 +329,7 @@ router.post(
             return;
         }
 
-        const { message, threadId, manowarWallet, image, audio, grantedPermissions } = parseResult.data;
+        const { message, threadId, manowarWallet, attachment, grantedPermissions } = parseResult.data;
 
         // Detect if this is a multimodal model
         const task = await detectModelTask(agent.model);
@@ -337,7 +340,7 @@ router.post(
             console.log(`[agent] Routing to multimodal handler for ${agent.name} (${task})`);
 
             // Pass image or audio data if provided
-            const mediaData = image || audio;
+            const mediaData = attachment?.url;
             const result = await executeMultimodal(agent.model, task, message, mediaData);
             markAgentExecuted(identifier);
 
