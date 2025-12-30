@@ -461,7 +461,7 @@ async function searchMemory(params: {
     }
 }
 
-export function createMem0Tools(agentId: string, userId?: string, manowarId?: string): DynamicStructuredTool[] {
+export function createMem0Tools(agentId: string, userId?: string, manowarWallet?: string): DynamicStructuredTool[] {
     // Search Knowledge
     const searchKnowledge = new DynamicStructuredTool({
         name: "search_memory",
@@ -469,7 +469,7 @@ export function createMem0Tools(agentId: string, userId?: string, manowarId?: st
         schema: z.object({ query: z.string().describe("Search query") }),
         func: async ({ query }: { query: string }) => {
             const filters: Record<string, unknown> = {};
-            if (manowarId) filters.manowar_id = manowarId;
+            if (manowarWallet) filters.manowar_wallet = manowarWallet;
 
             const items = await searchMemory({
                 query,
@@ -495,7 +495,7 @@ export function createMem0Tools(agentId: string, userId?: string, manowarId?: st
                 user_id: userId,
                 metadata: {
                     type: "explicit_save",
-                    manowar_id: manowarId
+                    manowar_wallet: manowarWallet
                 }
             });
             return "Memory saved.";

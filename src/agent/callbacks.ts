@@ -41,14 +41,14 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
     private agentId: string;
     private threadId: string;
     private userId?: string;
-    private manowarId?: string;
+    private manowarWallet?: string;
 
-    constructor(agentId: string, threadId: string, userId?: string, manowarId?: string) {
+    constructor(agentId: string, threadId: string, userId?: string, manowarWallet?: string) {
         super();
         this.agentId = agentId;
         this.threadId = threadId;
         this.userId = userId;
-        this.manowarId = manowarId;
+        this.manowarWallet = manowarWallet;
     }
 
     /**
@@ -84,7 +84,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 type: "tool_execution",
                 tool: toolName,
                 run_id: runId,
-                manowar_id: this.manowarId
+                manowar_wallet: this.manowarWallet
             }
         });
     }
@@ -117,7 +117,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                     metadata: {
                         type: "agent_response",
                         run_id: runId,
-                        manowar_id: this.manowarId
+                        manowar_wallet: this.manowarWallet
                     }
                 });
             }
@@ -151,7 +151,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                     run_id: this.threadId,
                     metadata: {
                         type: "user_message",
-                        manowar_id: this.manowarId
+                        manowar_wallet: this.manowarWallet
                     }
                 }).catch((err: Error) => console.error("[Mem0Handler] Background save failed:", err));
             }

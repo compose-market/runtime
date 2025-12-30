@@ -61,7 +61,7 @@ const RegisterAgentSchema = z.object({
 const ChatSchema = z.object({
     message: z.string().min(1, "message is required"),
     threadId: z.string().optional(),
-    manowarId: z.string().optional(),
+    manowarWallet: z.string().optional(), // Wallet address of the orchestrating Manowar (if any)
     image: z.string().optional(), // base64 encoded image for multimodal
     audio: z.string().optional(), // base64 encoded audio for multimodal
     grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
@@ -321,12 +321,12 @@ router.post(
             res.status(400).json({
                 error: "Invalid request body",
                 details: parseResult.error.issues,
-                hint: "Body should be: { message: string, threadId?: string, manowarId?: string }",
+                hint: "Body should be: { message: string, threadId?: string, manowarWallet?: string }",
             });
             return;
         }
 
-        const { message, threadId, manowarId, image, audio, grantedPermissions } = parseResult.data;
+        const { message, threadId, manowarWallet, image, audio, grantedPermissions } = parseResult.data;
 
         // Detect if this is a multimodal model
         const task = await detectModelTask(agent.model);
@@ -370,12 +370,12 @@ router.post(
         const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
 
         // Execute agent
-        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarId || 'none'}, Session: ${sessionActive}]`);
+        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarWallet || 'none'}, Session: ${sessionActive}]`);
 
         const result = await executeAgent(instance.id, message, {
             threadId,
             userId,
-            manowarId,
+            manowarWallet,
             sessionContext: {
                 sessionActive,
                 sessionBudgetRemaining,
