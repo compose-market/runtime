@@ -123,6 +123,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
     console.log(`[manowar] Executing manowar: ${manowar.title} (${manowar.walletAddress})`);
 
     // Build workflow steps from agent wallet addresses (using agent-registry for lookup)
+    // Only pass agentCardUri - orchestrator resolves full metadata from IPFS
     const steps: WorkflowStep[] = [];
     for (const agentWallet of (manowar.agentWalletAddresses || [])) {
         const agent = resolveAgent(agentWallet);
@@ -131,7 +132,11 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
             name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
             type: "agent",
             agentAddress: agentWallet,
-            inputTemplate: { agentAddress: agentWallet },
+            // Pass only agentCardUri - Orchestrator resolves full metadata (model, plugins, skills) at runtime
+            inputTemplate: {
+                agentAddress: agentWallet,
+                agentCardUri: agent?.agentCardUri,
+            },
             saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
         });
     }
@@ -159,6 +164,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         input: payload.input || {},
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
+        manowarCardUri: manowar.manowarCardUri,
     });
 
     // Mark as executed
@@ -179,7 +185,7 @@ app.get("/manowar/prices", (_req: Request, res: Response) => {
 app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) => {
     // NOTE: Registration is FREE (no x402 payment) - payment is collected during chat/execution
     // Parse body directly (matches agent pattern - no nested "payload" wrapper)
-    const { walletAddress, manowarId, dnaHash, title, description, creator,
+    const { walletAddress, manowarId, manowarCardUri, dnaHash, title, description, creator,
         hasCoordinator, coordinatorModel, totalPrice, image, agentWalletAddresses } = req.body;
 
     // Validate walletAddress (primary identifier - matches agent pattern)
@@ -193,13 +199,14 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
         const registrationResult = registerManowar({
             walletAddress,
             onchainTokenId: manowarId,
+            manowarCardUri,  // contains all metadata
             dnaHash,
             title: title || "",
             description: description || "",
             banner: image,
             creator: creator || "0x0000000000000000000000000000000000000000",
             hasCoordinator,
-            coordinatorModel,
+            coordinatorModel,  // User-selected at mint time
             totalPrice,
             agentWalletAddresses: agentWalletAddresses || [],
         });
@@ -274,6 +281,7 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     console.log(`[manowar] Resolved manowar: ${manowar.title} (${manowar.walletAddress})`);
 
     // Build workflow steps from agent wallet addresses (using agent-registry for lookup)
+    // Only pass agentCardUri - orchestrator resolves full metadata from IPFS
     const steps: WorkflowStep[] = [];
     for (const agentWallet of (manowar.agentWalletAddresses || [])) {
         const agent = resolveAgent(agentWallet);
@@ -282,7 +290,11 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
             name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
             type: "agent",
             agentAddress: agentWallet,
-            inputTemplate: { agentAddress: agentWallet },
+            // Pass only agentCardUri - orchestrator resolves full metadata from IPFS
+            inputTemplate: {
+                agentAddress: agentWallet,
+                agentCardUri: agent?.agentCardUri,
+            },
             saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
         });
     }
@@ -331,6 +343,7 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
         input: { message, threadId, attachment, image, audio },
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
+        manowarCardUri: manowar.manowarCardUri,
         onProgress: (event) => {
             // Send SSE event for each progress update
             res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
