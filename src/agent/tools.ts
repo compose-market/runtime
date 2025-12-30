@@ -462,43 +462,64 @@ async function searchMemory(params: {
 }
 
 export function createMem0Tools(agentId: string, userId?: string, manowarWallet?: string): DynamicStructuredTool[] {
-    // Search Knowledge
+    // Search Knowledge with Graph Memory
     const searchKnowledge = new DynamicStructuredTool({
         name: "search_memory",
-        description: "Search your long-term memory/knowledge base for past interactions or learned facts.",
+        description: "Search your long-term memory/knowledge base for past interactions or learned facts. Uses graph memory for better relation-based retrieval.",
         schema: z.object({ query: z.string().describe("Search query") }),
         func: async ({ query }: { query: string }) => {
             const filters: Record<string, unknown> = {};
             if (manowarWallet) filters.manowar_wallet = manowarWallet;
 
-            const items = await searchMemory({
-                query,
-                agent_id: agentId,
-                user_id: userId,
-                limit: 5,
-                filters
+            // Use graph-enabled search with reranking
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-tool-price": "500", // $0.0005 per memory search
+                },
+                body: JSON.stringify({
+                    query,
+                    agent_id: agentId,
+                    user_id: userId,
+                    limit: 8,
+                    enable_graph: true, // Enable graph memory for relations
+                    rerank: true, // Enable reranking for relevance
+                    filters
+                }),
             });
+            if (!response.ok) return "Memory search unavailable.";
+            const items = await response.json();
             if (!items.length) return "No relevant memories found.";
             return items.map((i: MemoryItem) => `[Memory]: ${i.memory}`).join("\n\n");
         },
     });
 
-    // Store Knowledge (Explicit)
+    // Store Knowledge with Graph Extraction
     const storeKnowledge = new DynamicStructuredTool({
         name: "save_memory",
-        description: "Explicitly save an important fact or user preference to your long-term memory.",
+        description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
         schema: z.object({ content: z.string().describe("Fact to remember") }),
         func: async ({ content }: { content: string }) => {
-            await addMemory({
-                messages: [{ role: "user", content }],
-                agent_id: agentId,
-                user_id: userId,
-                metadata: {
-                    type: "explicit_save",
-                    manowar_wallet: manowarWallet
-                }
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-tool-price": "1000", // $0.001 per memory save (includes graph extraction)
+                },
+                body: JSON.stringify({
+                    messages: [{ role: "user", content }],
+                    agent_id: agentId,
+                    user_id: userId,
+                    enable_graph: true, // Enable graph extraction
+                    metadata: {
+                        type: "explicit_save",
+                        manowar_wallet: manowarWallet
+                    }
+                }),
             });
-            return "Memory saved.";
+            if (!response.ok) return "Failed to save memory.";
+            return "Memory saved with graph extraction.";
         },
     });
 
