@@ -37,7 +37,7 @@ export interface AgentConfig {
   plugins?: string[];
   // Identity Context
   userId?: string;    // The user interacting with the agent
-  manowarId?: string; // The workflow context (if any)
+  manowarWallet?: string; // The orchestrating Manowar's wallet address (if any)
   sessionContext?: {  // Session for payment
     sessionActive: boolean;
     sessionBudgetRemaining: number;
@@ -255,7 +255,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     config.wallet,
     config.sessionContext  // Pass session context for tool execution
   );
-  const memTools = createMem0Tools(id, config.userId, config.manowarId);
+  const memTools = createMem0Tools(id, config.userId, config.manowarWallet);
   const tools = [...composeTools, ...memTools];
 
 
@@ -301,7 +301,7 @@ export function getStatus(): LangChainStatus {
 export interface ExecuteOptions {
   threadId?: string;
   userId?: string;
-  manowarId?: string;
+  manowarWallet?: string;
   sessionContext?: {
     sessionActive: boolean;
     sessionBudgetRemaining: number;
@@ -323,7 +323,7 @@ export async function executeAgent(
 
   const threadId = opts.threadId || `thread-${agentId}`;
   const userId = opts.userId;
-  const manowarId = opts.manowarId;
+  const manowarWallet = opts.manowarWallet;
 
   const start = Date.now();
 
@@ -337,7 +337,7 @@ export async function executeAgent(
     }
 
     // Setup Callbacks (Mem0) with full identity context
-    const mem0Handler = new Mem0CallbackHandler(agentId, threadId, userId, manowarId);
+    const mem0Handler = new Mem0CallbackHandler(agentId, threadId, userId, manowarWallet);
 
     const input = { messages: [new HumanMessage(message)] };
     const config = {
@@ -347,7 +347,7 @@ export async function executeAgent(
     };
 
     // Invoke
-    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarId || 'none'})...`);
+    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarWallet || 'none'})...`);
     const result = await agent.executor.invoke(input, config);
 
     // Parse Result
