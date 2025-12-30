@@ -185,20 +185,20 @@ export async function storeTrigger(
                 messages: [
                     {
                         role: "system",
-                        content: `Trigger definition for Manowar ${trigger.manowarId}`,
+                        content: `Trigger definition for Manowar ${trigger.manowarWallet}`,
                     },
                     {
                         role: "assistant",
                         content: `Trigger "${trigger.name}" (${trigger.type}): ${trigger.nlDescription}. Cron: ${trigger.cronExpression || "N/A"}. Enabled: ${trigger.enabled}.`,
                     },
                 ],
-                agent_id: `manowar-${trigger.manowarId}`,
+                agent_id: `manowar-${trigger.manowarWallet}`,
                 user_id: userId,
                 metadata: {
                     type: "trigger",
                     trigger_id: trigger.id,
                     trigger_type: trigger.type,
-                    manowar_id: trigger.manowarId,
+                    manowar_wallet: trigger.manowarWallet,
                     cron_expression: trigger.cronExpression,
                     enabled: trigger.enabled,
                     timezone: trigger.timezone,
@@ -226,7 +226,7 @@ export async function storeTrigger(
  * Retrieve triggers for a Manowar from mem0
  */
 export async function retrieveTriggers(
-    manowarId: number | string,
+    manowarWallet: string,
     userId?: string
 ): Promise<TriggerDefinition[]> {
     try {
@@ -234,13 +234,13 @@ export async function retrieveTriggers(
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                query: `triggers for manowar ${manowarId}`,
-                agent_id: `manowar-${manowarId}`,
+                query: `triggers for manowar ${manowarWallet}`,
+                agent_id: `manowar-${manowarWallet}`,
                 user_id: userId,
                 limit: 50,
                 filters: {
                     type: "trigger",
-                    manowar_id: String(manowarId),
+                    manowar_wallet: manowarWallet,
                 },
             }),
         });
@@ -276,7 +276,7 @@ export async function retrieveTriggers(
  */
 export async function deleteTriggerFromMemory(
     triggerId: string,
-    manowarId: number | string,
+    manowarWallet: string,
     userId?: string
 ): Promise<boolean> {
     try {
@@ -286,7 +286,7 @@ export async function deleteTriggerFromMemory(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 query: `trigger ${triggerId}`,
-                agent_id: `manowar-${manowarId}`,
+                agent_id: `manowar-${manowarWallet}`,
                 user_id: userId,
                 limit: 1,
                 filters: {

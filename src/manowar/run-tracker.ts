@@ -26,7 +26,7 @@ const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "compose-manowar";
 export interface TrackedRun {
     runId: string;
     workflowId: string;
-    manowarId?: number;
+    manowarWallet?: string; // Wallet address as primary identifier
     status: "pending" | "running" | "success" | "error" | "cancelled";
     triggeredBy?: {
         type: "manual" | "cron" | "webhook" | "api";
@@ -53,7 +53,7 @@ export interface TrackedRun {
 
 export interface RunFilter {
     workflowId?: string;
-    manowarId?: number;
+    manowarWallet?: string;
     status?: TrackedRun["status"];
     triggeredBy?: "manual" | "cron" | "webhook" | "api";
     since?: number;
@@ -102,7 +102,7 @@ export function isLangSmithAvailable(): boolean {
  */
 export function createRun(params: {
     workflowId: string;
-    manowarId?: number;
+    manowarWallet?: string;
     input: Record<string, unknown>;
     triggeredBy?: TrackedRun["triggeredBy"];
 }): TrackedRun {
@@ -111,7 +111,7 @@ export function createRun(params: {
     const run: TrackedRun = {
         runId,
         workflowId: params.workflowId,
-        manowarId: params.manowarId,
+        manowarWallet: params.manowarWallet,
         status: "pending",
         triggeredBy: params.triggeredBy,
         input: params.input,
@@ -234,8 +234,8 @@ export function listRuns(filter: RunFilter = {}): TrackedRun[] {
     if (filter.workflowId) {
         runs = runs.filter(r => r.workflowId === filter.workflowId);
     }
-    if (filter.manowarId !== undefined) {
-        runs = runs.filter(r => r.manowarId === filter.manowarId);
+    if (filter.manowarWallet) {
+        runs = runs.filter(r => r.manowarWallet === filter.manowarWallet);
     }
     if (filter.status) {
         runs = runs.filter(r => r.status === filter.status);

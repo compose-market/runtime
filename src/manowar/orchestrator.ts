@@ -121,7 +121,7 @@ function createMcpTool(connectorId: string, toolName: string, description: strin
 function createAgentDelegationTool(
     agentStep: WorkflowStep,
     paymentContext: PaymentContext,
-    manowarId: string,
+    manowarWallet: string,
     runId: string,
     stepContext?: { currentStep?: number; totalSteps?: number; previousOutput?: string },
     onProgress?: (event: SSEProgressEvent) => void
@@ -397,10 +397,13 @@ export class ManowarOrchestrator {
                 ? meta.skills.join(", ")
                 : "";
 
+            // Agent card URI for full context
+            const cardUri = meta.agentCardUri || s.agentAddress || "";
+
             return `### ${i + 1}. ${s.name}
 - **Delegation Tool**: \`${toolName}\`
 - **Model**: ${model}
-- **Plugins/Tools**: ${plugins}${skills ? `\n- **Skills**: ${skills}` : ""}`;
+- **Plugins/Tools**: ${plugins}${skills ? `\n- **Skills**: ${skills}` : ""}${cardUri ? `\n- **Agent Card**: ${cardUri}` : ""}`;
         }).join("\n\n");
 
         // MCP/Connector tools in workflow
@@ -469,12 +472,13 @@ ${agentPipeline}${mcpTools}
         });
 
         // Create tracked run
-        const manowarId = this.workflow.id.startsWith("manowar-")
-            ? parseInt(this.workflow.id.split("-")[1])
+        // Extract wallet address from workflow ID (format: "manowar-0xABC...")
+        const manowarWallet = this.workflow.id.startsWith("manowar-")
+            ? this.workflow.id.substring(8) // Skip "manowar-" prefix
             : undefined;
         const trackedRun = createRun({
             workflowId: this.workflow.id,
-            manowarId: isNaN(manowarId as number) ? undefined : manowarId,
+            manowarWallet, // Use wallet address, not numeric ID
             input: this.options.input,
             triggeredBy: this.options.triggerId
                 ? { type: "cron", triggerId: this.options.triggerId }

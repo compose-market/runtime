@@ -24,6 +24,14 @@ const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY;
 const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "compose-manowar";
 const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || "https://api.smith.langchain.com";
 
+// Bridge LANGSMITH_* to LANGCHAIN_* for SDK auto-tracing
+// LangChain SDK requires LANGCHAIN_TRACING_V2=true to enable tracing
+if (LANGSMITH_API_KEY && process.env.LANGSMITH_TRACING === "true") {
+    process.env.LANGCHAIN_TRACING_V2 = "true";
+    process.env.LANGCHAIN_API_KEY = LANGSMITH_API_KEY;
+    console.log(`[LangSmith] Tracing enabled for project: ${LANGSMITH_PROJECT}`);
+}
+
 // =============================================================================
 // Token Extraction Types
 // =============================================================================

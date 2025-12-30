@@ -89,7 +89,7 @@ export const ManowarOrchestrationState = Annotation.Root({
         reducer: (_, next) => next,
         default: () => "",
     }),
-    manowarId: Annotation<number | undefined>(),
+    manowarWallet: Annotation<string | undefined>(),
     runId: Annotation<string>({
         reducer: (_, next) => next,
         default: () => `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -202,11 +202,11 @@ export type ManowarState = typeof ManowarOrchestrationState.State;
 export function createInitialState(
     workflowId: string,
     goal: string,
-    manowarId?: number
+    manowarWallet?: string
 ): Partial<ManowarState> {
     return {
         workflowId,
-        manowarId,
+        manowarWallet,
         activeGoal: goal,
         runId: `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         status: "idle",

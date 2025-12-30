@@ -73,8 +73,8 @@ export interface RecurrenceRule {
 
 export interface TriggerDefinition {
     id: string;
-    /** Reference to the Manowar workflow */
-    manowarId: number | string;
+    /** Reference to the Manowar workflow via wallet address */
+    manowarWallet: string;
     /** Human-readable name */
     name: string;
     /** Trigger type */
@@ -139,8 +139,8 @@ export interface HookAction {
 
 export interface HookDefinition {
     id: string;
-    /** Reference to the Manowar workflow */
-    manowarId: number | string;
+    /** Reference to the Manowar workflow via wallet address */
+    manowarWallet: string;
     /** Human-readable name */
     name: string;
     /** When this hook fires */
@@ -236,7 +236,8 @@ export interface Workflow {
 // =============================================================================
 
 export interface ManowarMetadata {
-    manowarId: number;
+    manowarId: number; // On-chain token ID (kept for contract reference)
+    walletAddress: string; // Primary identifier
     title: string;
     description: string;
     banner?: string;
@@ -271,7 +272,7 @@ export interface StepExecutionResult {
 
 export interface WorkflowExecutionState {
     workflowId: string;
-    manowarId?: number;
+    manowarWallet?: string;
     status: "pending" | "running" | "success" | "error";
     startTime: number;
     endTime?: number;
