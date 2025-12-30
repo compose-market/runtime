@@ -639,7 +639,7 @@ async function storeContextSummary(
                         content: `Summary: ${summary.summary}\n\nKey Facts:\n${summary.keyFacts.map((f: string) => `- ${f}`).join("\n")}`,
                     },
                 ],
-                agent_id: `manowar-${workflowId}`,
+                agent_id: workflowId, // workflowId already contains "manowar-" prefix
                 user_id: userId,
                 metadata: {
                     type: "context_summary",
@@ -676,7 +676,7 @@ export async function retrieveContextSummary(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 query: `workflow ${workflowId} context summary`,
-                agent_id: `manowar-${workflowId}`,
+                agent_id: workflowId, // workflowId already contains "manowar-" prefix
                 user_id: userId,
                 limit: 1,
                 rerank: true,
