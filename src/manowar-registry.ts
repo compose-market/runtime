@@ -20,6 +20,8 @@ export interface RegisteredManowar {
     walletAddress: string;
     /** On-chain manowar ID (ERC721 NFT ID) - stored for on-chain reference only */
     onchainTokenId: number;
+    /** IPFS URI to manowarCard - SINGLE SOURCE OF TRUTH for all metadata */
+    manowarCardUri?: string;
     /** DNA hash from contract */
     dnaHash?: string;
     /** Manowar title */
@@ -32,7 +34,7 @@ export interface RegisteredManowar {
     creator: string;
     /** Has coordinator */
     hasCoordinator?: boolean;
-    /** Coordinator model */
+    /** Coordinator model (user-selected at mint time) */
     coordinatorModel?: string;
     /** Total price in USDC (formatted) */
     totalPrice?: string;
@@ -49,6 +51,8 @@ export interface RegisterManowarParams {
     walletAddress: string;
     /** On-chain token ID (for display/on-chain reference only) */
     onchainTokenId: number;
+    /** IPFS URI to manowarCard - SINGLE SOURCE OF TRUTH */
+    manowarCardUri?: string;
     dnaHash?: string;
     title: string;
     description: string;
@@ -92,6 +96,7 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
     const registered: RegisteredManowar = {
         walletAddress,
         onchainTokenId: params.onchainTokenId,
+        manowarCardUri: params.manowarCardUri,
         dnaHash: params.dnaHash,
         title: params.title,
         description: params.description,
@@ -108,7 +113,7 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
 
     console.log(`[manowar-registry] Registered manowar: ${params.title}`);
     console.log(`[manowar-registry]   Wallet: ${walletAddress}`);
-    console.log(`[manowar-registry]   On-chain Token ID: ${params.onchainTokenId}`);
+    console.log(`[manowar-registry]   CardURI: ${params.manowarCardUri || "none"}`);
     console.log(`[manowar-registry]   Coordinator: ${params.coordinatorModel || "none"}`);
     console.log(`[manowar-registry]   Agents: [${params.agentWalletAddresses?.join(", ") || "none"}]`);
 
