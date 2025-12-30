@@ -253,13 +253,68 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
 // =============================================================================
 
 /**
- * Create LangSmith configuration for graph invocation
+ * Fetch model metadata from the dynamic registry (2700+ models)
+ * Uses the Lambda API which aggregates from all providers with real source data
  */
-export function createLangSmithConfig(workflowId: string, runId: string): Record<string, unknown> {
+async function fetchModelMetadata(modelId: string): Promise<{ source: string; contextLength?: number } | null> {
+    if (!modelId) return null;
+
+    const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/models/${encodeURIComponent(modelId)}`);
+        if (response.ok) {
+            const data = await response.json();
+            return {
+                source: data.source || data.ownedBy || "unknown",
+                contextLength: data.contextLength,
+            };
+        }
+    } catch {
+        // Fallback on error
+    }
+
+    return null;
+}
+
+// Cache for model metadata to avoid repeated API calls during a run
+const modelMetadataCache = new Map<string, { source: string; contextLength?: number }>();
+
+/**
+ * Get model metadata (cached)
+ */
+async function getModelMetadataCached(modelId: string): Promise<{ source: string; contextLength?: number }> {
+    if (modelMetadataCache.has(modelId)) {
+        return modelMetadataCache.get(modelId)!;
+    }
+
+    const metadata = await fetchModelMetadata(modelId);
+    if (metadata) {
+        modelMetadataCache.set(modelId, metadata);
+        return metadata;
+    }
+
+    // Fallback if API fails - return unknown
+    return { source: "unknown" };
+}
+
+/**
+ * Create LangSmith configuration for graph invocation
+ * 
+ * ls_provider and ls_model_name are fetched dynamically from the Lambda models API.
+ */
+export async function createLangSmithConfig(
+    workflowId: string,
+    runId: string,
+    modelName?: string
+): Promise<Record<string, unknown>> {
     if (!LANGSMITH_API_KEY) {
         console.warn("[LangSmith] LANGSMITH_API_KEY not configured - tracing disabled");
         return {};
     }
+
+    // Fetch model metadata from dynamic registry (2700+ models)
+    const modelMetadata = modelName ? await getModelMetadataCached(modelName) : { source: "unknown" };
 
     return {
         configurable: {
@@ -272,6 +327,9 @@ export function createLangSmithConfig(workflowId: string, runId: string): Record
             workflow_id: workflowId,
             run_id: runId,
             environment: process.env.NODE_ENV || "development",
+            // LangSmith cost tracking - dynamically fetched from 2700+ model registry
+            ls_provider: modelMetadata.source,
+            ls_model_name: modelName,
         },
     };
 }
