@@ -104,11 +104,13 @@ export function isAgenticCoordinatorModel(modelId: string): boolean {
 }
 
 /**
- * Get the default coordinator model (highest capability)
+ * Get the coordinator model selected by user at mint time.
+ * No hardcoded model dependencies.
  */
-export function getDefaultCoordinatorModel(): string {
-    // MiniMax M2.1 as default due to largest context and Interleaved Thinking
-    return "minimax/minimax-m2.1";
+export function getDefaultCoordinatorModel(): string | null {
+    // No hardcoded default - must be set by user at mint time via compose.tsx
+    // The coordinatorModel is stored on-chain and passed to the orchestrator
+    return null;
 }
 
 // =============================================================================
