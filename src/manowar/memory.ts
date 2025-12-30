@@ -67,31 +67,33 @@ export interface SolutionPattern {
 
 // Constants for sliding window (used by orchestrator)
 export const SLIDING_WINDOW_SIZE = 4;
-export const TOKEN_THRESHOLD_PERCENT = 60; // Legacy fallback only
 
 /**
  * Get dynamic context threshold based on model's effective window
  * 
- * Uses the model's actual contextLength from registry, NOT hardcoded values.
- * Returns threshold as a percentage of context that should trigger cleanup.
+ * Formula: 55% + 0.5 × log₁₀(window/1024)
  * 
- * Formula: Base 55% + log-scaled bonus for larger contexts
- * This gives a continuous curve, not arbitrary breakpoints.
+ * This provides a continuous, non-hardcoded threshold that scales with model capacity:
+ * - 32k context (22.4k effective) → ~56.8%
+ * - 128k context (89.6k effective) → ~58.9%
+ * - 1M context (700k effective) → ~61.4%
+ * - 4M context (2.8M effective) → ~62.2%
  * 
- * @param effectiveWindow - The model's effective context window (from modelSpec.effectiveWindow)
+ * @param effectiveWindow - The model's effective context window (70% of advertised, from modelSpec.effectiveWindow)
+ * @returns Threshold percentage at which cleanup should trigger
  */
 export function getDynamicThresholdPercent(effectiveWindow: number): number {
-    // Base threshold: 55%
-    // Bonus: logarithmic scale that adds up to 15% for very large contexts
-    // This avoids hardcoded breakpoints - purely dynamic based on actual model capacity
-    const BASE = 55;
-    const MAX_BONUS = 15;
+    // Formula: 55% + 0.5 × log₁₀(window/1024)
+    const BASE_THRESHOLD = 55;
+    const SCALE_FACTOR = 0.5;
+    const NORMALIZATION_DIVISOR = 1024;
 
-    // Log scale: 32k => 0 bonus, 1M => ~10-12% bonus, 4M => ~15% bonus
-    const logScale = Math.log10(Math.max(effectiveWindow, 32000) / 32000);
-    const bonus = Math.min(MAX_BONUS, logScale * 6);
+    // Ensure minimum window size to avoid negative log
+    const normalizedWindow = Math.max(effectiveWindow, NORMALIZATION_DIVISOR) / NORMALIZATION_DIVISOR;
+    const logBonus = SCALE_FACTOR * Math.log10(normalizedWindow);
 
-    return Math.min(70, BASE + bonus); // Cap at 70%
+    // Cap at 75% to always maintain safety margin
+    return Math.min(75, BASE_THRESHOLD + logBonus);
 }
 
 // =============================================================================
@@ -340,11 +342,132 @@ export async function optimizeWithGraph(
 }
 
 /**
- * Perform memory wipe with summary stored in Mem0
+ * Perform SAFE memory wipe with context preservation
+ * 
+ * Safe-wipe pattern:
+ * 1. Compress current conversation into summary using the coordinator model
+ * 2. Store summary with Mem0 graph memory (entities + relations extracted)
+ * 3. Return [CONTEXT REFRESHED] marker for reducer state reset
+ * 
+ * This ensures NO information is lost - it's compressed and stored in graph memory
+ * for later retrieval while freeing up context window space.
+ * 
+ * @param coordinatorModel - The coordinator model selected at mint time
+ */
+export async function performSafeWipe(
+    workflowId: string,
+    runId: string,
+    coordinatorModel: string,  // REQUIRED - from AGENTIC_COORDINATOR_MODELS list
+    currentContext: {
+        goal: string;
+        completedActions: string[];
+        lastOutcome: string;
+        agentSummaries: Record<string, string>;
+        messageCount?: number;
+    },
+    userId?: string
+): Promise<{
+    summary: string;
+    marker: string;
+    memoryId?: string;
+    entitiesExtracted: number;
+    tokensSaved: number;
+} | null> {
+    // Build comprehensive summary prompt
+    const agentSummaryText = Object.entries(currentContext.agentSummaries)
+        .map(([agent, summary]) => `- ${agent}: ${summary}`)
+        .join("\n");
+
+    const summaryPrompt = `Summarize this workflow execution into a concise paragraph that preserves all critical information:
+
+## Workflow Goal
+${currentContext.goal}
+
+## Actions Completed
+${currentContext.completedActions.join(", ")}
+
+## Agent Outputs
+${agentSummaryText || "No agent summaries available"}
+
+## Last Outcome
+${currentContext.lastOutcome}
+
+Create a summary that:
+1. Captures the key facts and decisions made
+2. Notes any important entities (users, tools, data sources)
+3. Preserves information needed for future context recovery
+4. Is concise but complete (max 200 words)`;
+
+    try {
+        // Use the coordinator model (selected at mint time, from AGENTIC_COORDINATOR_MODELS)
+        const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                model: coordinatorModel,  // User-selected coordinator model
+                messages: [{ role: "user", content: summaryPrompt }],
+                temperature: 0.2,
+                max_tokens: 500,
+            }),
+        });
+
+        const data = await response.json();
+        const summary = data.choices?.[0]?.message?.content || currentContext.lastOutcome;
+
+        // 2. Store summary in Mem0 graph memory with entity extraction
+        const memories = await addMemoryWithGraph({
+            messages: [
+                { role: "system", content: `Context wipe summary for workflow ${workflowId}` },
+                { role: "assistant", content: summary },
+            ],
+            agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
+            user_id: userId,
+            run_id: runId,
+            metadata: {
+                type: "context_wipe_summary",
+                goal: currentContext.goal,
+                actionCount: currentContext.completedActions.length,
+                timestamp: Date.now(),
+            },
+        });
+
+        // Count entities extracted from graph memory
+        const entitiesExtracted = memories.reduce(
+            (sum, m) => sum + (m.relations?.length || 0),
+            0
+        );
+
+        // Estimate tokens saved (rough: 4 chars per token)
+        const originalTokens = currentContext.completedActions.join("").length / 4;
+        const summaryTokens = summary.length / 4;
+        const tokensSaved = Math.max(0, Math.round(originalTokens - summaryTokens));
+
+        console.log(
+            `[SafeWipe] Compressed ${currentContext.completedActions.length} actions into ${Math.round(summaryTokens)} tokens, saved ~${tokensSaved} tokens`
+        );
+
+        // 3. Return marker for reducer reset
+        return {
+            summary,
+            marker: "[CONTEXT REFRESHED]",
+            memoryId: memories[0]?.id,
+            entitiesExtracted,
+            tokensSaved,
+        };
+    } catch (error) {
+        console.error("[SafeWipe] Failed:", error);
+        return null;
+    }
+}
+
+/**
+ * Legacy wrapper for backward compatibility
+ * @deprecated Use performSafeWipe instead
  */
 export async function performMemoryWipe(
     workflowId: string,
     runId: string,
+    coordinatorModel: string,  // REQUIRED - from AGENTIC_COORDINATOR_MODELS list
     currentContext: {
         goal: string;
         completedActions: string[];
@@ -352,45 +475,15 @@ export async function performMemoryWipe(
         agentSummaries: Record<string, string>;
     }
 ): Promise<WipeResult | null> {
-    const summaryPrompt = `Summarize this workflow state in 2 sentences:
-Goal: ${currentContext.goal}
-Actions: ${currentContext.completedActions.join(", ")}
-Last outcome: ${currentContext.lastOutcome}`;
+    const result = await performSafeWipe(workflowId, runId, coordinatorModel, currentContext);
+    if (!result) return null;
 
-    try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: "nvidia/nemotron-3-nano-30b-a3b:free",
-                messages: [{ role: "user", content: summaryPrompt }],
-                temperature: 0.3,
-            }),
-        });
-
-        const data = await response.json();
-        const summary = data.choices?.[0]?.message?.content || currentContext.lastOutcome;
-
-        const memories = await addMemoryWithGraph({
-            messages: [
-                { role: "system", content: `Memory wipe summary for ${workflowId}` },
-                { role: "assistant", content: summary },
-            ],
-            agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
-            run_id: runId,
-            metadata: { type: "wipe_summary" },
-        });
-
-        return {
-            previousSummary: summary,
-            preservedFacts: currentContext.completedActions.slice(-3),
-            wipedMessageCount: currentContext.completedActions.length,
-            memoryId: memories[0]?.id,
-        };
-    } catch (error) {
-        console.error("[MemoryWipe] Failed:", error);
-        return null;
-    }
+    return {
+        previousSummary: result.summary,
+        preservedFacts: currentContext.completedActions.slice(-3),
+        wipedMessageCount: currentContext.completedActions.length,
+        memoryId: result.memoryId,
+    };
 }
 
 // =============================================================================

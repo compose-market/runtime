@@ -313,20 +313,41 @@ export interface PaymentContext {
 // Executor Options
 // =============================================================================
 
-/** SSE Progress Event types for streaming */
+/** 
+ * SSE Progress Event types for streaming
+ * 
+ * Event types:
+ * - start: Workflow execution started
+ * - progress: General progress update (percentage)
+ * - step: Workflow step started/completed
+ * - agent: Agent delegation event
+ * - tool_start: Tool execution started
+ * - tool_end: Tool execution completed
+ * - response: Intermediate response from agent/tool
+ * - result: Final workflow result
+ * - error: Error occurred
+ * - done: Workflow execution completed (success or failure)
+ */
 export interface SSEProgressEvent {
-    type: "start" | "step" | "agent" | "tool" | "response" | "error" | "complete";
+    type: "start" | "progress" | "step" | "agent" | "tool_start" | "tool_end" | "response" | "result" | "error" | "done";
     timestamp: number;
     data: {
         runId?: string;
         stepName?: string;
+        stepIndex?: number;
+        totalSteps?: number;
         agentName?: string;
+        agentWallet?: string;
         toolName?: string;
         message?: string;
         output?: string;
         error?: string;
         tokenCount?: number;
+        tokensUsed?: number;
+        tokenBudget?: number;
+        cost?: number;
         progress?: number; // 0-100
+        duration?: number; // ms
     };
 }
 
@@ -351,8 +372,10 @@ export interface ExecutorOptions {
     resumeState?: WorkflowStateSummary;
     /** Trigger ID if auto-triggered */
     triggerId?: string;
-    /** Coordinator model (from manowar registry) */
+    /** Coordinator model (user-selected at mint time via compose.tsx) */
     coordinatorModel?: string;
+    /** IPFS URI to manowarCard */
+    manowarCardUri?: string;
 }
 
 // =============================================================================

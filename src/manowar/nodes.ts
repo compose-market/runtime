@@ -147,7 +147,9 @@ export async function windowTrackerNode(
         0
     );
 
-    const coordinatorModel = state.agentModels?.["coordinator"] || getDefaultCoordinatorModel();
+    // Get coordinator model from state or use a placeholder for registry lookup
+    // The coordinatorModel should always be set from on-chain data
+    const coordinatorModel = state.agentModels?.["coordinator"] || "coordinator";
     const coordSpec = await getModelContextSpec(coordinatorModel);
     const coordUsagePercent = (messageTokenEstimate / coordSpec.effectiveWindow) * 100;
 
