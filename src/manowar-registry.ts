@@ -20,7 +20,7 @@ export interface RegisteredManowar {
     walletAddress: string;
     /** On-chain manowar ID (ERC721 NFT ID) - stored for on-chain reference only */
     onchainTokenId: number;
-    /** IPFS URI to manowarCard - SINGLE SOURCE OF TRUTH for all metadata */
+    /** IPFS URI to manowarCard */
     manowarCardUri?: string;
     /** DNA hash from contract */
     dnaHash?: string;
@@ -51,7 +51,7 @@ export interface RegisterManowarParams {
     walletAddress: string;
     /** On-chain token ID (for display/on-chain reference only) */
     onchainTokenId: number;
-    /** IPFS URI to manowarCard - SINGLE SOURCE OF TRUTH */
+    /** IPFS URI to manowarCard */
     manowarCardUri?: string;
     dnaHash?: string;
     title: string;
@@ -80,10 +80,50 @@ const registeredManowars = new Map<string, RegisteredManowar>();
  * 
  * walletAddress is the PRIMARY and ONLY identifier
  */
-export function registerManowar(params: RegisterManowarParams): RegisteredManowar {
+export async function registerManowar(params: RegisterManowarParams): Promise<RegisteredManowar> {
     const walletAddress = params.walletAddress;
     if (!walletAddress || !walletAddress.startsWith("0x") || walletAddress.length !== 42) {
         throw new Error(`Invalid walletAddress: ${walletAddress}. Must be a valid Ethereum address.`);
+    }
+
+    // Validate manowarCardUri
+    if (params.manowarCardUri && params.manowarCardUri.startsWith("ipfs://")) {
+        const cid = params.manowarCardUri.replace("ipfs://", "");
+        // Validate CID format - proper IPFS CIDs start with 'Qm' (v0) or 'bafy/bafk' (v1)
+        if (!cid.startsWith("Qm") && !cid.startsWith("baf")) {
+            throw new Error(`Invalid manowarCardUri CID format: ${cid}. Must be a valid IPFS CID.`);
+        }
+
+        try {
+            const gatewayUrl = `https://${process.env.PINATA_GATEWAY || "compose.mypinata.cloud"}/ipfs/${cid}`;
+            const response = await fetch(gatewayUrl);
+
+            if (response.ok) {
+                const metadata = await response.json() as {
+                    walletAddress?: string;
+                    title?: string;
+                };
+
+                // Verify wallet address from IPFS matches provided wallet address
+                if (metadata.walletAddress &&
+                    metadata.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+                    throw new Error(
+                        `Wallet address mismatch! IPFS metadata has ${metadata.walletAddress} ` +
+                        `but registration provided ${walletAddress}. Registration rejected.`
+                    );
+                }
+
+                console.log(`[manowar-registry] ✅ manowarCardUri validated: ${params.manowarCardUri}`);
+            } else {
+                console.warn(`[manowar-registry] ⚠️ Could not fetch manowarCardUri: HTTP ${response.status}`);
+            }
+        } catch (err) {
+            if (err instanceof Error && err.message.includes("mismatch")) {
+                throw err; // Re-throw validation errors
+            }
+            console.warn(`[manowar-registry] ⚠️ Could not validate manowarCardUri: ${err}`);
+            // Continue with registration - IPFS may be temporarily unavailable
+        }
     }
 
     // Check if already registered by wallet address

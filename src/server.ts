@@ -196,7 +196,7 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
 
     try {
         // Register directly from frontend data (matches agent pattern)
-        const registrationResult = registerManowar({
+        const registrationResult = await registerManowar({
             walletAddress,
             onchainTokenId: manowarId,
             manowarCardUri,  // contains all metadata
@@ -204,7 +204,7 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
             title: title || "",
             description: description || "",
             banner: image,
-            creator: creator || "0x0000000000000000000000000000000000000000",
+            creator,
             hasCoordinator,
             coordinatorModel,  // User-selected at mint time
             totalPrice,
