@@ -21,6 +21,14 @@ if (!MEM0_API_KEY) {
     console.warn("[mem0] MEM0_API_KEY not found. Memory features will be disabled.");
 }
 
+/**
+ * Check if Mem0 memory service is available
+ * Components should check this before attempting memory operations
+ */
+export function isMem0Available(): boolean {
+    return Boolean(MEM0_API_KEY);
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -201,7 +209,10 @@ export async function searchMemoryWithGraph(params: {
                 limit: params.limit || 10,
                 filters: filterConditions.length > 0 ? { AND: filterConditions } : params.filters,
                 enable_graph: true,
+                // Advanced retrieval options - all passed to Mem0 API
                 rerank: params.options?.rerank ?? true,
+                keyword_search: params.options?.keyword_search ?? true,
+                filter_memories: params.options?.filter_memories ?? true,
             }),
         });
 
@@ -357,7 +368,7 @@ export async function optimizeWithGraph(
 export async function performSafeWipe(
     workflowId: string,
     runId: string,
-    coordinatorModel: string,  // REQUIRED - from AGENTIC_COORDINATOR_MODELS list
+    coordinatorModel: string,  // from AGENTIC_COORDINATOR_MODELS list
     currentContext: {
         goal: string;
         completedActions: string[];
@@ -467,7 +478,7 @@ Create a summary that:
 export async function performMemoryWipe(
     workflowId: string,
     runId: string,
-    coordinatorModel: string,  // REQUIRED - from AGENTIC_COORDINATOR_MODELS list
+    coordinatorModel: string,
     currentContext: {
         goal: string;
         completedActions: string[];

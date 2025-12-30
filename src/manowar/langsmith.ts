@@ -29,7 +29,12 @@ const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || "https://api.smith.
 if (LANGSMITH_API_KEY && process.env.LANGSMITH_TRACING === "true") {
     process.env.LANGCHAIN_TRACING_V2 = "true";
     process.env.LANGCHAIN_API_KEY = LANGSMITH_API_KEY;
-    console.log(`[LangSmith] Tracing enabled for project: ${LANGSMITH_PROJECT}`);
+    console.log(`[LangSmith] ✅ TRACING ENABLED for project: ${LANGSMITH_PROJECT}`);
+    console.log(`[LangSmith] Cost tracking: ls_provider and ls_model_name metadata enabled`);
+} else if (LANGSMITH_API_KEY) {
+    console.warn(`[LangSmith] ⚠️ API key set but LANGSMITH_TRACING !== "true" - tracing disabled`);
+} else {
+    console.log(`[LangSmith] ❌ LANGSMITH_API_KEY not set - tracing disabled`);
 }
 
 // =============================================================================

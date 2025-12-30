@@ -384,7 +384,7 @@ export class ManowarOrchestrator {
      * Build the coordinator system prompt with COMPLETE workflow context
      * Includes full agent card metadata so coordinator can orchestrate properly
      * 
-     * CRITICAL: Instructs coordinator to PING agents, NOT execute tasks
+     * Instructs coordinator to PING agents, NOT execute tasks
      */
     private buildSystemPrompt(): string {
         // Return cached version if available
@@ -430,20 +430,24 @@ export class ManowarOrchestrator {
             ? `\n\n## MCP TOOLS AVAILABLE\n${mcpSteps.map(s => `- ${s.name}: ${s.toolName} (${s.connectorId})`).join("\n")}`
             : "";
 
-        // User input with attachments (always Pinata URLs, never base64)
+        // User input with attachments (now Pinata URLs, not base64)
         const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
         const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
 
-        // Handle attachment format: { type: string, url: string }
-        // Orchestrator ONLY sees URL reference - never raw file data
+        // Handle new attachment format: { type: "image"|"audio", url: "https://..." }
         const attachment = this.options.input.attachment as { type?: string; url?: string } | undefined;
         let attachmentNote = "";
         if (attachment?.url) {
-            // Only pass URL reference to coordinator - agent handles actual file
-            attachmentNote = `\n\n## ATTACHMENT\n- **Type**: ${attachment.type || 'file'}\n- **URL**: ${attachment.url}\n- **Note**: Pass this URL to the appropriate agent for processing. Do NOT attempt to read file contents yourself.`;
+            attachmentNote = ` [${attachment.type || 'file'} attached: ${attachment.url}]`;
+        } else if (this.options.input.image || this.options.input.audio) {
+            // Legacy format fallback
+            const attachments: string[] = [];
+            if (this.options.input.image) attachments.push("Image attached");
+            if (this.options.input.audio) attachments.push("Audio attached");
+            attachmentNote = attachments.length > 0 ? ` [${attachments.join(", ")}]` : "";
         }
 
-        // Complete system prompt with CRITICAL orchestration rules
+        // Complete system prompt with orchestration rules
         this.cachedSystemPrompt = `You are the **Shadow Orchestra Coordinator** for "${this.workflow.name}".
 
 ## WORKFLOW GOAL
@@ -453,6 +457,9 @@ ${this.workflow.description || "Execute the workflow steps in sequence"}
 "${userMessage}"${attachmentNote}
 
 ## COMPONENT AGENTS PIPELINE
+Execute these agents SEQUENTIALLY. Each agent is self-sufficient with its own tools.
+Pass each agent's output to the next step. Evaluate responses to determine if additional work is needed.
+
 ${agentPipeline}${mcpTools}
 
 ## CRITICAL ORCHESTRATION RULES
@@ -485,10 +492,9 @@ If an agent needs clarification or has questions:
 - Resolve it by providing more context or re-delegating
 - Do NOT ask the user interactively mid-workflow
 - Use your knowledge of the workflow and previous outputs to answer agent queries
-- ONLY provide the USER with the final, complete result
 
 ### 6. FINAL RESPONSE
-After all agents complete, synthesize their outputs into a coherent final response for the user.`;
+ONLY provide the USER with the final, complete result`;
 
         console.log(`[orchestrator] System prompt built: ${Math.ceil(this.cachedSystemPrompt.length / 4)} tokens`);
         return this.cachedSystemPrompt;
@@ -825,7 +831,12 @@ After all agents complete, synthesize their outputs into a coherent final respon
                 })
                 .addEdge("memoryWipe", "toolBoxer")
                 .addEdge("toolBoxer", "graphOptimize")
-                .addEdge("graphOptimize", END);
+                // Run evaluator at end of each workflow for quality assessment
+                .addNode("evaluator", async (state: ManowarState) => {
+                    return evaluatorNode(state, this.coordinatorModel);
+                })
+                .addEdge("graphOptimize", "evaluator")
+                .addEdge("evaluator", END);
 
             // Compile and execute
             const app = graph.compile();
