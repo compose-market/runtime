@@ -33,7 +33,7 @@ import {
     optimizeWithGraph,
     // Kept token optimization functions
     SLIDING_WINDOW_SIZE,
-    TOKEN_THRESHOLD_PERCENT,
+    getDynamicThresholdPercent,
     compressToolOutput,
     generateStructuredTaskPrompt,
 } from "./memory.js";
@@ -588,11 +588,12 @@ ${agentPipeline}${mcpTools}
 
                     console.log(`[orchestrator] Context: ~${estimatedTokens} tokens (${usagePercent.toFixed(1)}% of ${modelSpec.effectiveWindow})`);
 
-                    // 2. Standard sliding window at 60%
+                    // 2. Dynamic sliding window - threshold adapts to model's context size
+                    const dynamicThreshold = getDynamicThresholdPercent(modelSpec.effectiveWindow);
                     let messagesToUse: BaseMessage[] = state.messages;
 
-                    if (usagePercent > TOKEN_THRESHOLD_PERCENT && state.messages.length > SLIDING_WINDOW_SIZE) {
-                        console.log(`[orchestrator] Activating sliding window`);
+                    if (usagePercent > dynamicThreshold && state.messages.length > SLIDING_WINDOW_SIZE) {
+                        console.log(`[orchestrator] Activating sliding window (${usagePercent.toFixed(1)}% > ${dynamicThreshold.toFixed(1)}% threshold)`);
                         const firstMsg = state.messages[0];
                         const recentMsgs = state.messages.slice(-SLIDING_WINDOW_SIZE);
                         messagesToUse = [firstMsg, ...recentMsgs];
@@ -605,7 +606,7 @@ ${agentPipeline}${mcpTools}
                         try {
                             const memResult = await searchMemoryWithGraph({
                                 query: String(state.messages[0]?.content || this.workflow.description),
-                                agent_id: `manowar-${this.workflow.id}`,
+                                agent_id: this.workflow.id, // workflow.id is already "manowar-<walletAddress>"
                                 run_id: this.runId,
                                 limit: 5,
                                 options: { rerank: true },
@@ -803,7 +804,7 @@ ${agentPipeline}${mcpTools}
                     status: "running",
                 },
                 {
-                    ...createLangSmithConfig(this.workflow.id, this.runId),
+                    ...(await createLangSmithConfig(this.workflow.id, this.runId, this.coordinatorModel)),
                     callbacks: this.langsmithTracker ? [this.langsmithTracker] : [],
                     recursionLimit: 50, // Increase from default 25 for complex workflows
                 }

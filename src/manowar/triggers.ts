@@ -194,6 +194,7 @@ export async function storeTrigger(
                 ],
                 agent_id: `manowar-${trigger.manowarWallet}`,
                 user_id: userId,
+                enable_graph: true, // Enable graph memory for relation extraction
                 metadata: {
                     type: "trigger",
                     trigger_id: trigger.id,
@@ -238,6 +239,8 @@ export async function retrieveTriggers(
                 agent_id: `manowar-${manowarWallet}`,
                 user_id: userId,
                 limit: 50,
+                enable_graph: true, // Enable graph memory for better retrieval
+                rerank: true, // Enable reranking for relevance
                 filters: {
                     type: "trigger",
                     manowar_wallet: manowarWallet,

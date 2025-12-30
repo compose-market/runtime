@@ -67,7 +67,32 @@ export interface SolutionPattern {
 
 // Constants for sliding window (used by orchestrator)
 export const SLIDING_WINDOW_SIZE = 4;
-export const TOKEN_THRESHOLD_PERCENT = 60;
+export const TOKEN_THRESHOLD_PERCENT = 60; // Legacy fallback only
+
+/**
+ * Get dynamic context threshold based on model's effective window
+ * 
+ * Uses the model's actual contextLength from registry, NOT hardcoded values.
+ * Returns threshold as a percentage of context that should trigger cleanup.
+ * 
+ * Formula: Base 55% + log-scaled bonus for larger contexts
+ * This gives a continuous curve, not arbitrary breakpoints.
+ * 
+ * @param effectiveWindow - The model's effective context window (from modelSpec.effectiveWindow)
+ */
+export function getDynamicThresholdPercent(effectiveWindow: number): number {
+    // Base threshold: 55%
+    // Bonus: logarithmic scale that adds up to 15% for very large contexts
+    // This avoids hardcoded breakpoints - purely dynamic based on actual model capacity
+    const BASE = 55;
+    const MAX_BONUS = 15;
+
+    // Log scale: 32k => 0 bonus, 1M => ~10-12% bonus, 4M => ~15% bonus
+    const logScale = Math.log10(Math.max(effectiveWindow, 32000) / 32000);
+    const bonus = Math.min(MAX_BONUS, logScale * 6);
+
+    return Math.min(70, BASE + bonus); // Cap at 70%
+}
 
 // =============================================================================
 // Memory Priority Matrix Configuration
@@ -298,7 +323,7 @@ export async function optimizeWithGraph(
             { role: "system", content: `Workflow: ${workflowId} | Goal: ${context.goal}` },
             { role: "assistant", content },
         ],
-        agent_id: `manowar-${workflowId}`,
+        agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
         user_id: context.userId,
         run_id: runId,
         metadata: {
@@ -351,7 +376,7 @@ Last outcome: ${currentContext.lastOutcome}`;
                 { role: "system", content: `Memory wipe summary for ${workflowId}` },
                 { role: "assistant", content: summary },
             ],
-            agent_id: `manowar-${workflowId}`,
+            agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
             run_id: runId,
             metadata: { type: "wipe_summary" },
         });
@@ -379,7 +404,7 @@ export async function findSimilarSolutions(
 ): Promise<SolutionPattern[]> {
     const result = await searchMemoryWithGraph({
         query: taskDescription,
-        agent_id: `manowar-${workflowId}-patterns`,
+        agent_id: `${workflowId}-patterns`, // workflowId already has manowar- prefix
         limit: options?.limit || 5,
         options: { rerank: true },
     });
@@ -408,7 +433,7 @@ export async function saveSolutionPattern(
             { role: "user", content: `Task: ${pattern.task}` },
             { role: "assistant", content: `Solution: ${pattern.toolSequence.join(" → ")} (${pattern.outcome})` },
         ],
-        agent_id: `manowar-${workflowId}-patterns`,
+        agent_id: `${workflowId}-patterns`, // workflowId already has manowar- prefix
         run_id: runId,
         metadata: {
             type: "solution_pattern",
@@ -433,7 +458,7 @@ export async function getGraphInsights(
 ): Promise<{ entities: Array<{ name: string; type: string }>; topRelations: Array<{ source: string; target: string; relation: string }> }> {
     const result = await searchMemoryWithGraph({
         query,
-        agent_id: `manowar-${workflowId}`,
+        agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
         run_id: runId,
         limit: 20,
         options: { rerank: true },
@@ -502,7 +527,7 @@ Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
                 { role: "system", content: `Context summary for ${workflowId}` },
                 { role: "assistant", content: parsed.summary },
             ],
-            agent_id: `manowar-${workflowId}`,
+            agent_id: workflowId, // workflowId is already "manowar-<walletAddress>"
             run_id: runId,
             metadata: { type: "context_summary", key_facts: parsed.keyFacts },
         });

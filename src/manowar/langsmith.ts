@@ -249,6 +249,161 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
 }
 
 // =============================================================================
+// Token Extraction & Cost Estimation (Centralized Utilities)
+// =============================================================================
+
+/**
+ * Extracted token usage from any LLM response format
+ */
+export interface ExtractedUsage {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimated: boolean;
+    source: string;
+}
+
+/**
+ * Extract token usage from LangChain LLMResult or raw API response
+ * 
+ * WORKS FOR ALL 2700+ MODELS because:
+ * 1. All coordinator models (nvidia, minimax, moonshotai, nex-agi, allenai, arcee-ai)
+ *    are accessed via OpenRouter which uses OpenAI-compatible response format
+ * 2. LangChain's ChatOpenAI wrapper normalizes all OpenRouter responses to llmOutput.tokenUsage
+ * 3. This function handles both LangChain LLMResult AND raw OpenRouter API responses
+ */
+export function extractTokenUsage(response: any, modelId?: string): ExtractedUsage {
+    // 1. LangChain LLMResult format (from handleLLMEnd callback)
+    if (response?.llmOutput?.tokenUsage) {
+        const usage = response.llmOutput.tokenUsage;
+        return {
+            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
+            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
+            totalTokens: usage.totalTokens || usage.total_tokens ||
+                ((usage.promptTokens || 0) + (usage.completionTokens || 0)),
+            estimated: false,
+            source: "langchain",
+        };
+    }
+
+    // 2. LangChain AIMessage with response_metadata
+    if (response?.response_metadata?.tokenUsage) {
+        const usage = response.response_metadata.tokenUsage;
+        return {
+            inputTokens: usage.promptTokens || 0,
+            outputTokens: usage.completionTokens || 0,
+            totalTokens: usage.totalTokens || 0,
+            estimated: false,
+            source: "langchain-metadata",
+        };
+    }
+
+    // 3. OpenRouter / OpenAI-compatible format
+    if (response?.usage?.prompt_tokens !== undefined || response?.usage?.promptTokens !== undefined) {
+        const usage = response.usage;
+        return {
+            inputTokens: usage.prompt_tokens || usage.promptTokens || 0,
+            outputTokens: usage.completion_tokens || usage.completionTokens || 0,
+            totalTokens: usage.total_tokens || usage.totalTokens ||
+                ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0)),
+            estimated: false,
+            source: "openrouter",
+        };
+    }
+
+    // 4. Anthropic format (input_tokens / output_tokens)
+    if (response?.usage?.input_tokens !== undefined) {
+        return {
+            inputTokens: response.usage.input_tokens || 0,
+            outputTokens: response.usage.output_tokens || 0,
+            totalTokens: (response.usage.input_tokens + response.usage.output_tokens) || 0,
+            estimated: false,
+            source: "anthropic",
+        };
+    }
+
+    // 5. Google GenAI format (usageMetadata)
+    if (response?.usageMetadata?.promptTokenCount !== undefined) {
+        return {
+            inputTokens: response.usageMetadata.promptTokenCount || 0,
+            outputTokens: response.usageMetadata.candidatesTokenCount || 0,
+            totalTokens: response.usageMetadata.totalTokenCount ||
+                (response.usageMetadata.promptTokenCount + response.usageMetadata.candidatesTokenCount) || 0,
+            estimated: false,
+            source: "google",
+        };
+    }
+
+    // 6. Direct tokenUsage object (some LangChain versions)
+    if (response?.tokenUsage) {
+        const usage = response.tokenUsage;
+        return {
+            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
+            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
+            totalTokens: usage.totalTokens || usage.total_tokens || 0,
+            estimated: false,
+            source: "direct",
+        };
+    }
+
+    // 7. FALLBACK: Character-based estimation
+    const content = extractContentFromResponse(response);
+    const estimatedTokens = Math.ceil(content.length / 4);
+    if (modelId) {
+        console.warn(`[langsmith] No token usage in response for model ${modelId}, using estimation`);
+    }
+    return {
+        inputTokens: 0,
+        outputTokens: estimatedTokens,
+        totalTokens: estimatedTokens,
+        estimated: true,
+        source: "estimated",
+    };
+}
+
+/**
+ * Extract text content from various response formats (for fallback estimation)
+ */
+function extractContentFromResponse(response: any): string {
+    if (response?.content !== undefined) {
+        if (typeof response.content === "string") return response.content;
+        if (Array.isArray(response.content)) {
+            return response.content.map((p: any) => p.text || p.content || "").join("");
+        }
+    }
+    if (response?.choices?.[0]?.message?.content) {
+        return response.choices[0].message.content;
+    }
+    if (response?.content?.[0]?.text) {
+        return response.content[0].text;
+    }
+    if (typeof response?.text === "string") {
+        return response.text;
+    }
+    return "";
+}
+
+/**
+ * Estimate tokens from text (fallback when no tokenizer available)
+ * Uses ~4 chars per token heuristic
+ */
+export function estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
+}
+
+/**
+ * Calculate USD cost from token counts and pricing
+ * Pricing is in USD per million tokens
+ */
+export function estimateCost(
+    inputTokens: number,
+    outputTokens: number,
+    pricing: { input: number; output: number }
+): number {
+    return (inputTokens * pricing.input + outputTokens * pricing.output) / 1_000_000;
+}
+
+// =============================================================================
 // LangSmith Configuration
 // =============================================================================
 
@@ -256,7 +411,7 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
  * Fetch model metadata from the dynamic registry (2700+ models)
  * Uses the Lambda API which aggregates from all providers with real source data
  */
-async function fetchModelMetadata(modelId: string): Promise<{ source: string; contextLength?: number } | null> {
+export async function fetchModelMetadata(modelId: string): Promise<{ source: string; contextLength?: number } | null> {
     if (!modelId) return null;
 
     const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
@@ -281,9 +436,10 @@ async function fetchModelMetadata(modelId: string): Promise<{ source: string; co
 const modelMetadataCache = new Map<string, { source: string; contextLength?: number }>();
 
 /**
- * Get model metadata (cached)
+ * Get model metadata (cached) - exported for use by context.ts and other modules
+ * Fetches source (provider) and contextLength from Lambda models API (2700+ models)
  */
-async function getModelMetadataCached(modelId: string): Promise<{ source: string; contextLength?: number }> {
+export async function getModelMetadataCached(modelId: string): Promise<{ source: string; contextLength?: number }> {
     if (modelMetadataCache.has(modelId)) {
         return modelMetadataCache.get(modelId)!;
     }

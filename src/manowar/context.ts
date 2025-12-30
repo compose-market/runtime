@@ -26,6 +26,21 @@ import type { LLMResult } from "@langchain/core/outputs";
 // Import agentic model definitions for provider context
 import { AGENTIC_COORDINATOR_MODELS, getAgenticModel } from "./agentic.js";
 
+// Import dynamic model metadata from langsmith (centralized, uses Lambda API)
+import {
+    getModelMetadataCached,
+    extractTokenUsage,
+    estimateTokens,
+    estimateCost,
+    type ExtractedUsage
+} from "./langsmith.js";
+
+// Re-export for backwards compatibility
+export { ExtractedUsage, extractTokenUsage, estimateTokens, estimateCost };
+
+// Default context fallback (only used when Lambda API fails)
+const DEFAULT_CONTEXT_LENGTH = 128000;
+
 // =============================================================================
 // WindowTracker Agent - Dynamic Model Context Window Specs
 // =============================================================================
@@ -41,233 +56,51 @@ export interface ModelContextSpec {
     source: string;
 }
 
-/**
- * Default context limits by provider (fallback when model not in registry)
- */
-const PROVIDER_DEFAULTS: Record<string, number> = {
-    "openai": 400000,      // GPT-5.2
-    "anthropic": 200000,   // Claude 4.5
-    "google": 1000000,     // Gemini 3 Pro
-    "nvidia": 128000,      // Nemotron
-    "minimax": 4000000,    // MiniMax M2.1
-    "moonshotai": 256000,  // Kimi K2
-    "nex-agi": 164000,     // DeepSeek Nex
-    "allenai": 128000,     // OLMo
-    "arcee-ai": 128000,    // Arcee Trinity
-    "asi-cloud": 128000,
-    "huggingface": 32768,
-    "default": 128000,
-};
+// Context fetches from Lambda API via getModelMetadataCached
 
 /**
- * Infer provider from model ID
- */
-function inferProvider(modelId: string): string {
-    const parts = modelId.split("/");
-    if (parts.length >= 2) {
-        return parts[0].toLowerCase();
-    }
-    // Check common prefixes
-    if (modelId.startsWith("gpt")) return "openai";
-    if (modelId.startsWith("claude")) return "anthropic";
-    if (modelId.startsWith("gemini")) return "google";
-    return "default";
-}
-
-/**
- * WindowTracker: Get model context spec from registry or infer from provider
- * Uses dynamic lookup from models.ts when available
+ * WindowTracker: Get model context spec from registry
+ * Uses centralized getModelMetadataCached from langsmith.ts (Lambda API with 2700+ models)
  */
 export async function getModelContextSpec(modelId: string): Promise<ModelContextSpec> {
-    try {
-        // Try to fetch from the models API
-        const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
-        const response = await fetch(`${LAMBDA_API_URL}/api/models/${encodeURIComponent(modelId)}`);
-
-        if (response.ok) {
-            const model = await response.json();
-            return {
-                modelId,
-                contextLength: model.contextLength || PROVIDER_DEFAULTS[inferProvider(modelId)] || PROVIDER_DEFAULTS.default,
-                effectiveWindow: (model.contextLength || PROVIDER_DEFAULTS.default) * 0.70,
-                maxCompletionTokens: model.maxCompletionTokens,
-                source: model.source || inferProvider(modelId),
-            };
-        }
-    } catch {
-        // Fallback to provider defaults
-    }
-
-    // Fallback: use provider defaults
-    const provider = inferProvider(modelId);
-    const contextLength = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.default;
+    // Use centralized model metadata cache (fetches from Lambda API)
+    const metadata = await getModelMetadataCached(modelId);
+    const contextLength = metadata.contextLength || DEFAULT_CONTEXT_LENGTH;
 
     return {
         modelId,
         contextLength,
         effectiveWindow: contextLength * 0.70,
-        source: provider,
+        source: metadata.source,
     };
 }
 
 /**
  * Synchronous version using defaults (for when async is not possible)
+ * Falls back to CONTEXT_WINDOW_DEFAULTS or default value
  */
 export function getModelContextSpecSync(modelId: string): ModelContextSpec {
-    const provider = inferProvider(modelId);
-    const contextLength = CONTEXT_WINDOW_DEFAULTS.MODEL_CONTEXT_SIZES[modelId] ||
-        PROVIDER_DEFAULTS[provider] ||
-        PROVIDER_DEFAULTS.default;
+    // Check known model sizes first
+    const contextLength = CONTEXT_WINDOW_DEFAULTS.MODEL_CONTEXT_SIZES[modelId] || DEFAULT_CONTEXT_LENGTH;
+
+    // Infer source from model ID for sync version (can't call async API)
+    const parts = modelId.split("/");
+    const source = parts.length >= 2 ? parts[0].toLowerCase() : "unknown";
 
     return {
         modelId,
         contextLength,
         effectiveWindow: contextLength * 0.70,
-        source: provider,
+        source,
     };
 }
 
 // =============================================================================
-// API Usage Extraction (NoteTaker Agent Logic)
+// API Usage Extraction (Imported from langsmith.ts)
 // =============================================================================
 
-/**
- * Extract token usage from API responses across all providers
- * This replaces character-based estimation with 100% accurate tracking
- */
-export interface ExtractedUsage {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-    estimated: boolean;
-    source: string;
-}
-
-/**
- * Extract token usage from LangChain LLMResult or raw API response
- * 
- * WORKS FOR ALL 2700+ MODELS because:
- * 1. All coordinator models (nvidia, minimax, moonshotai, nex-agi, allenai, arcee-ai)
- *    are accessed via OpenRouter which uses OpenAI-compatible response format
- * 2. LangChain's ChatOpenAI wrapper normalizes all OpenRouter responses to llmOutput.tokenUsage
- * 3. This function handles both LangChain LLMResult AND raw OpenRouter API responses
- */
-export function extractTokenUsage(response: any, modelId?: string): ExtractedUsage {
-    // 1. LangChain LLMResult format (from handleLLMEnd callback)
-    // This is the PREFERRED source - LangChain normalizes all provider responses here
-    if (response?.llmOutput?.tokenUsage) {
-        const usage = response.llmOutput.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
-            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
-            totalTokens: usage.totalTokens || usage.total_tokens ||
-                ((usage.promptTokens || 0) + (usage.completionTokens || 0)),
-            estimated: false,
-            source: "langchain",
-        };
-    }
-
-    // 2. LangChain AIMessage with response_metadata (from ChatOpenAI invoke)
-    // ChatOpenAI stores token usage in response_metadata.usage or response_metadata.tokenUsage
-    if (response?.response_metadata?.tokenUsage) {
-        const usage = response.response_metadata.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || 0,
-            outputTokens: usage.completionTokens || 0,
-            totalTokens: usage.totalTokens || 0,
-            estimated: false,
-            source: "langchain-metadata",
-        };
-    }
-
-    // 3. OpenRouter / OpenAI-compatible format (used by ALL coordinator models)
-    // nvidia, minimax, moonshotai, nex-agi, allenai, arcee-ai ALL use this via OpenRouter
-    if (response?.usage?.prompt_tokens !== undefined || response?.usage?.promptTokens !== undefined) {
-        const usage = response.usage;
-        return {
-            inputTokens: usage.prompt_tokens || usage.promptTokens || 0,
-            outputTokens: usage.completion_tokens || usage.completionTokens || 0,
-            totalTokens: usage.total_tokens || usage.totalTokens ||
-                ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0)),
-            estimated: false,
-            source: "openrouter",
-        };
-    }
-
-    // 4. Anthropic format (input_tokens / output_tokens)
-    if (response?.usage?.input_tokens !== undefined) {
-        return {
-            inputTokens: response.usage.input_tokens || 0,
-            outputTokens: response.usage.output_tokens || 0,
-            totalTokens: (response.usage.input_tokens + response.usage.output_tokens) || 0,
-            estimated: false,
-            source: "anthropic",
-        };
-    }
-
-    // 5. Google GenAI format (usageMetadata)
-    if (response?.usageMetadata?.promptTokenCount !== undefined) {
-        return {
-            inputTokens: response.usageMetadata.promptTokenCount || 0,
-            outputTokens: response.usageMetadata.candidatesTokenCount || 0,
-            totalTokens: response.usageMetadata.totalTokenCount ||
-                (response.usageMetadata.promptTokenCount + response.usageMetadata.candidatesTokenCount) || 0,
-            estimated: false,
-            source: "google",
-        };
-    }
-
-    // 6. Direct tokenUsage object (some LangChain versions)
-    if (response?.tokenUsage) {
-        const usage = response.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
-            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
-            totalTokens: usage.totalTokens || usage.total_tokens || 0,
-            estimated: false,
-            source: "direct",
-        };
-    }
-
-    // 7. FALLBACK: Character-based estimation (only if no usage data available)
-    // This should rarely happen since OpenRouter includes usage in all responses
-    const content = extractContentFromResponse(response);
-    const estimatedTokens = Math.ceil(content.length / 4);
-    console.warn(`[context] No token usage in response for model ${modelId || 'unknown'}, using estimation`);
-    return {
-        inputTokens: 0,
-        outputTokens: estimatedTokens,
-        totalTokens: estimatedTokens,
-        estimated: true,
-        source: "estimated",
-    };
-}
-
-/**
- * Extract text content from various response formats
- */
-function extractContentFromResponse(response: any): string {
-    // LangChain AIMessage
-    if (response?.content !== undefined) {
-        if (typeof response.content === "string") return response.content;
-        if (Array.isArray(response.content)) {
-            return response.content.map((p: any) => p.text || p.content || "").join("");
-        }
-    }
-    // OpenAI format
-    if (response?.choices?.[0]?.message?.content) {
-        return response.choices[0].message.content;
-    }
-    // Anthropic format
-    if (response?.content?.[0]?.text) {
-        return response.content[0].text;
-    }
-    // LangChain text attribute
-    if (typeof response?.text === "string") {
-        return response.text;
-    }
-    return "";
-}
+// Token extraction utilities are now centralized in langsmith.ts
+// extractTokenUsage, ExtractedUsage, estimateTokens, estimateCost are re-exported above
 
 // =============================================================================
 // Token Checkpoint (NoteTaker Agent Data Structure)
