@@ -183,6 +183,44 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
         throw new Error(`Invalid walletAddress: ${walletAddress}. Must be provided from IPFS metadata.`);
     }
 
+    // Validate agentCardUri is resolvable and matches provided data
+    if (params.agentCardUri && params.agentCardUri.startsWith("ipfs://")) {
+        const cid = params.agentCardUri.replace("ipfs://", "");
+        // Validate CID format - proper IPFS CIDs start with 'Qm' (v0) or 'bafy/bafk' (v1)
+        if (!cid.startsWith("Qm") && !cid.startsWith("baf")) {
+            throw new Error(`Invalid agentCardUri CID format: ${cid}. Must be a valid IPFS CID.`);
+        }
+
+        try {
+            const metadata = await fetchFromPinata<{
+                walletAddress?: string;
+                name?: string;
+                model?: string;
+            }>(cid);
+
+            if (!metadata) {
+                throw new Error(`Failed to fetch agentCardUri metadata from IPFS: ${params.agentCardUri}`);
+            }
+
+            // Verify wallet address from IPFS matches provided wallet address
+            if (metadata.walletAddress &&
+                metadata.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+                throw new Error(
+                    `Wallet address mismatch! IPFS metadata has ${metadata.walletAddress} ` +
+                    `but registration provided ${walletAddress}. Registration rejected.`
+                );
+            }
+
+            console.log(`[registry] ✅ agentCardUri validated: ${params.agentCardUri}`);
+        } catch (err) {
+            if (err instanceof Error && err.message.includes("mismatch")) {
+                throw err; // Re-throw validation errors
+            }
+            console.warn(`[registry] ⚠️ Could not validate agentCardUri: ${err}`);
+            // Continue with registration - IPFS may be temporarily unavailable
+        }
+    }
+
     // Check if already registered by wallet address
     if (registeredAgents.has(walletAddress)) {
         throw new Error(`Agent with wallet ${walletAddress} is already registered`);
