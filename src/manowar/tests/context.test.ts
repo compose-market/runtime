@@ -1,320 +1,261 @@
 /**
  * Context Tests
  * 
- * Unit tests for context window management components:
- * - TokenLedger: Token usage checkpointing
- * - ContextWindowManager: Window state tracking
- * - Model context spec retrieval (sync and async)
+ * INTEGRATION TESTS - Uses real API calls to api.compose.market
+ * No mocks - tests actual connectivity and data.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
-    TokenLedger,
     ContextWindowManager,
     getModelContextSpec,
     getModelContextSpecSync,
-    type TokenCheckpoint,
+    getSlidingWindow,
+    getDynamicThresholdPercent,
+    fetchModelContextWindow,
+    SLIDING_WINDOW_SIZE,
     type ModelContextSpec,
 } from "../context.js";
+import {
+    estimateCost,
+} from "../langsmith.js";
 
-// Mock fetch for Lambda API calls
-const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch);
+// NO MOCKS - Real API calls to api.compose.market
 
-// Helper to create valid TokenUsage objects
-function createTokenUsage(agentId: string, model: string, inputTokens: number, outputTokens: number) {
-    return {
-        agentId,
-        model,
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens + outputTokens,
-        timestamp: Date.now(),
-    };
-}
+// ============================================================================
+// estimateCost Tests (from langsmith.ts)
+// ============================================================================
+describe("estimateCost", () => {
+    it("should calculate cost with pricing object", () => {
+        const pricing = { input: 2.5, output: 10 }; // USD per million tokens
+        const cost = estimateCost(1000, 500, pricing);
 
-describe("TokenLedger", () => {
-    let ledger: TokenLedger;
-
-    beforeEach(() => {
-        ledger = new TokenLedger();
+        expect(cost).toBeGreaterThan(0);
+        expect(cost).toBeLessThan(0.01);
     });
 
-    describe("recordFromResponse", () => {
-        it("should record checkpoint from API response with usage data", () => {
-            const response = {
-                usage: {
-                    prompt_tokens: 100,
-                    completion_tokens: 50,
-                    total_tokens: 150,
-                },
-            };
+    it("should handle different pricing", () => {
+        const pricing = { input: 0.15, output: 0.6 };
+        const cost = estimateCost(1000, 500, pricing);
 
-            const checkpoint = ledger.recordFromResponse(
-                "agent1",
-                "gpt-4o",
-                "analyze",
-                response,
-                "openai"
-            );
-
-            expect(checkpoint.agentId).toBe("agent1");
-            expect(checkpoint.modelId).toBe("gpt-4o");
-            expect(checkpoint.action).toBe("analyze");
-            expect(checkpoint.inputTokens).toBe(100);
-            expect(checkpoint.outputTokens).toBe(50);
-            expect(checkpoint.estimated).toBe(false);
-        });
-
-        it("should handle Anthropic-style usage format", () => {
-            const response = {
-                usage: {
-                    input_tokens: 200,
-                    output_tokens: 100,
-                },
-            };
-
-            const checkpoint = ledger.recordFromResponse(
-                "claude",
-                "claude-3-opus",
-                "generate",
-                response,
-                "anthropic"
-            );
-
-            expect(checkpoint.inputTokens).toBe(200);
-            expect(checkpoint.outputTokens).toBe(100);
-        });
-
-        it("should update cumulative total", () => {
-            const response1 = { usage: { prompt_tokens: 100, completion_tokens: 50 } };
-            const response2 = { usage: { prompt_tokens: 200, completion_tokens: 100 } };
-
-            ledger.recordFromResponse("a1", "m1", "act1", response1);
-            ledger.recordFromResponse("a2", "m2", "act2", response2);
-
-            expect(ledger.getCumulativeTotal()).toBe(450); // 150 + 300
-        });
-    });
-
-    describe("getAgentCheckpoints", () => {
-        it("should return only checkpoints for specified agent", () => {
-            ledger.recordFromResponse("agent1", "m1", "a1", { usage: { prompt_tokens: 100, completion_tokens: 50 } });
-            ledger.recordFromResponse("agent2", "m2", "a2", { usage: { prompt_tokens: 200, completion_tokens: 100 } });
-            ledger.recordFromResponse("agent1", "m3", "a3", { usage: { prompt_tokens: 150, completion_tokens: 75 } });
-
-            const agent1Checkpoints = ledger.getAgentCheckpoints("agent1");
-
-            expect(agent1Checkpoints).toHaveLength(2);
-            expect(agent1Checkpoints.every(c => c.agentId === "agent1")).toBe(true);
-        });
-
-        it("should return empty array for unknown agent", () => {
-            ledger.recordFromResponse("agent1", "m1", "a1", { usage: { prompt_tokens: 100, completion_tokens: 50 } });
-
-            const unknown = ledger.getAgentCheckpoints("unknown");
-
-            expect(unknown).toHaveLength(0);
-        });
-    });
-
-    describe("getAgentTotals", () => {
-        it("should return total tokens per agent", () => {
-            ledger.recordFromResponse("agent1", "m1", "a1", { usage: { prompt_tokens: 100, completion_tokens: 50 } });
-            ledger.recordFromResponse("agent2", "m2", "a2", { usage: { prompt_tokens: 200, completion_tokens: 100 } });
-            ledger.recordFromResponse("agent1", "m3", "a3", { usage: { prompt_tokens: 150, completion_tokens: 75 } });
-
-            const totals = ledger.getAgentTotals();
-
-            expect(totals.get("agent1")).toBe(375); // 150 + 225
-            expect(totals.get("agent2")).toBe(300);
-        });
-    });
-
-    describe("clear", () => {
-        it("should clear all checkpoints and reset total", () => {
-            ledger.recordFromResponse("agent1", "m1", "a1", { usage: { prompt_tokens: 100, completion_tokens: 50 } });
-            ledger.recordFromResponse("agent2", "m2", "a2", { usage: { prompt_tokens: 200, completion_tokens: 100 } });
-
-            ledger.clear();
-
-            expect(ledger.getCumulativeTotal()).toBe(0);
-            expect(ledger.export()).toHaveLength(0);
-        });
-    });
-
-    describe("recordCheckpoint", () => {
-        it("should record pre-built checkpoint directly", () => {
-            const checkpoint: TokenCheckpoint = {
-                agentId: "external",
-                modelId: "gpt-4",
-                action: "external-action",
-                inputTokens: 500,
-                outputTokens: 200,
-                timestamp: Date.now(),
-                cumulativeTotal: 700,
-                estimated: false,
-                provider: "openai",
-            };
-
-            ledger.recordCheckpoint(checkpoint);
-
-            const exported = ledger.export();
-            expect(exported).toHaveLength(1);
-            expect(exported[0].agentId).toBe("external");
-        });
-    });
-
-    describe("export", () => {
-        it("should return copy of all checkpoints", () => {
-            ledger.recordFromResponse("agent1", "m1", "a1", { usage: { prompt_tokens: 100, completion_tokens: 50 } });
-
-            const exported1 = ledger.export();
-            const exported2 = ledger.export();
-
-            expect(exported1).not.toBe(exported2); // Different array instances
-            expect(exported1).toEqual(exported2); // Same content
-        });
+        expect(cost).toBeGreaterThan(0);
     });
 });
 
-describe("ContextWindowManager", () => {
-    let manager: ContextWindowManager;
+// ============================================================================
+// getDynamicThresholdPercent Tests (moved from memory.ts)
+// ============================================================================
+describe("getDynamicThresholdPercent", () => {
+    it("should return higher threshold for larger windows", () => {
+        const smallWindowThreshold = getDynamicThresholdPercent(16000);
+        const largeWindowThreshold = getDynamicThresholdPercent(128000);
 
-    beforeEach(() => {
-        manager = new ContextWindowManager("gpt-4o", {
-            maxTokens: 128000,
-            cleanupThreshold: 70,
-        });
+        expect(largeWindowThreshold).toBeGreaterThan(smallWindowThreshold);
     });
 
-    describe("constructor", () => {
-        it("should initialize with correct settings", () => {
-            const state = manager.getState();
+    it("should return approximately 55% for small windows", () => {
+        const threshold = getDynamicThresholdPercent(1024);
 
-            expect(state.maxTokens).toBe(128000);
-            expect(state.currentTokens).toBe(0);
-            expect(state.usagePercent).toBe(0);
-        });
-
-        it("should use default values when options not provided", () => {
-            const defaultManager = new ContextWindowManager("gpt-4o-mini");
-            const state = defaultManager.getState();
-
-            // Should have a reasonable default maxTokens
-            expect(state.maxTokens).toBeGreaterThanOrEqual(16000);
-        });
+        expect(threshold).toBeCloseTo(55, 0);
     });
 
-    describe("recordUsage", () => {
-        it("should track token usage", () => {
-            manager.recordUsage(createTokenUsage("agent1", "gpt-4o", 1000, 500));
+    it("should cap at reasonable maximum", () => {
+        const threshold = getDynamicThresholdPercent(1000000);
 
-            const state = manager.getState();
-            expect(state.currentTokens).toBe(1500);
-        });
+        expect(threshold).toBeLessThanOrEqual(75);
+    });
+});
 
-        it("should accumulate usage from multiple calls", () => {
-            manager.recordUsage(createTokenUsage("a1", "m1", 1000, 500));
-            manager.recordUsage(createTokenUsage("a2", "m2", 2000, 1000));
+// ============================================================================
+// Constants
+// ============================================================================
+describe("Constants", () => {
+    it("should export SLIDING_WINDOW_SIZE", () => {
+        expect(typeof SLIDING_WINDOW_SIZE).toBe("number");
+        expect(SLIDING_WINDOW_SIZE).toBeGreaterThan(0);
+    });
+});
 
-            const state = manager.getState();
-            expect(state.currentTokens).toBe(4500);
-        });
+// ============================================================================
+// getModelContextSpec Tests - REAL API CALLS
+// ============================================================================
+describe("fetchModelContextWindow (Real API)", () => {
+    it("should fetch contextWindow from api.compose.market", async () => {
+        // Real API call - no mocks
+        const contextWindow = await fetchModelContextWindow("gpt-4o");
+
+        // Real gpt-4o has 128k context window
+        expect(contextWindow).toBeGreaterThan(0);
+        expect(contextWindow).toBe(128000);
+        console.log(`[TEST] Real API returned contextWindow: ${contextWindow}`);
     });
 
-    describe("recordMessage", () => {
-        it("should estimate and record tokens from message content", () => {
-            const usage = manager.recordMessage("agent1", "gpt-4o", "Hello, this is a test message with some content.");
+    it("should cache repeated requests", async () => {
+        // First call fetches from API
+        const first = await fetchModelContextWindow("gpt-4o-mini");
+        // Second call should use cache (faster)
+        const second = await fetchModelContextWindow("gpt-4o-mini");
 
-            expect(usage.inputTokens).toBeGreaterThan(0);
-            expect(manager.getState().currentTokens).toBeGreaterThan(0);
-        });
-
-        it("should add output tokens when isOutput is true", () => {
-            const usage = manager.recordMessage("agent1", "gpt-4o", "Response content", true);
-
-            expect(usage.outputTokens).toBeGreaterThan(0);
-        });
-    });
-
-    describe("getState", () => {
-        it("should calculate usage percentage correctly", () => {
-            manager.recordUsage(createTokenUsage("a1", "m1", 64000, 0));
-
-            const state = manager.getState();
-            expect(state.usagePercent).toBeCloseTo(50, 0);
-        });
-
-        it("should indicate when cleanup is needed", () => {
-            // Record tokens that exceed 70% threshold
-            manager.recordUsage(createTokenUsage("a1", "m1", 100000, 0));
-
-            const state = manager.getState();
-            expect(state.needsCleanup).toBe(true);
-        });
-    });
-
-    describe("getRemainingTokens", () => {
-        it("should return correct remaining capacity", () => {
-            manager.recordUsage(createTokenUsage("a1", "m1", 28000, 0));
-
-            expect(manager.getRemainingTokens()).toBe(100000); // 128000 - 28000
-        });
-    });
-
-    describe("getSafeTokenLimit", () => {
-        it("should return threshold-adjusted limit", () => {
-            const safeLimit = manager.getSafeTokenLimit();
-
-            expect(safeLimit).toBe(89600); // 128000 * 0.7
-        });
-    });
-
-    describe("willExceedThreshold", () => {
-        it("should return true when content will exceed threshold", () => {
-            // Set current usage close to threshold
-            manager.recordUsage(createTokenUsage("a1", "m1", 85000, 0));
-
-            // A long message should exceed threshold
-            const longContent = "word ".repeat(10000);
-            expect(manager.willExceedThreshold(longContent)).toBe(true);
-        });
-
-        it("should return false when content fits within threshold", () => {
-            const shortContent = "Hello world";
-            expect(manager.willExceedThreshold(shortContent)).toBe(false);
-        });
+        expect(first).toBe(second);
+        expect(first).toBeGreaterThan(0);
     });
 });
 
 describe("getModelContextSpec", () => {
-    beforeEach(() => {
-        mockFetch.mockReset();
-    });
-
-    it("should return spec for model", async () => {
-        mockFetch.mockResolvedValueOnce({
-            ok: true,
-            json: () => Promise.resolve({
-                contextLength: 128000,
-                source: "openai",
-            }),
-        });
-
+    it("should return spec from real API", async () => {
         const spec = await getModelContextSpec("gpt-4o");
 
         expect(spec.modelId).toBe("gpt-4o");
-        expect(spec.contextLength).toBeGreaterThan(0);
-        expect(spec.effectiveWindow).toBeGreaterThan(0);
+        expect(spec.contextLength).toBe(128000); // Real API value
+        expect(spec.effectiveWindow).toBe(Math.floor(128000 * 0.70));
+        expect(spec.source).toBe("api");
     });
 });
 
 describe("getModelContextSpecSync", () => {
-    it("should return spec for any model", () => {
+    it("should return unknown source for sync version", () => {
         const spec = getModelContextSpecSync("gpt-4o");
 
         expect(spec.modelId).toBe("gpt-4o");
-        expect(typeof spec.contextLength).toBe("number");
+        expect(spec.source).toBe("unknown"); // Sync cannot fetch from API
+    });
+});
+
+// ============================================================================
+// ContextWindowManager Tests
+// ============================================================================
+describe("ContextWindowManager", () => {
+    it("should create with model", () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        expect(manager).toBeDefined();
+    });
+
+    it("should initialize with real context from API", async () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        await manager.initialize();
+
+        const state = manager.getState();
+        expect(state.maxTokens).toBe(128000); // From mock
+    });
+
+    it("should record usage and update state", async () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        await manager.initialize();
+
+        manager.recordUsage({
+            agentId: "agent1",
+            model: "gpt-4o",
+            inputTokens: 100,
+            outputTokens: 50,
+            totalTokens: 150,
+            timestamp: Date.now(),
+        });
+
+        const state = manager.getState();
+        expect(state.currentTokens).toBe(150);
+    });
+
+    it("should record message and track actual token count", async () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        await manager.initialize();
+
+        // Use actual token count (from LangSmith callback) instead of estimating
+        const usage = manager.recordMessage("agent1", "gpt-4o", 100);
+
+        expect(usage.agentId).toBe("agent1");
+        expect(usage.totalTokens).toBe(100);
+    });
+
+    it("should accumulate usage for same agent", async () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        await manager.initialize();
+
+        manager.recordUsage({
+            agentId: "agent1",
+            model: "gpt-4o",
+            inputTokens: 100,
+            outputTokens: 50,
+            totalTokens: 150,
+            timestamp: Date.now(),
+        });
+
+        manager.recordUsage({
+            agentId: "agent1",
+            model: "gpt-4o",
+            inputTokens: 50,
+            outputTokens: 25,
+            totalTokens: 75,
+            timestamp: Date.now(),
+        });
+
+        const state = manager.getState();
+        expect(state.currentTokens).toBe(225);
+    });
+
+    it("should calculate remaining tokens", async () => {
+        const manager = new ContextWindowManager("gpt-4o");
+        await manager.initialize();
+
+        manager.recordUsage({
+            agentId: "agent1",
+            model: "gpt-4o",
+            inputTokens: 300,
+            outputTokens: 0,
+            totalTokens: 300,
+            timestamp: Date.now(),
+        });
+
+        expect(manager.getRemainingTokens()).toBe(128000 - 300);
+    });
+});
+
+// ============================================================================
+// getSlidingWindow Tests
+// ============================================================================
+describe("getSlidingWindow", () => {
+    it("should keep all messages if under window size", () => {
+        const messages = [
+            { role: "system", content: "System" },
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Hi" },
+        ];
+
+        const result = getSlidingWindow(messages, 6);
+        expect(result.length).toBe(3);
+    });
+
+    it("should keep system message and last N messages", () => {
+        const messages = [
+            { role: "system", content: "System" },
+            { role: "user", content: "1" },
+            { role: "assistant", content: "2" },
+            { role: "user", content: "3" },
+            { role: "assistant", content: "4" },
+            { role: "user", content: "5" },
+            { role: "assistant", content: "6" },
+            { role: "user", content: "7" },
+            { role: "assistant", content: "8" },
+        ];
+
+        const result = getSlidingWindow(messages, 4);
+
+        expect(result.length).toBe(5); // system + last 4
+        expect(result[0].role).toBe("system");
+        expect(result[1].content).toBe("5");
+    });
+
+    it("should handle messages without system message", () => {
+        const messages = [
+            { role: "user", content: "1" },
+            { role: "assistant", content: "2" },
+            { role: "user", content: "3" },
+            { role: "assistant", content: "4" },
+            { role: "user", content: "5" },
+        ];
+
+        const result = getSlidingWindow(messages, 2);
+
+        expect(result.length).toBe(2);
+        expect(result[0].content).toBe("4");
     });
 });

@@ -1,123 +1,103 @@
 /**
- * State Tests
+ * State Tests - Simplified
  * 
- * Unit tests for the ManowarOrchestrationState annotations and types.
+ * Tests for the simplified state management.
  */
 
 import { describe, it, expect } from "vitest";
 import {
     ManowarOrchestrationState,
-    type AgentTokenMetrics,
-    type WindowHealthStatus,
-    type ToolRecommendation,
-    type LoopEvaluation,
-    type OrchestraModels,
+    createInitialState,
+    getTotalTokenUsage,
+    type ManowarState,
+    type PlanStepOutput,
 } from "../state.js";
 
+// ============================================================================
+// State Annotation Tests
+// ============================================================================
 describe("ManowarOrchestrationState", () => {
-    it("should have all required annotations defined", () => {
+    it("should have required core fields", () => {
         const spec = ManowarOrchestrationState.spec;
 
-        // Core messages
+        // Core fields
         expect(spec.messages).toBeDefined();
-
-        // Workflow identity
         expect(spec.workflowId).toBeDefined();
         expect(spec.runId).toBeDefined();
-
-        // Goal & Progress
         expect(spec.activeGoal).toBeDefined();
-        expect(spec.completedActions).toBeDefined();
-
-        // Agent mapping
-        expect(spec.agentModels).toBeDefined();
-        expect(spec.boundPlugins).toBeDefined();
-
-        // Shadow Orchestra Models (coordinator-assigned)
-        expect(spec.orchestraModels).toBeDefined();
-
-        // NoteTaker
-        expect(spec.tokenMetrics).toBeDefined();
-
-        // WindowTracker
-        expect(spec.windowHealth).toBeDefined();
-        expect(spec.needsCleanup).toBeDefined();
-
-        // ToolBoxer
-        expect(spec.suggestedTools).toBeDefined();
-
-        // Evaluator
-        expect(spec.lastEvaluation).toBeDefined();
-        expect(spec.suggestedImprovements).toBeDefined();
-
-        // Continuous Loop
-        expect(spec.loopCount).toBeDefined();
-        expect(spec.shouldContinueLoop).toBeDefined();
+        expect(spec.status).toBeDefined();
     });
 
-    it("should have orchestraModels annotation", () => {
+    it("should have planning fields", () => {
         const spec = ManowarOrchestrationState.spec;
-        expect(spec.orchestraModels).toBeDefined();
+
+        expect(spec.currentPlan).toBeDefined();
+        expect(spec.stepOutputs).toBeDefined();
+        expect(spec.currentStepNumber).toBeDefined();
+    });
+
+    it("should have tracking fields", () => {
+        const spec = ManowarOrchestrationState.spec;
+
+        expect(spec.totalCostWei).toBeDefined();
+        expect(spec.totalTokensUsed).toBeDefined();
+        expect(spec.completedActions).toBeDefined();
     });
 });
 
-describe("Type Exports", () => {
-    it("should export AgentTokenMetrics type correctly", () => {
-        const metrics: AgentTokenMetrics = {
-            inputTokens: 100,
-            outputTokens: 50,
-            reasoningTokens: 10,
-            totalTokens: 160,
-            lastUpdated: Date.now(),
-        };
+// ============================================================================
+// Helper Function Tests
+// ============================================================================
+describe("createInitialState", () => {
+    it("should create state with required fields", () => {
+        const state = createInitialState("workflow-1", "My goal", "0x123");
 
-        expect(metrics.inputTokens).toBe(100);
-        expect(metrics.reasoningTokens).toBe(10);
+        expect(state.workflowId).toBe("workflow-1");
+        expect(state.activeGoal).toBe("My goal");
+        expect(state.manowarWallet).toBe("0x123");
+        expect(state.status).toBe("idle");
+        expect(state.runId).toMatch(/^run-\d+-[a-z0-9]+$/);
     });
 
-    it("should export WindowHealthStatus type correctly", () => {
-        const health: WindowHealthStatus = {
-            usage: 50000,
-            limit: 128000,
-            usagePercent: 39.0625,
-            healthy: true,
+    it("should work without wallet address", () => {
+        const state = createInitialState("workflow-2", "Another goal");
+
+        expect(state.workflowId).toBe("workflow-2");
+        expect(state.manowarWallet).toBeUndefined();
+    });
+});
+
+describe("getTotalTokenUsage", () => {
+    it("should sum tokens from step outputs", () => {
+        const state: Partial<ManowarState> = {
+            stepOutputs: [
+                { stepNumber: 1, agentName: "A1", success: true, output: "test", tokensUsed: 100 },
+                { stepNumber: 2, agentName: "A2", success: true, output: "test", tokensUsed: 200 },
+                { stepNumber: 3, agentName: "A3", success: false, output: "err", tokensUsed: 50 },
+            ],
         };
 
-        expect(health.healthy).toBe(true);
+        const total = getTotalTokenUsage(state as ManowarState);
+        expect(total).toBe(350);
     });
 
-    it("should export ToolRecommendation type correctly", () => {
-        const rec: ToolRecommendation = {
-            registryId: "brave-search",
-            name: "Brave Search",
-            description: "Web search using Brave",
-            spawnParams: { transport: "http", remoteUrl: "https://api.brave.com" },
-            confidence: 0.85,
+    it("should return 0 for empty step outputs", () => {
+        const state: Partial<ManowarState> = {
+            stepOutputs: [],
         };
 
-        expect(rec.confidence).toBe(0.85);
+        const total = getTotalTokenUsage(state as ManowarState);
+        expect(total).toBe(0);
     });
 
-    it("should export LoopEvaluation type correctly", () => {
-        const evaluation: LoopEvaluation = {
-            loopNumber: 3,
-            goalScore: 7,
-            efficiencyScore: 8,
-            improvements: ["Reduce context size"],
-            timestamp: Date.now(),
+    it("should handle missing tokensUsed", () => {
+        const state: Partial<ManowarState> = {
+            stepOutputs: [
+                { stepNumber: 1, agentName: "A1", success: true, output: "test" },
+            ],
         };
 
-        expect(evaluation.loopNumber).toBe(3);
-    });
-
-    it("should export OrchestraModels type correctly", () => {
-        const models: OrchestraModels = {
-            planner: "gpt-4o",
-            evaluator: "moonshotai/kimi-k2-thinking",
-            summarizer: "gpt-4o-mini",
-        };
-
-        expect(models.planner).toBe("gpt-4o");
-        expect(models.evaluator).toContain("kimi");
+        const total = getTotalTokenUsage(state as ManowarState);
+        expect(total).toBe(0);
     });
 });
