@@ -1,14 +1,14 @@
 /**
- * Manowar Module Index
+ * Manowar Module Index - Simplified
  * 
  * Exports all Manowar workflow execution functionality.
- * The Shadow Orchestra pattern is exposed via executeWithOrchestrator.
+ * Per suggestions.md, removed Shadow Orchestra sub-agent exports.
  */
 
 // Core types
 export * from "./types.js";
 
-// State management (Dec 2025 Annotation pattern)
+// State management
 export * from "./state.js";
 
 // Token tracking (LangSmith integration)
@@ -17,24 +17,20 @@ export * from "./langsmith.js";
 // Memory (Mem0 Graph integration)
 export * from "./memory.js";
 
-// Sub-agent nodes
-export * from "./nodes.js";
-
 // Context management
 export {
     ContextWindowManager,
-    TokenLedger,
-    extractTokenUsage,
     getModelContextSpec,
     getModelContextSpecSync,
-    searchRegistryTools,
-    inspectToolCapability,
+    getSlidingWindow,
+    getDynamicThresholdPercent,
+    SLIDING_WINDOW_SIZE,
     type TokenCheckpoint,
     type ModelContextSpec,
-    type ExtractedUsage,
+    type AgentContextState,
 } from "./context.js";
 
-// Orchestrator (Shadow Orchestra pattern)
+// Orchestrator
 export { ManowarOrchestrator, executeWithOrchestrator } from "./orchestrator.js";
 
 // Run tracking & observability
@@ -72,55 +68,27 @@ export {
 
 // Agentic models
 export {
-    AGENTIC_COORDINATOR_MODELS,
+    coordinatorModels,
     getAgenticModel,
     getAgenticModelIds,
     isAgenticCoordinatorModel,
     getDefaultCoordinatorModel,
-    CONTEXT_SUB_AGENTS,
-    getActiveSubAgents,
     type AgenticModel,
-    type ContextSubAgent,
-    type ContextAgentRole,
 } from "./agentic.js";
 
-// Phase 1-3 Enhancements (Jan 2026)
-
-// Task Planning (Plan → Act → Reflect pattern)
+// Task Planning
 export {
     TaskPlanner,
-    PLANNER_SYSTEM_PROMPT,
-    REFLECTOR_SYSTEM_PROMPT,
+    plannerSystemPrompt,
+    reflectorSystemPrompt,
+    reviewerSystemPrompt,
     createInitialPlanningState,
     type ExecutionPlan,
     type PlanStep,
     type StepReflection,
     type PlanningState,
+    type ReviewerSuggestions,
 } from "./planner.js";
-
-// File-Based Context Management (Manus-style)
-export {
-    FileContextManager,
-    getContextManager,
-    cleanupContextManagers,
-    processForContext,
-    formatReference,
-    type ContextFile,
-    type ContextReference,
-    type TodoItem,
-} from "./file-context.js";
-
-// Tool Masking (KV-cache efficiency)
-export {
-    ToolRegistry,
-    getToolRegistry,
-    clearToolRegistry,
-    createMaskingConfig,
-    updateMaskingState,
-    calculateMasking,
-    type StaticToolDefinition,
-    type MaskingConfig,
-} from "./tool-masking.js";
 
 // Structured Task Contracts
 export {
@@ -139,3 +107,52 @@ export {
     type ContextualTaskContract,
     type AgentOutput,
 } from "./task-contracts.js";
+
+// Embeddings
+export {
+    computeEmbedding,
+    storeEmbedding,
+    searchByEmbedding,
+    getRelevantContext,
+    recordConversationTurn,
+    type EmbeddingResult,
+    type StoredEmbedding,
+} from "./embeddings.js";
+
+// Delegation
+export {
+    callAgent,
+    delegatePlanStep,
+    isAgentAvailable,
+    type DelegationResult,
+    type DelegationOptions,
+} from "./delegation.js";
+
+// Registry
+export {
+    fetchManowarCard,
+    buildSystemPromptFromCard,
+    clearCardCache,
+    getAgentCard,
+    type AgentCard,
+    type ManowarCard,
+} from "./registry.js";
+
+// Checkpoints
+export {
+    createCheckpoint,
+    getCheckpoints,
+    getAgentCheckpoints,
+    getCheckpointsByType,
+    getInsights,
+    getDecisionTrail,
+    summarizeCheckpoints,
+    persistCheckpoints,
+    retrievePastInsights,
+    recordObservation,
+    recordDecision,
+    recordInsight,
+    recordError,
+    type Checkpoint,
+    type CheckpointSummary,
+} from "./checkpoint.js";

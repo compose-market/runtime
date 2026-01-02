@@ -160,6 +160,118 @@ export interface HookDefinition {
 }
 
 // =============================================================================
+// Agent & Manowar Card Types (Canonical - matches pinata.ts)
+// =============================================================================
+
+/**
+ * AgentCard - Canonical agent metadata from IPFS
+ * Single source of truth for agent configuration.
+ */
+export interface AgentCard {
+    /** Schema version for forward compatibility */
+    schemaVersion: string;
+    /** Agent display name */
+    name: string;
+    /** Agent description */
+    description: string;
+    /** Agent capabilities/skills */
+    skills: string[];
+    /** Avatar/banner image URL (gateway URL) */
+    image?: string;
+    /** DNA hash from on-chain */
+    dnaHash: string;
+    /** Agent's derived wallet address - SINGLE SOURCE OF TRUTH */
+    walletAddress: string;
+    /** Timestamp used in wallet derivation */
+    walletTimestamp?: number;
+    /** Chain ID */
+    chain: number;
+    /** Model ID for inference (used to fetch contextWindow from API) */
+    model: string;
+    /** Agent runtime framework */
+    framework?: "eliza" | "langchain";
+    /** License price in USDC (6 decimals) */
+    licensePrice: string;
+    /** License supply cap (0 = infinite) */
+    licenses: number;
+    /** Whether agent can be cloned */
+    cloneable: boolean;
+    /** Agent API endpoint */
+    endpoint?: string;
+    /** Supported protocols */
+    protocols: Array<{ name: string; version: string }>;
+    /** Plugins/tools available to this agent */
+    plugins?: Array<{
+        registryId: string;
+        name: string;
+        origin: string;
+    }>;
+    /** Creation timestamp */
+    createdAt: string;
+    /** Creator wallet address */
+    creator?: string;
+}
+
+/**
+ * ManowarCard - Canonical manowar/workflow metadata from IPFS
+ * Contains embedded AgentCards and workflow graph edges.
+ */
+export interface ManowarCard {
+    /** Schema version */
+    schemaVersion: string;
+    /** Manowar title */
+    title: string;
+    /** Manowar description */
+    description: string;
+    /** Banner image URL */
+    image?: string;
+    /** DNA hash from on-chain */
+    dnaHash: string;
+    /** Manowar's derived wallet address - SINGLE SOURCE OF TRUTH */
+    walletAddress: string;
+    /** Timestamp used in wallet derivation */
+    walletTimestamp: number;
+    /** Embedded agent cards (full metadata, not just references) */
+    agents: AgentCard[];
+    /** Workflow graph edges (agent execution order) */
+    edges?: Array<{
+        /** Source agent index or ID */
+        source: number;
+        /** Target agent index or ID */
+        target: number;
+        /** Edge description */
+        label?: string;
+    }>;
+    /** Coordinator configuration */
+    coordinator?: {
+        hasCoordinator: boolean;
+        /** Coordinator model ID (only if hasCoordinator=true) */
+        model: string;
+    };
+    /** Pricing information */
+    pricing: {
+        totalAgentPrice: string;
+    };
+    /** Lease configuration */
+    lease?: {
+        enabled: boolean;
+        durationDays: number;
+        creatorPercent: number;
+    };
+    /** Request-For-Agent configuration */
+    rfa?: {
+        title: string;
+        description: string;
+        skills: string[];
+        offerAmount: string;
+    };
+    /** Creator wallet address */
+    creator: string;
+    /** Creation timestamp */
+    createdAt: string;
+}
+
+// =============================================================================
 // Token & Context Window Management
 // =============================================================================
 

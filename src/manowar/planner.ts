@@ -8,14 +8,15 @@
  * - Match steps to available agents
  * - Generate structured execution plans
  * - Support iterative plan refinement
+ * - Review past executions before planning (multi-loop improvement)
  * 
  * Based on Manus Context Engineering principles (Jan 2026)
  */
 
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import type { WorkflowStep, Workflow } from "./types.js";
-import type { ManowarState } from "./state.js";
+import type { Workflow } from "./types.js";
+import { searchMemoryWithGraph, addMemoryWithGraph } from "./memory.js";
 
 // =============================================================================
 // Planning Types
@@ -83,15 +84,57 @@ export interface StepReflection {
     actualTokensUsed: number;
 }
 
+/**
+ * Reviewer suggestions from past executions (for multi-loop improvement)
+ */
+export interface ReviewerSuggestions {
+    /** Whether there are past executions to review */
+    hasPastExecutions: boolean;
+    /** Quality score from past runs (average) */
+    pastQualityScore?: number;
+    /** Suggestions to improve this run */
+    suggestions: string[];
+    /** Patterns that worked well */
+    successPatterns: string[];
+    /** Patterns to avoid */
+    avoidPatterns: string[];
+    /** Skip planning delay (true on first run) */
+    skipReview: boolean;
+}
+
 // =============================================================================
 // Planning Prompts (Stable - Cache Friendly)
 // =============================================================================
 
 /**
+ * Stable system prompt for the Reviewer - optimized for KV-cache efficiency
+ * Reviews past executions and suggests improvements before planning
+ */
+const reviewerSystemPrompt = `You are the WORKFLOW REVIEWER for a multi-agent orchestration system.
+
+Your role is to review past workflow evaluations and suggest improvements for the upcoming execution.
+
+RULES:
+1. Identify patterns from successful past runs (quality score > 7)
+2. Identify anti-patterns from failed runs (quality score < 5)
+3. Suggest concrete, actionable improvements
+4. Be concise - the planner needs quick, actionable feedback
+5. If no past evaluations, return empty suggestions
+
+OUTPUT FORMAT (JSON):
+{
+  "hasPastExecutions": true,
+  "pastQualityScore": 8.2,
+  "suggestions": ["Use Agent X for research tasks - higher success rate"],
+  "successPatterns": ["Breaking complex goals into 3-4 steps works best"],
+  "avoidPatterns": ["Avoid chaining more than 5 steps without checkpoint"]
+}`;
+
+/**
  * Stable system prompt for the planner - optimized for KV-cache efficiency
  * This prompt NEVER changes during workflow execution
  */
-const PLANNER_SYSTEM_PROMPT = `You are the TASK PLANNER for a multi-agent orchestration system.
+const plannerSystemPrompt = `You are the TASK PLANNER for a multi-agent orchestration system.
 
 Your role is to decompose a user's goal into specific, actionable steps that can be delegated to specialized agents.
 
@@ -113,17 +156,17 @@ OUTPUT FORMAT (JSON):
       "task": "Specific task description",
       "expectedOutput": "What the agent should return",
       "dependsOn": [],
-      "estimatedTokens": 2000,
+      "estimatedTokens": 20000,
       "priority": "critical"
     }
   ],
-  "total_estimated_tokens": 8000
+  "total_estimated_tokens": 80000
 }`;
 
 /**
  * Stable system prompt for the reflector - optimized for KV-cache efficiency
  */
-const REFLECTOR_SYSTEM_PROMPT = `You are the STEP REFLECTOR for a multi-agent orchestration system.
+const reflectorSystemPrompt = `You are the STEP REFLECTOR for a multi-agent orchestration system.
 
 Your role is to evaluate the output of a completed step and determine:
 1. Whether the step succeeded
@@ -157,13 +200,13 @@ export class TaskPlanner {
 
     /**
      * @param workflow - The workflow definition
-     * @param plannerModel - Model assigned by coordinator from AGENTIC_COORDINATOR_MODELS
+     * @param plannerModel - Model assigned by coordinator from coordinatorModels
      */
     constructor(workflow: Workflow, plannerModel: string) {
         this.workflow = workflow;
 
         if (!plannerModel) {
-            throw new Error("plannerModel is required - must be assigned by coordinator from AGENTIC_COORDINATOR_MODELS");
+            throw new Error("plannerModel is required - must be assigned by coordinator from coordinatorModels");
         }
 
         console.log(`[planner] Using coordinator-assigned model: ${plannerModel}`);
@@ -191,6 +234,91 @@ export class TaskPlanner {
     }
 
     /**
+     * Review past executions before planning (multi-loop improvement)
+     * 
+     * Skippable on first run when there are no past evaluations.
+     * Returns suggestions to improve the upcoming execution.
+     * 
+     * @param manowarWallet - The manowar wallet for Mem0 lookup
+     * @param goal - The current goal (for relevance matching)
+     * @returns ReviewerSuggestions with improvements or skipReview=true
+     */
+    async reviewBeforePlanning(
+        manowarWallet: string,
+        goal: string
+    ): Promise<ReviewerSuggestions> {
+        // Search for past evaluations in Mem0
+        const pastEvaluations = await searchMemoryWithGraph({
+            query: `workflow evaluation quality score success rate ${goal}`,
+            agent_id: manowarWallet,
+            limit: 5,
+            options: {
+                rerank: true,
+                keyword_search: true,
+            },
+        });
+
+        // If no past evaluations, skip review (first run)
+        if (!pastEvaluations.memories || pastEvaluations.memories.length === 0) {
+            console.log(`[planner] No past evaluations found - skipping review (first run)`);
+            return {
+                hasPastExecutions: false,
+                suggestions: [],
+                successPatterns: [],
+                avoidPatterns: [],
+                skipReview: true,
+            };
+        }
+
+        // We have past evaluations - use LLM to generate suggestions
+        const evaluationSummary = pastEvaluations.memories
+            .map(m => m.memory)
+            .join("\n---\n");
+
+        const response = await this.model.invoke([
+            new SystemMessage(reviewerSystemPrompt),
+            new HumanMessage(`## PAST WORKFLOW EVALUATIONS
+${evaluationSummary}
+
+## UPCOMING GOAL
+"${goal}"
+
+Review the past evaluations and suggest improvements for the upcoming execution.`),
+        ]);
+
+        // Parse the response
+        const content = String(response.content);
+        try {
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+                throw new Error("No JSON found in reviewer response");
+            }
+            const parsed = JSON.parse(jsonMatch[0]);
+
+            console.log(`[planner] Reviewer found ${pastEvaluations.memories.length} past evaluations, avg quality: ${parsed.pastQualityScore || "N/A"}`);
+
+            return {
+                hasPastExecutions: true,
+                pastQualityScore: parsed.pastQualityScore,
+                suggestions: parsed.suggestions || [],
+                successPatterns: parsed.successPatterns || [],
+                avoidPatterns: parsed.avoidPatterns || [],
+                skipReview: false,
+            };
+        } catch (err) {
+            console.warn("[planner] Failed to parse reviewer response, proceeding without suggestions");
+            return {
+                hasPastExecutions: true,
+                pastQualityScore: undefined,
+                suggestions: [],
+                successPatterns: [],
+                avoidPatterns: [],
+                skipReview: false,
+            };
+        }
+    }
+
+    /**
      * Generate an execution plan for the given goal
      * 
      * @param goal - The user's stated goal
@@ -214,7 +342,7 @@ ${context?.priorContext ? `\n## PRIOR CONTEXT\n${context.priorContext}` : ""}
 Create an execution plan for this goal.`;
 
         const response = await this.model.invoke([
-            new SystemMessage(PLANNER_SYSTEM_PROMPT),
+            new SystemMessage(plannerSystemPrompt),
             new HumanMessage(userPrompt),
         ]);
 
@@ -231,8 +359,7 @@ Create an execution plan for this goal.`;
             parsed = JSON.parse(jsonMatch[0]);
         } catch (err) {
             console.error("[planner] Failed to parse plan response:", content);
-            // Fallback: create a simple sequential plan
-            parsed = this.createFallbackPlan(goal, agents);
+            throw err;
         }
 
         // Build the execution plan
@@ -261,24 +388,6 @@ Create an execution plan for this goal.`;
 
         console.log(`[planner] Created plan with ${plan.steps.length} steps, estimated ${plan.totalEstimatedTokens} tokens`);
         return plan;
-    }
-
-    /**
-     * Create a fallback plan when LLM parsing fails
-     */
-    private createFallbackPlan(goal: string, agents: { name: string; description: string }[]): any {
-        return {
-            steps: agents.map((agent, idx) => ({
-                stepNumber: idx + 1,
-                agentName: agent.name,
-                task: `Contribute to: ${goal}`,
-                expectedOutput: "Task completion result",
-                dependsOn: idx > 0 ? [idx] : [],
-                estimatedTokens: 3000,
-                priority: idx === 0 ? "critical" : "high",
-            })),
-            total_estimated_tokens: agents.length * 3000,
-        };
     }
 
     /**
@@ -368,7 +477,7 @@ ${this.currentPlan.steps
 Evaluate this step and provide recommendations.`;
 
         const response = await this.model.invoke([
-            new SystemMessage(REFLECTOR_SYSTEM_PROMPT),
+            new SystemMessage(reflectorSystemPrompt),
             new HumanMessage(userPrompt),
         ]);
 
@@ -530,6 +639,7 @@ export function createInitialPlanningState(): PlanningState {
 // =============================================================================
 
 export {
-    PLANNER_SYSTEM_PROMPT,
-    REFLECTOR_SYSTEM_PROMPT,
+    plannerSystemPrompt,
+    reflectorSystemPrompt,
+    reviewerSystemPrompt,
 };
