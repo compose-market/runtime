@@ -16,7 +16,6 @@ import {
     TokenUsage,
     ContextWindowState,
     WorkflowStateSummary,
-    CONTEXT_WINDOW_DEFAULTS,
 } from "./types.js";
 
 // Import LangChain callback base for production token tracking
@@ -77,11 +76,10 @@ export async function getModelContextSpec(modelId: string): Promise<ModelContext
 
 /**
  * Synchronous version using defaults (for when async is not possible)
- * Falls back to CONTEXT_WINDOW_DEFAULTS or default value
  */
 export function getModelContextSpecSync(modelId: string): ModelContextSpec {
-    // Check known model sizes first
-    const contextLength = CONTEXT_WINDOW_DEFAULTS.MODEL_CONTEXT_SIZES[modelId] || DEFAULT_CONTEXT_LENGTH;
+
+    const contextLength = DEFAULT_CONTEXT_LENGTH;
 
     // Infer source from model ID for sync version (can't call async API)
     const parts = modelId.split("/");
@@ -230,10 +228,8 @@ export class ContextWindowManager {
         }
     ) {
         this.model = model;
-        this.maxTokens = options?.maxTokens ||
-            CONTEXT_WINDOW_DEFAULTS.MODEL_CONTEXT_SIZES[model] ||
-            CONTEXT_WINDOW_DEFAULTS.MODEL_CONTEXT_SIZES.default;
-        this.cleanupThreshold = options?.cleanupThreshold || CONTEXT_WINDOW_DEFAULTS.CLEANUP_THRESHOLD;
+        this.maxTokens = options?.maxTokens || DEFAULT_CONTEXT_LENGTH;
+        this.cleanupThreshold = options?.cleanupThreshold || DEFAULT_CONTEXT_LENGTH;
         this.tokenLedger = new TokenLedger();
     }
 

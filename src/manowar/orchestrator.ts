@@ -27,15 +27,13 @@ import { LangSmithTokenTracker, createLangSmithConfig, isLangSmithEnabled } from
 import {
     addMemoryWithGraph,
     searchMemoryWithGraph,
-    performMemoryWipe,
+    performSafeWipe,
     findSimilarSolutions,
     saveSolutionPattern,
     optimizeWithGraph,
-    // Kept token optimization functions
+    // Token optimization constants
     SLIDING_WINDOW_SIZE,
     getDynamicThresholdPercent,
-    compressToolOutput,
-    generateStructuredTaskPrompt,
 } from "./memory.js";
 // LangSmith distributed tracing for A2A calls
 import { getCurrentRunTree } from "langsmith/traceable";
@@ -43,14 +41,18 @@ import {
     noteTakerNode,
     windowTrackerNode,
     toolBoxerNode,
-    // evaluatorNode and reviewerNode - reserved for continuous loop workflows
-    // Will be integrated when loop mode is implemented
     evaluatorNode,
     reviewerNode,
     type TokenLedgerState,
 } from "./nodes.js";
 import { TokenLedger, getModelContextSpec } from "./context.js";
 import { createRun, startRun, completeRun, failRun } from "./run-tracker.js";
+
+// Enhancements (Jan 2026)
+import { TaskPlanner, type ExecutionPlan, type PlanStep, type StepReflection } from "./planner.js";
+import { FileContextManager, getContextManager, processForContext, formatReference, type ContextReference } from "./file-context.js";
+import { ToolRegistry, getToolRegistry, createMaskingConfig, clearToolRegistry, type MaskingConfig } from "./tool-masking.js";
+import { createContractFromStep, generateStructuredPrompt, parseAgentOutput, summarizeOutput, type ContextualTaskContract, type AgentOutput } from "./task-contracts.js";
 
 // Existing imports
 import type { Workflow, WorkflowStep, WorkflowExecutionState, ExecutorOptions, PaymentContext, SSEProgressEvent } from "./types.js";
@@ -121,9 +123,9 @@ function createMcpTool(connectorId: string, toolName: string, description: strin
 function createAgentDelegationTool(
     agentStep: WorkflowStep,
     paymentContext: PaymentContext,
-    manowarWallet: string,
+    workflowId: string,
     runId: string,
-    stepContext?: { currentStep?: number; totalSteps?: number; previousOutput?: string },
+    stepContext?: { currentStep?: number; totalSteps?: number; previousOutputs?: Array<{ stepNumber: number; agentName: string; summary: string }> },
     onProgress?: (event: SSEProgressEvent) => void
 ): DynamicStructuredTool {
     const agentName = agentStep.name.replace(/[^a-zA-Z0-9_]/g, "_");
@@ -133,8 +135,9 @@ function createAgentDelegationTool(
         description: `Delegate a sub-task to agent "${agentStep.name}". Use for this agent's specialized capabilities.`,
         schema: z.object({
             task: z.string().describe("The specific sub-task to delegate"),
+            attachmentUrl: z.string().optional().describe("Optional attachment URL (image, audio, etc.)"),
         }),
-        func: async ({ task }) => {
+        func: async ({ task, attachmentUrl }) => {
             try {
                 const agentId = agentStep.agentAddress || agentStep.agentId;
                 if (!agentId) throw new Error("Agent ID not found");
@@ -178,16 +181,21 @@ function createAgentDelegationTool(
                     // Tracing not available, continue without
                 }
 
-                // Generate structured task prompt with minimal context
-                const structuredTask = generateStructuredTaskPrompt(
-                    agentStep.name,
+                // =========================================================
+                // Use structured task contracts for unambiguous delegation
+                // =========================================================
+                const taskContract: ContextualTaskContract = createContractFromStep(
+                    agentStep,
                     task,
-                    stepContext ? {
-                        currentStep: stepContext.currentStep,
-                        totalSteps: stepContext.totalSteps,
-                        previousStepOutput: stepContext.previousOutput?.slice(0, 500),
-                    } : undefined
+                    stepContext?.currentStep || 1,
+                    stepContext?.totalSteps || 1,
+                    stepContext?.previousOutputs || [],
+                    attachmentUrl
                 );
+
+                // Generate structured prompt from contract
+                const structuredTask = generateStructuredPrompt(taskContract);
+                console.log(`[orchestrator] Task contract created: ${taskContract.taskId} (${taskContract.priority} priority)`);
 
                 // Minimal agent context - no workflow metadata
                 const response = await fetch(`${MANOWAR_URL}/agent/${agentId}/chat`, {
@@ -201,7 +209,7 @@ function createAgentDelegationTool(
                 });
 
                 if (!response.ok) throw new Error(`Agent invocation failed: ${await response.text()}`);
-                const result = await response.json();
+                const rawResult = await response.json();
 
                 // SSE: Emit agent complete event
                 onProgress?.({
@@ -214,17 +222,44 @@ function createAgentDelegationTool(
                     },
                 });
 
+                // =========================================================
+                // NEW: Parse agent output with structured schema
+                // =========================================================
+                const parsedOutput: AgentOutput = parseAgentOutput(
+                    typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult),
+                    agentStep.name
+                );
+
                 // Track multimodal output
-                if (result.type && result.data && result.type !== "text") {
-                    setMultimodalOutput({ output: result.data, outputType: result.type, fromAgent: agentStep.name });
+                if (parsedOutput.outputType !== "text" && parsedOutput.artifactUrl) {
+                    setMultimodalOutput({
+                        output: parsedOutput.artifactUrl,
+                        outputType: parsedOutput.outputType as "image" | "audio" | "video",
+                        fromAgent: agentStep.name
+                    });
                 }
 
-                // OPTIMIZATION: Compress output instead of raw JSON
-                // This reduces tool output tokens by 60-80%
-                const compressed = compressToolOutput(result, agentStep.name, { maxLength: 800 });
-                console.log(`[orchestrator] Compressed ${agentStep.name} output: ${compressed.length} chars`);
+                // =========================================================
+                // Process large outputs for context externalization
+                // =========================================================
+                const contextResult: { reference: ContextReference | null; inline: string | null } = await processForContext(
+                    parsedOutput.result,
+                    "tool_output",
+                    workflowId,
+                    runId
+                );
 
-                return compressed;
+                // If externalized, return compact reference; otherwise summarized output
+                if (contextResult.reference) {
+                    const ref: ContextReference = contextResult.reference;
+                    console.log(`[orchestrator] Externalized ${agentStep.name} output to file: ${ref.fileId}`);
+                    return formatReference(ref);
+                }
+
+                // Summarize output for token efficiency
+                const summary = summarizeOutput(parsedOutput, 800);
+                console.log(`[orchestrator] ${agentStep.name} output: ${summary.length} chars (success: ${parsedOutput.success})`);
+                return summary;
             } catch (err) {
                 // SSE: Emit error event
                 onProgress?.({
@@ -293,6 +328,20 @@ export class ManowarOrchestrator {
     // System prompt cache for reduced token overhead on repeated calls
     private cachedSystemPrompt: string | null = null;
 
+    // Enhancements (Jan 2026)
+    /** Task planner for Plan→Act→Reflect pattern */
+    private planner: TaskPlanner;
+    /** File-based context manager */
+    private fileContextManager: FileContextManager;
+    /** Static tool registry for masking */
+    private toolRegistry: ToolRegistry;
+    /** Cached stable system prompt prefix (never changes) */
+    private stablePromptPrefix: string | null = null;
+    /** Step outputs for context building */
+    private stepOutputMap: Map<number, string> = new Map();
+    /** Shadow Orchestra node models - assigned by coordinator */
+    private orchestraModels: { planner: string; evaluator: string; summarizer: string };
+
     constructor(workflow: Workflow, options: ExecutorOptions) {
         this.workflow = workflow;
         this.options = options;
@@ -305,6 +354,47 @@ export class ManowarOrchestrator {
         }
         this.coordinatorModel = options.coordinatorModel;
         console.log(`[orchestrator] Using coordinator model: ${this.coordinatorModel}`);
+
+        // Coordinator assigns models to shadow orchestra nodes
+        // Use coordinatorModel for all internal nodes by default
+        // This can be enhanced to distribute across AGENTIC_COORDINATOR_MODELS for diversity
+        this.orchestraModels = {
+            planner: this.coordinatorModel,
+            evaluator: this.coordinatorModel,
+            summarizer: this.coordinatorModel,
+        };
+        console.log(`[orchestrator] Assigned Shadow Orchestra models:`, this.orchestraModels);
+
+        // Initialize components with coordinator-assigned models
+        this.planner = new TaskPlanner(workflow, this.orchestraModels.planner);
+        this.fileContextManager = getContextManager(workflow.id, this.runId);
+        this.toolRegistry = getToolRegistry(workflow);
+
+        // CRITICAL FIX: Initialize tool registry with factories
+        // Without this, getMaskedTools() returns empty arrays
+        this.toolRegistry.buildRegistry({
+            createDelegationTool: (step) => createAgentDelegationTool(
+                step,
+                this.options.payment,
+                this.workflow.id,
+                this.runId,
+                undefined,
+                this.options.onProgress
+            ),
+            createMcpTool: (step) => {
+                if (step.connectorId && step.toolName) {
+                    return createMcpTool(step.connectorId, step.toolName, step.name);
+                }
+                return null;
+            },
+            createMemoryTools: () => createMemoryTools(
+                this.workflow.id,
+                this.runId,
+                this.options.payment.userId
+            ),
+        });
+
+        console.log(`[orchestrator] Components initialized with ${this.toolRegistry.getAllToolIds().length} static tools`);
     }
 
     /**
@@ -381,15 +471,15 @@ export class ManowarOrchestrator {
     }
 
     /**
-     * Build the coordinator system prompt with COMPLETE workflow context
-     * Includes full agent card metadata so coordinator can orchestrate properly
+     * Build the stable coordinator system prompt (KV-cache friendly)
+     * This prefix never changes during workflow execution
      * 
-     * Instructs coordinator to PING agents, NOT execute tasks
+     * Dynamic content (memory, enhancements) goes into separate messages after cache breakpoint
      */
-    private buildSystemPrompt(): string {
+    private buildStableSystemPrompt(): string {
         // Return cached version if available
-        if (this.cachedSystemPrompt) {
-            return this.cachedSystemPrompt;
+        if (this.stablePromptPrefix) {
+            return this.stablePromptPrefix;
         }
 
         const agentSteps = this.workflow.steps.filter(s => s.type === "agent");
@@ -430,35 +520,16 @@ export class ManowarOrchestrator {
             ? `\n\n## MCP TOOLS AVAILABLE\n${mcpSteps.map(s => `- ${s.name}: ${s.toolName} (${s.connectorId})`).join("\n")}`
             : "";
 
-        // User input with attachments (now Pinata URLs, not base64)
-        const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
-        const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
-
-        // Handle new attachment format: { type: "image"|"audio", url: "https://..." }
-        const attachment = this.options.input.attachment as { type?: string; url?: string } | undefined;
-        let attachmentNote = "";
-        if (attachment?.url) {
-            attachmentNote = ` [${attachment.type || 'file'} attached: ${attachment.url}]`;
-        } else if (this.options.input.image || this.options.input.audio) {
-            // Legacy format fallback
-            const attachments: string[] = [];
-            if (this.options.input.image) attachments.push("Image attached");
-            if (this.options.input.audio) attachments.push("Audio attached");
-            attachmentNote = attachments.length > 0 ? ` [${attachments.join(", ")}]` : "";
-        }
-
-        // Complete system prompt with orchestration rules
-        this.cachedSystemPrompt = `You are the **Shadow Orchestra Coordinator** for "${this.workflow.name}".
+        // Stable prompt prefix - no dynamic content
+        // User request, memory, and enhancements go in separate messages
+        this.stablePromptPrefix = `You are the **Shadow Orchestra Coordinator** for "${this.workflow.name}".
 
 ## WORKFLOW GOAL
 ${this.workflow.description || "Execute the workflow steps in sequence"}
 
-## USER REQUEST
-"${userMessage}"${attachmentNote}
-
 ## COMPONENT AGENTS PIPELINE
-Execute these agents SEQUENTIALLY. Each agent is self-sufficient with its own tools.
-Pass each agent's output to the next step. Evaluate responses to determine if additional work is needed.
+Execute these agents SEQUENTIALLY using the Plan→Act→Reflect pattern.
+Each agent is self-sufficient with its own tools.
 
 ${agentPipeline}${mcpTools}
 
@@ -470,15 +541,16 @@ You are the **COORDINATOR**, NOT an executor. You MUST delegate all tasks to the
 - Do NOT attempt to perform agent tasks yourself
 - Do NOT use generic tools when an agent is designed for that task
 
-### 2. SEQUENTIAL DELEGATION
-Execute agents in pipeline order: 1 → 2 → 3...
-- Pass each agent's complete output as context to the next agent
-- Include any relevant attachments (as URLs) in the delegation
+### 2. FOLLOW THE PLAN
+If an execution plan exists, follow it step by step.
+- Execute the current step from the plan
+- Wait for completion before moving to next step
+- Report progress and any deviations
 
-### 3. STRUCTURED INSTRUCTIONS
+### 3. STRUCTURED DELEGATION
 When calling an agent, provide:
-- Clear task description based on user request
-- Previous agent(s) output/results
+- Clear task description from the plan
+- Previous agent(s) output/results as context
 - Attachment URLs if applicable
 - Any constraints or requirements
 
@@ -494,8 +566,88 @@ If an agent needs clarification or has questions:
 - Use your knowledge of the workflow and previous outputs to answer agent queries
 
 ### 6. FINAL RESPONSE
-ONLY provide the USER with the final, complete result`;
+ONLY provide the USER with the final, complete result when ALL steps are done.`;
 
+        console.log(`[orchestrator] Stable prompt built: ${Math.ceil(this.stablePromptPrefix.length / 4)} tokens (cacheable)`);
+        return this.stablePromptPrefix;
+    }
+
+    /**
+     * Build dynamic context message (for inclusion AFTER cache breakpoint)
+     * This content changes per invocation - kept separate for KV-cache efficiency
+     */
+    private buildDynamicContext(state: ManowarState): string {
+        const parts: string[] = [];
+
+        // User request
+        const rawMessage = this.options.input.message || this.options.input.task || this.options.input.prompt || "";
+        const userMessage = typeof rawMessage === 'string' ? rawMessage : String(rawMessage);
+
+        // Handle attachment format
+        const attachment = this.options.input.attachment as { type?: string; url?: string } | undefined;
+        let attachmentNote = "";
+        if (attachment?.url) {
+            attachmentNote = ` [${attachment.type || 'file'} attached: ${attachment.url}]`;
+        }
+
+        parts.push(`## USER REQUEST\n"${userMessage}"${attachmentNote}`);
+
+        // Current plan (if exists)
+        if (state.currentPlan) {
+            parts.push(`## EXECUTION PLAN (v${state.currentPlan.version})`);
+            for (const step of state.currentPlan.steps) {
+                const status = state.stepOutputs?.[step.stepNumber] ? "✓" :
+                    step.stepNumber === state.currentStepNumber ? "→" : "○";
+                parts.push(`${status} Step ${step.stepNumber}: ${step.agentName} - ${step.task.slice(0, 100)}`);
+            }
+        }
+
+        // Previous step outputs (compact)
+        const completedSteps = Object.entries(state.stepOutputs || {}).slice(-3);
+        if (completedSteps.length > 0) {
+            parts.push(`## PREVIOUS STEP RESULTS`);
+            for (const [stepNum, output] of completedSteps) {
+                parts.push(`Step ${stepNum}: ${String(output).slice(0, 300)}${String(output).length > 300 ? "..." : ""}`);
+            }
+        }
+
+        // Memory context (cached)
+        if (state.cachedMemories?.results?.length) {
+            parts.push(`## PRIOR CONTEXT`);
+            for (const mem of state.cachedMemories.results.slice(0, 3)) {
+                parts.push(`- ${mem.memory}`);
+            }
+        }
+
+        // Context file references
+        if (state.contextReferences?.length) {
+            parts.push(`## AVAILABLE CONTEXT FILES`);
+            for (const ref of state.contextReferences.slice(0, 5)) {
+                parts.push(`- [${ref.type}] ${ref.summary}`);
+            }
+        }
+
+        // Improvements from previous loop
+        if (state.contextEnhancements?.length) {
+            parts.push(`## IMPROVEMENTS APPLIED`);
+            parts.push(state.contextEnhancements.join("\n"));
+        }
+
+        return parts.join("\n\n");
+    }
+
+    /**
+     * Legacy method for backwards compatibility
+     * @deprecated Use buildStableSystemPrompt + buildDynamicContext instead
+     */
+    private buildSystemPrompt(): string {
+        if (this.cachedSystemPrompt) {
+            return this.cachedSystemPrompt;
+        }
+
+        // For backwards compat, combine stable + dynamic (less efficient)
+        const stable = this.buildStableSystemPrompt();
+        this.cachedSystemPrompt = stable;
         console.log(`[orchestrator] System prompt built: ${Math.ceil(this.cachedSystemPrompt.length / 4)} tokens`);
         return this.cachedSystemPrompt;
     }
@@ -508,6 +660,11 @@ ONLY provide the USER with the final, complete result`;
         resetMultimodalOutput();
 
         console.log(`[orchestrator] Starting workflow ${this.workflow.id} (run: ${this.runId})`);
+
+        // Initialize FileContextManager before graph construction
+        // Prevents race conditions and redundant mkdir calls during externalize()
+        await this.fileContextManager.initialize();
+        console.log(`[orchestrator] FileContextManager initialized`);
 
         // SSE: Emit start event
         this.emitProgress("start", {
@@ -560,70 +717,116 @@ ONLY provide the USER with the final, complete result`;
 
             // Build the orchestration graph
             const graph = new StateGraph(ManowarOrchestrationState)
-                // Main coordinator node - with PROGRESSIVE tool binding
+                // ============================================================
+                // Planner Node - Creates execution plan
+                // ============================================================
+                .addNode("planner", async (state: ManowarState) => {
+                    if (state.planningComplete && state.currentPlan) {
+                        console.log(`[orchestrator] Plan already exists, skipping planner`);
+                        return {};
+                    }
+
+                    const goal = state.activeGoal ||
+                        this.options.input.message ||
+                        this.options.input.task ||
+                        this.workflow.description;
+
+                    console.log(`[orchestrator] Creating execution plan for: ${String(goal).slice(0, 80)}...`);
+
+                    // Get attachment URL if any
+                    const attachment = this.options.input.attachment as { url?: string } | undefined;
+
+                    // Create the plan
+                    const plan: ExecutionPlan = await this.planner.createPlan(String(goal), {
+                        attachmentUrl: attachment?.url,
+                        priorContext: state.cachedMemories?.results?.slice(0, 2).map(m => m.memory).join("; "),
+                    });
+
+                    // Log plan steps (each step is a PlanStep)
+                    const steps: PlanStep[] = plan.steps;
+                    console.log(`[orchestrator] Plan created: ${steps.length} steps, ~${plan.totalEstimatedTokens} tokens`);
+
+                    // Convert to state format
+                    return {
+                        currentPlan: {
+                            planId: plan.planId,
+                            goal: plan.goal,
+                            version: plan.version,
+                            steps: plan.steps,
+                            totalEstimatedTokens: plan.totalEstimatedTokens,
+                            createdAt: plan.createdAt,
+                            validated: plan.validated,
+                        },
+                        planningComplete: true,
+                        currentStepNumber: 1,
+                    };
+                })
+
+                // ============================================================
+                // Main Coordinator Node - Uses STABLE PROMPT + DYNAMIC CONTEXT
+                // ============================================================
                 .addNode("coordinator", async (state: ManowarState) => {
-                    const systemPrompt = this.buildSystemPrompt();
+                    // Build STABLE system prompt (cacheable - never changes)
+                    const stablePrompt = this.buildStableSystemPrompt();
 
-                    // Add context enhancements from Reviewer if any
-                    const enhancements = state.contextEnhancements?.length
-                        ? `\n\n## IMPROVEMENTS FROM PREVIOUS LOOP\n${state.contextEnhancements.join("\n")}`
-                        : "";
+                    // Build DYNAMIC context (per-invocation - after cache breakpoint)
+                    const dynamicContext = this.buildDynamicContext(state);
 
                     // =========================================================
-                    // PROGRESSIVE TOOL LOADING (Phase 3.5 Optimization)
-                    // Only bind tools needed for current step, reducing token overhead
+                    // TOOL MASKING: Use static registry exclusively for KV-cache efficiency
+                    // Tools are already built in constructor via buildRegistry()
                     // =========================================================
 
-                    // Determine current step based on completed actions
-                    const agentSteps = this.workflow.steps.filter(s => s.type === "agent");
-                    const completedAgentActions = (state.completedActions || []).filter(a => a.startsWith("delegate_to_"));
-                    const currentStepIndex = Math.min(completedAgentActions.length, agentSteps.length - 1);
+                    // Create masking config from current state
+                    const maskingConfig: MaskingConfig = createMaskingConfig(state);
+                    const currentStepIndex = (state.currentStepNumber || 1) - 1;
+                    console.log(`[orchestrator] Masking config: step ${currentStepIndex + 1}, disabled: ${maskingConfig.disabledToolIds.size}`);
 
-                    // Build progressive tools: current step agent + memory tools (always available)
-                    const progressiveTools: DynamicStructuredTool[] = [];
+                    // Get tools from registry with masking applied
+                    // Registry already contains all delegation, MCP, and memory tools
+                    const progressiveTools = this.toolRegistry.getMaskedTools(maskingConfig);
 
-                    // 1. Add current step's agent delegation tool (if any agent steps remain)
-                    if (currentStepIndex < agentSteps.length) {
-                        const currentAgentStep = agentSteps[currentStepIndex];
-                        progressiveTools.push(createAgentDelegationTool(
-                            currentAgentStep,
-                            this.options.payment,
-                            this.workflow.id,
-                            this.runId,
-                            { currentStep: currentStepIndex + 1, totalSteps: agentSteps.length }
-                        ));
-                        console.log(`[orchestrator] Progressive: loading step ${currentStepIndex + 1}/${agentSteps.length} (${currentAgentStep.name})`);
-                    }
+                    console.log(`[orchestrator] Using ${progressiveTools.length} tools from registry for step ${currentStepIndex + 1}`);
 
-                    // 2. Add MCP/connector tools (always available for current workflow)
-                    for (const step of this.workflow.steps) {
-                        if ((step.type === "mcpTool" || step.type === "connectorTool") && step.connectorId && step.toolName) {
-                            progressiveTools.push(createMcpTool(step.connectorId, step.toolName, step.name));
-                        }
-                    }
-
-                    // 3. Add memory tools (always available)
-                    progressiveTools.push(...createMemoryTools(this.workflow.id, this.runId, this.options.payment.userId));
-
-                    // 4. Add optimization tools if recommended by ToolBoxer
-                    if (state.suggestedTools?.length) {
-                        for (const rec of state.suggestedTools) {
-                            if (rec.spawnParams) {
-                                progressiveTools.push(createMcpTool(rec.registryId, rec.name, rec.description));
-                            }
-                        }
-                    }
-
-                    console.log(`[orchestrator] Progressive loading: ${progressiveTools.length} tools (vs ${workflowTools.length} static)`);
-
-                    // Bind progressive tools to model
+                    // Bind tools to model
                     const modelWithTools = (model as any).bindTools(progressiveTools);
 
                     // =========================================================
+                    // MEMORY CACHING (Phase 1) - Prevent redundant queries
+                    // =========================================================
+                    let updatedCachedMemories = state.cachedMemories;
 
-                    // 1. Token estimation
+                    const memoryCacheExpired = !state.cachedMemories ||
+                        (Date.now() - (state.cachedMemories.timestamp || 0)) > (state.memoryCacheTTL || 60000);
+
+                    if (memoryCacheExpired && state.messages.length <= 2) {
+                        try {
+                            const query = String(state.messages[0]?.content || this.workflow.description);
+                            const memResult = await searchMemoryWithGraph({
+                                query,
+                                agent_id: this.workflow.id,
+                                run_id: this.runId,
+                                limit: 5,
+                                options: { rerank: true },
+                            });
+
+                            updatedCachedMemories = {
+                                query,
+                                results: memResult.memories.slice(0, 5).map(m => ({ memory: m.memory })),
+                                timestamp: Date.now(),
+                            };
+                            console.log(`[orchestrator] Memory cached: ${updatedCachedMemories.results.length} memories`);
+                        } catch {
+                            // Memory not available, continue
+                        }
+                    }
+
+                    // =========================================================
+                    // TOKEN ESTIMATION & SLIDING WINDOW
+                    // =========================================================
                     const estimatedTokens = Math.ceil(
-                        systemPrompt.length / 4 +
+                        stablePrompt.length / 4 +
+                        dynamicContext.length / 4 +
                         state.messages.reduce((sum, m) => sum + String(m.content || '').length / 4, 0)
                     );
 
@@ -632,7 +835,7 @@ ONLY provide the USER with the final, complete result`;
 
                     console.log(`[orchestrator] Context: ~${estimatedTokens} tokens (${usagePercent.toFixed(1)}% of ${modelSpec.effectiveWindow})`);
 
-                    // 2. Dynamic sliding window - threshold adapts to model's context size
+                    // Dynamic sliding window - threshold adapts to model's context size
                     const dynamicThreshold = getDynamicThresholdPercent(modelSpec.effectiveWindow);
                     let messagesToUse: BaseMessage[] = state.messages;
 
@@ -644,27 +847,9 @@ ONLY provide the USER with the final, complete result`;
                         console.log(`[orchestrator] Messages: ${state.messages.length} → ${messagesToUse.length}`);
                     }
 
-                    // 3. Memory retrieval via Mem0 native search (first call only)
-                    let memoryContext = "";
-                    if (state.messages.length <= 2) {
-                        try {
-                            const memResult = await searchMemoryWithGraph({
-                                query: String(state.messages[0]?.content || this.workflow.description),
-                                agent_id: this.workflow.id, // workflow.id is already "manowar-<walletAddress>"
-                                run_id: this.runId,
-                                limit: 5,
-                                options: { rerank: true },
-                            });
-                            if (memResult.memories.length > 0) {
-                                memoryContext = `\n\n## Prior Context\n${memResult.memories.slice(0, 3).map(m => `- ${m.memory}`).join('\n')}`;
-                            }
-                        } catch {
-                            // Memory not available, continue
-                        }
-                    }
-
-                    // 4. SANITIZE messages - extract Pinata URLs from attachments
-                    // Orchestrator only needs: hasAttachment=true + pinataUrl (NOT base64 data)
+                    // =========================================================
+                    // MESSAGE SANITIZATION (externalize large content)
+                    // =========================================================
                     const sanitizeMessage = (m: BaseMessage): BaseMessage => {
                         const content = String(m.content || '');
 
@@ -677,7 +862,7 @@ ONLY provide the USER with the final, complete result`;
                         const typeMatch = content.match(/"type"\s*:\s*"(image|audio|video)"/);
                         const nameMatch = content.match(/"name"\s*:\s*"([^"]+)"/);
 
-                        // If this looks like a tool response with image data
+                        // If this looks like a tool response with large data
                         if (content.includes('"data"') && content.length > 5000) {
                             const url = pinataMatch?.[0] || ipfsMatch?.[0];
                             const mediaType = typeMatch?.[1] || 'image';
@@ -706,9 +891,15 @@ ONLY provide the USER with the final, complete result`;
 
                     const sanitizedMessages = messagesToUse.map(sanitizeMessage);
 
-                    // 5. Build final messages
+                    // =========================================================
+                    // BUILD FINAL MESSAGES (Cache-Friendly Pattern)
+                    // =========================================================
+                    // 1. Stable system prompt (cacheable)
+                    // 2. Dynamic context as separate message (after cache breakpoint)
+                    // 3. Sanitized conversation messages
                     const messagesWithSystem = [
-                        new SystemMessage(systemPrompt + enhancements + memoryContext),
+                        new SystemMessage(stablePrompt),
+                        new SystemMessage(`[CONTEXT]\n${dynamicContext}`), // After cache breakpoint
                         ...sanitizedMessages,
                     ];
 
@@ -717,7 +908,22 @@ ONLY provide the USER with the final, complete result`;
                     }
 
                     const response = await modelWithTools.invoke(messagesWithSystem);
-                    return { messages: [response], completedActions: [`Coordinator response`] };
+
+                    // Calculate estimated KV-cache hit rate
+                    const kvCacheHit = state.messages.length > 1 ?
+                        Math.round((stablePrompt.length / (stablePrompt.length + dynamicContext.length)) * 100) : 0;
+
+                    // Populate contextReferences from FileContextManager
+                    const contextManifest = this.fileContextManager.getContextManifest();
+
+                    return {
+                        messages: [response],
+                        completedActions: [`Coordinator response`],
+                        cachedMemories: updatedCachedMemories,
+                        kvCacheHitEstimate: kvCacheHit,
+                        // File-based context references for dynamic context building
+                        contextReferences: contextManifest,
+                    };
                 })
 
                 // 4. Tool execution node - dynamically includes suggestedTools to match coordinator
@@ -736,7 +942,26 @@ ONLY provide the USER with the final, complete result`;
 
                     // Create and invoke ToolNode with complete tool set
                     const toolNode = new ToolNode(allTools);
-                    return toolNode.invoke(state);
+                    const result = await toolNode.invoke(state);
+
+                    // Track step outputs for Plan→Act→Reflect context
+                    const updatedStepOutputs: Record<number, string> = { ...state.stepOutputs };
+                    const currentStep = state.currentStepNumber || 1;
+
+                    // Extract output from tool messages
+                    const newMessages = result.messages || [];
+                    for (const msg of newMessages) {
+                        if (msg._getType() === 'tool') {
+                            const content = String(msg.content).slice(0, 500); // Truncate for context
+                            updatedStepOutputs[currentStep] = content;
+                            console.log(`[tools] Saved output for step ${currentStep}: ${content.slice(0, 100)}...`);
+                        }
+                    }
+
+                    return {
+                        ...result,
+                        stepOutputs: updatedStepOutputs,
+                    };
                 })
 
 
@@ -769,26 +994,28 @@ ONLY provide the USER with the final, complete result`;
                     return toolBoxerNode({ ...state, boundPlugins });
                 })
 
-                // Shadow Orchestra: Memory Wipe
+                // Shadow Orchestra: Memory Wipe (Safe Wipe with context preservation)
                 .addNode("memoryWipe", async (state: ManowarState) => {
-                    const result = await performMemoryWipe(
+                    const result = await performSafeWipe(
                         this.workflow.id,
                         this.runId,
-                        this.coordinatorModel,  // Use the coordinator model from options
+                        this.coordinatorModel,
                         {
                             goal: state.activeGoal,
                             completedActions: state.completedActions || [],
                             lastOutcome: String(state.messages[state.messages.length - 1]?.content || ""),
                             agentSummaries: {},
-                        }
+                            messageCount: state.messages.length,
+                        },
+                        this.options.payment.userId
                     );
 
                     if (result) {
-                        // Wipe: return single system message (reducer will replace)
+                        // Safe Wipe: return single system message (reducer will replace)
                         return {
-                            messages: [new SystemMessage(`[CONTEXT REFRESHED] ${result.previousSummary}`)],
-                            lastSummary: result.previousSummary,
-                            preservedFacts: result.preservedFacts,
+                            messages: [new SystemMessage(`[CONTEXT REFRESHED] ${result.summary}`)],
+                            lastSummary: result.summary,
+                            tokensSavedByExternalization: result.tokensSaved,
                             needsCleanup: false,
                         };
                     }
@@ -809,8 +1036,9 @@ ONLY provide the USER with the final, complete result`;
                     return {};
                 })
 
-                // Edges: Main flow
-                .addEdge(START, "coordinator")
+                // Edges: Main flow - START → Planner → Coordinator
+                .addEdge(START, "planner")
+                .addEdge("planner", "coordinator")
                 .addConditionalEdges("coordinator", (state: ManowarState) => {
                     const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
                     if (lastMessage && (lastMessage.tool_calls?.length ?? 0) > 0) {
@@ -831,12 +1059,98 @@ ONLY provide the USER with the final, complete result`;
                 })
                 .addEdge("memoryWipe", "toolBoxer")
                 .addEdge("toolBoxer", "graphOptimize")
-                // Run evaluator at end of each workflow for quality assessment
-                .addNode("evaluator", async (state: ManowarState) => {
-                    return evaluatorNode(state, this.coordinatorModel);
+
+                // ==================================================================
+                // Reviewer node - integrates improvements from previous loops
+                // ==================================================================
+                .addNode("reviewer", async (state: ManowarState) => {
+                    // Only active on loop 2+ in continuous workflows
+                    const loopNum = state.lastEvaluation?.loopNumber || 1;
+                    if (loopNum > 1 && state.lastEvaluation) {
+                        console.log(`[orchestrator] Running reviewer for loop ${loopNum}`);
+                        return reviewerNode(state);
+                    }
+                    return {}; // Skip on first loop
                 })
+
+                // ==================================================================
+                // Memory saver node - saves workflow outcomes to Mem0
+                // ==================================================================
+                .addNode("memorySaver", async (state: ManowarState) => {
+                    // Save significant outcomes to Mem0 for future reference
+                    try {
+                        const lastMessage = state.messages[state.messages.length - 1];
+                        if (lastMessage && state.activeGoal) {
+                            const outcome = typeof lastMessage.content === 'string'
+                                ? lastMessage.content
+                                : JSON.stringify(lastMessage.content);
+
+                            // Calculate total tokens from tokenMetrics
+                            let totalTokens = 0;
+                            if (state.tokenMetrics) {
+                                for (const metrics of Object.values(state.tokenMetrics)) {
+                                    totalTokens += metrics.totalTokens || 0;
+                                }
+                            }
+
+                            // Only save if outcome is substantial
+                            if (outcome.length > 100) {
+                                await addMemoryWithGraph({
+                                    messages: [
+                                        { role: "user", content: state.activeGoal },
+                                        { role: "assistant", content: outcome.slice(0, 2000) }, // Limit to 2000 chars
+                                    ],
+                                    agent_id: this.workflow.id,
+                                    run_id: this.runId,
+                                    user_id: this.options.payment.userId,
+                                    metadata: {
+                                        workflowName: this.workflow.name,
+                                        success: state.status !== "error",
+                                        tokensUsed: totalTokens,
+                                    },
+                                });
+                                console.log(`[orchestrator] Saved workflow outcome to memory`);
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(`[orchestrator] Failed to save memory:`, err);
+                    }
+                    return {}; // Don't modify state
+                })
+
+                // Evaluator node for quality assessment
+                .addNode("evaluator", async (state: ManowarState) => {
+                    return evaluatorNode(state);
+                })
+
+                // ==================================================================
+                // Graph edges: Complete Shadow Orchestra flow
+                // planner → coordinator → tools → noteTaker → windowTracker
+                // → (memoryWipe) → toolBoxer → graphOptimize → evaluator
+                // → [conditionally: memorySaver → END or reviewer → coordinator]
+                // ==================================================================
                 .addEdge("graphOptimize", "evaluator")
-                .addEdge("evaluator", END);
+
+                // Production continuous loop: evaluator decides whether to continue or end
+                .addConditionalEdges("evaluator", (state: ManowarState) => {
+                    // Check if this is a multi-loop workflow and should continue
+                    const shouldContinue = state.shouldContinueLoop &&
+                        state.loopCount < state.maxLoops &&
+                        state.maxLoops > 0;
+
+                    if (shouldContinue) {
+                        console.log(`[orchestrator] Loop ${state.loopCount}/${state.maxLoops}: continuing to reviewer`);
+                        return "reviewer";
+                    }
+
+                    // Either one-shot workflow or loop complete - save and end
+                    console.log(`[orchestrator] Workflow complete after ${state.loopCount} loop(s)`);
+                    return "memorySaver";
+                })
+
+                // Reviewer leads back to coordinator for next loop iteration
+                .addEdge("reviewer", "coordinator")
+                .addEdge("memorySaver", END);
 
             // Compile and execute
             const app = graph.compile();
@@ -845,14 +1159,17 @@ ONLY provide the USER with the final, complete result`;
 
             console.log(`[orchestrator] Executing task: ${String(task).substring(0, 80)}...`);
 
+            // Create initial state using the state factory
+            const initialState = {
+                ...createInitialState(this.workflow.id, String(task)),
+                messages: [new HumanMessage(String(task))],
+                runId: this.runId,
+                status: "running" as const,
+                // maxLoops can be set via workflow config if supported
+            };
+
             const result = await app.invoke(
-                {
-                    messages: [new HumanMessage(String(task))],
-                    workflowId: this.workflow.id,
-                    runId: this.runId,
-                    activeGoal: String(task),
-                    status: "running",
-                },
+                initialState,
                 {
                     ...(await createLangSmithConfig(this.workflow.id, this.runId, this.coordinatorModel)),
                     callbacks: this.langsmithTracker ? [this.langsmithTracker] : [],
@@ -882,6 +1199,9 @@ ONLY provide the USER with the final, complete result`;
                 reasoningTokens: 0,
                 totalTokens: this.tokenLedger.getCumulativeTotal(),
             });
+
+            // Clean up tool registry after successful execution
+            clearToolRegistry(this.workflow.id);
 
             return {
                 workflowId: this.workflow.id,
@@ -916,6 +1236,9 @@ ONLY provide the USER with the final, complete result`;
 
         } catch (error) {
             console.error(`[orchestrator] Failed:`, error);
+
+            // Clean up tool registry
+            clearToolRegistry(this.workflow.id);
 
             // Fail tracked run
             failRun(trackedRun.runId, error instanceof Error ? error.message : String(error));

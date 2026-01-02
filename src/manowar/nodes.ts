@@ -18,7 +18,7 @@ import type {
     ToolRecommendation,
     LoopEvaluation,
 } from "./state.js";
-import { getModelContextSpec } from "./context.js";
+import { getModelContextSpec, getModelContextSpecSync } from "./context.js";
 import { searchRegistryTools, inspectToolCapability } from "./context.js";
 import { getDefaultCoordinatorModel } from "./agentic.js";
 
@@ -44,8 +44,9 @@ if (LANGSMITH_API_KEY) {
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
-// Model used for Evaluator reasoning (thinking model for nuanced analysis)
-const EVALUATOR_MODEL = "moonshotai/kimi-k2-thinking";
+// Default model for Evaluator if not assigned by coordinator (fallback only)
+// This should rarely be used - coordinator should always assign from AGENTIC_COORDINATOR_MODELS
+const DEFAULT_EVALUATOR_MODEL = "moonshotai/kimi-k2-thinking";
 
 // =============================================================================
 // NoteTaker: Token Usage Checkpointing
@@ -141,30 +142,32 @@ export async function windowTrackerNode(
         }
     }
 
-    // Also check coordinator (implicit in state.messages)
-    const messageTokenEstimate = state.messages.reduce(
-        (sum, m) => sum + Math.ceil(String(m.content).length / 4),
-        0
-    );
-
-    // Get coordinator model from state or use a placeholder for registry lookup
-    // The coordinatorModel should always be set from on-chain data
-    const coordinatorModel = state.agentModels?.["coordinator"] || "coordinator";
-    const coordSpec = await getModelContextSpec(coordinatorModel);
-    const coordUsagePercent = (messageTokenEstimate / coordSpec.effectiveWindow) * 100;
-
-    windowHealth["coordinator"] = {
-        usage: messageTokenEstimate,
-        limit: coordSpec.effectiveWindow,
-        usagePercent: coordUsagePercent,
-        healthy: coordUsagePercent < 80,
-    };
-
-    if (coordUsagePercent >= 80) {
-        needsCleanup = true;
-        console.log(
-            `[WindowTracker] Coordinator at ${coordUsagePercent.toFixed(1)}% capacity - cleanup needed`
+    // Also check coordinator (use tokenMetrics if available, fallback to message estimate)
+    if (!windowHealth["coordinator"]) {
+        // Coordinator not in tokenMetrics, estimate from messages
+        const messageTokenEstimate = state.messages.reduce(
+            (sum, m) => sum + Math.ceil(String(m.content).length / 4),
+            0
         );
+
+        // Get coordinator model from state or use a placeholder for registry lookup
+        const coordinatorModel = state.agentModels?.["coordinator"] || "coordinator";
+        const coordSpec = await getModelContextSpec(coordinatorModel);
+        const coordUsagePercent = (messageTokenEstimate / coordSpec.effectiveWindow) * 100;
+
+        windowHealth["coordinator"] = {
+            usage: messageTokenEstimate,
+            limit: coordSpec.effectiveWindow,
+            usagePercent: coordUsagePercent,
+            healthy: coordUsagePercent < 80,
+        };
+
+        if (coordUsagePercent >= 80) {
+            needsCleanup = true;
+            console.log(
+                `[WindowTracker] Coordinator at ${coordUsagePercent.toFixed(1)}% capacity - cleanup needed`
+            );
+        }
     }
 
     return { windowHealth, needsCleanup };
@@ -259,12 +262,20 @@ function calculateToolConfidence(tool: { description: string; tags: string[] }, 
 /**
  * Evaluator node: Assesses loop performance and suggests improvements
  * Uses LangSmith for structured evaluation when available, LLM fallback otherwise
+ * 
+ * @param state - Current orchestration state
+ * @returns Partial state with evaluation results
  */
 export async function evaluatorNode(
-    state: ManowarState,
-    coordinatorModel: string = EVALUATOR_MODEL
+    state: ManowarState
 ): Promise<Partial<ManowarState>> {
     const loopNum = state.loopCount || 1;
+
+    // Use coordinator-assigned model, fallback to default if not assigned
+    const evaluatorModel = state.orchestraModels?.evaluator || DEFAULT_EVALUATOR_MODEL;
+    if (!state.orchestraModels?.evaluator) {
+        console.warn(`[Evaluator] No coordinator-assigned model, using fallback: ${DEFAULT_EVALUATOR_MODEL}`);
+    }
 
     // Build evaluation context
     const evalContext = {
@@ -326,7 +337,7 @@ Score 0-10 and suggest improvements. Respond with JSON only:
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                model: coordinatorModel,
+                model: evaluatorModel,
                 messages: [
                     { role: "system", content: "Respond only with valid JSON." },
                     { role: "user", content: prompt },
@@ -357,15 +368,25 @@ Score 0-10 and suggest improvements. Respond with JSON only:
             timestamp: Date.now(),
         };
 
+        // Determine if loop should continue based on quality threshold
+        const qualityThreshold = state.loopQualityThreshold || 7;
+        const avgScore = (loopEvaluation.goalScore + loopEvaluation.efficiencyScore) / 2;
+        const shouldContinue = avgScore < qualityThreshold && loopEvaluation.improvements.length > 0;
+
         console.log(
             `[Evaluator] Loop ${loopNum}: goal=${loopEvaluation.goalScore}/10, ` +
-            `efficiency=${loopEvaluation.efficiencyScore}/10, ` +
+            `efficiency=${loopEvaluation.efficiencyScore}/10, avg=${avgScore.toFixed(1)}, ` +
+            `threshold=${qualityThreshold}, continue=${shouldContinue}, ` +
             `${loopEvaluation.improvements.length} improvements`
         );
 
         return {
             lastEvaluation: loopEvaluation,
             suggestedImprovements: evaluation.improvements || [],
+            // Set loop continuation flag based on quality
+            shouldContinueLoop: shouldContinue,
+            // Increment loop count
+            loopCount: loopNum + 1,
         };
     }
 

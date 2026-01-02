@@ -83,3 +83,59 @@ export {
     type ContextSubAgent,
     type ContextAgentRole,
 } from "./agentic.js";
+
+// Phase 1-3 Enhancements (Jan 2026)
+
+// Task Planning (Plan → Act → Reflect pattern)
+export {
+    TaskPlanner,
+    PLANNER_SYSTEM_PROMPT,
+    REFLECTOR_SYSTEM_PROMPT,
+    createInitialPlanningState,
+    type ExecutionPlan,
+    type PlanStep,
+    type StepReflection,
+    type PlanningState,
+} from "./planner.js";
+
+// File-Based Context Management (Manus-style)
+export {
+    FileContextManager,
+    getContextManager,
+    cleanupContextManagers,
+    processForContext,
+    formatReference,
+    type ContextFile,
+    type ContextReference,
+    type TodoItem,
+} from "./file-context.js";
+
+// Tool Masking (KV-cache efficiency)
+export {
+    ToolRegistry,
+    getToolRegistry,
+    clearToolRegistry,
+    createMaskingConfig,
+    updateMaskingState,
+    calculateMasking,
+    type StaticToolDefinition,
+    type MaskingConfig,
+} from "./tool-masking.js";
+
+// Structured Task Contracts
+export {
+    TaskContractBuilder,
+    generateStructuredPrompt,
+    parseAgentOutput,
+    summarizeOutput,
+    createContractFromStep,
+    createResearchContract,
+    createImplementationContract,
+    createDesignContract,
+    BaseTaskContractSchema,
+    ContextualTaskContractSchema,
+    AgentOutputSchema,
+    type BaseTaskContract,
+    type ContextualTaskContract,
+    type AgentOutput,
+} from "./task-contracts.js";
