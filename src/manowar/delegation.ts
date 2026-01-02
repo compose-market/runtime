@@ -1,0 +1,221 @@
+/**
+ * Agent Delegation
+ * 
+ * Handles direct HTTP calls to component agents for task delegation.
+ * Follows the ExecutionPlan steps from planner.ts.
+ * 
+ * Key features:
+ * - Direct HTTP POST to agent endpoints
+ * - Follows PlanStep structure from planner
+ * - Returns structured DelegationResult
+ * - Uses agent-routes.ts endpoint format
+ */
+
+import type { PlanStep, ExecutionPlan } from "./planner.js";
+import type { AgentCard, ManowarCard } from "./registry.js";
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export interface DelegationResult {
+    success: boolean;
+    stepNumber: number;
+    agentName: string;
+    output: string;
+    tokensUsed?: number;
+    error?: string;
+    timing: {
+        startedAt: number;
+        completedAt: number;
+        durationMs: number;
+    };
+}
+
+export interface DelegationOptions {
+    /** Timeout in ms (default: 120000) */
+    timeout?: number;
+    /** Payment context for x402 */
+    paymentData?: string;
+    /** Internal secret for bypassing payment */
+    internalSecret?: string;
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const API_URL = process.env.API_URL || process.env.LAMBDA_API_URL || "http://localhost:4003";
+const DEFAULT_TIMEOUT = 120000; // 2 minutes
+
+// Internal secret for agent-to-agent calls (bypasses payment)
+const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || `manowar-internal-${Date.now()}`;
+
+// =============================================================================
+// Core Delegation
+// =============================================================================
+
+/**
+ * Call an agent directly via HTTP
+ * 
+ * Uses the /agent/:identifier/run endpoint from agent-routes.ts
+ */
+export async function callAgent(
+    agentWallet: string,
+    message: string,
+    options: DelegationOptions = {}
+): Promise<{ success: boolean; output: string; tokensUsed?: number; error?: string }> {
+    const startedAt = Date.now();
+    const timeout = options.timeout || DEFAULT_TIMEOUT;
+
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+        const response = await fetch(`${API_URL}/agent/${agentWallet}/run`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(options.paymentData && { "x-payment": options.paymentData }),
+                // Use internal secret to bypass payment for orchestrator-initiated calls
+                "x-manowar-internal": options.internalSecret || MANOWAR_INTERNAL_SECRET,
+            },
+            body: JSON.stringify({ message }),
+            signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => "Unknown error");
+            return {
+                success: false,
+                output: "",
+                error: `Agent returned ${response.status}: ${errorText}`,
+            };
+        }
+
+        const result = await response.json();
+
+        return {
+            success: true,
+            output: result.result || result.output || result.message || JSON.stringify(result),
+            tokensUsed: result.tokensUsed || result.usage?.totalTokens,
+        };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+            success: false,
+            output: "",
+            error: errorMessage.includes("aborted") ? "Request timeout" : errorMessage,
+        };
+    }
+}
+
+/**
+ * Delegate a plan step to an agent
+ * 
+ * @param step - PlanStep from planner.ts ExecutionPlan
+ * @param agentCard - AgentCard with agent details (from manowarCard)
+ * @param context - Additional context (prior step outputs)
+ */
+export async function delegatePlanStep(
+    step: PlanStep,
+    agentCard: AgentCard | undefined,
+    context: { priorOutputs?: string[] } = {},
+    options: DelegationOptions = {}
+): Promise<DelegationResult> {
+    const startedAt = Date.now();
+    const agentWallet = agentCard?.walletAddress || step.agentName;
+
+    // Build the task message
+    let message = step.task;
+    if (step.expectedOutput) {
+        message += `\n\nExpected output: ${step.expectedOutput}`;
+    }
+    if (context.priorOutputs?.length) {
+        message += `\n\n## Prior context:\n${context.priorOutputs.join("\n---\n")}`;
+    }
+
+    console.log(`[delegation] Step ${step.stepNumber}: Calling ${step.agentName} (${agentWallet?.slice(0, 8)}...)`);
+
+    const result = await callAgent(agentWallet, message, options);
+    const completedAt = Date.now();
+
+    return {
+        success: result.success,
+        stepNumber: step.stepNumber,
+        agentName: step.agentName,
+        output: result.output,
+        tokensUsed: result.tokensUsed,
+        error: result.error,
+        timing: {
+            startedAt,
+            completedAt,
+            durationMs: completedAt - startedAt,
+        },
+    };
+}
+
+/**
+ * Execute all steps of a plan in order
+ * 
+ * Respects step dependencies and passes prior outputs as context.
+ */
+export async function executePlan(
+    plan: ExecutionPlan,
+    manowarCard: ManowarCard,
+    options: DelegationOptions = {}
+): Promise<DelegationResult[]> {
+    const results: DelegationResult[] = [];
+    const outputs: Map<number, string> = new Map();
+
+    for (const step of plan.steps) {
+        // Get prior outputs for dependencies
+        const priorOutputs: string[] = [];
+        for (const depNum of step.dependsOn || []) {
+            const depOutput = outputs.get(depNum);
+            if (depOutput) {
+                priorOutputs.push(`[Step ${depNum}]: ${depOutput}`);
+            }
+        }
+
+        // Get agent card from manowarCard
+        const agentCard = manowarCard.agents?.find(
+            (a: { name: string; walletAddress: string }) => a.name === step.agentName || a.walletAddress?.includes(step.agentName)
+        );
+
+        // Execute step
+        const result = await delegatePlanStep(
+            step,
+            agentCard,
+            { priorOutputs },
+            options
+        );
+
+        results.push(result);
+        outputs.set(step.stepNumber, result.output);
+
+        // Stop on failure for critical steps
+        if (!result.success && step.priority === "critical") {
+            console.error(`[delegation] Critical step ${step.stepNumber} failed, stopping execution`);
+            break;
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Check if an agent is available
+ */
+export async function isAgentAvailable(agentWallet: string): Promise<boolean> {
+    try {
+        const response = await fetch(`${API_URL}/agent/${agentWallet}`, {
+            method: "GET",
+        });
+        return response.ok;
+    } catch {
+        return false;
+    }
+}
