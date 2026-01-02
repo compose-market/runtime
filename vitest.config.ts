@@ -1,4 +1,8 @@
 import { defineConfig } from "vitest/config";
+import { config } from "dotenv";
+
+// Load .env file for tests
+config();
 
 export default defineConfig({
     test: {
@@ -14,5 +18,7 @@ export default defineConfig({
         },
         testTimeout: 30000,
         hookTimeout: 10000,
+        // Load .env automatically
+        setupFiles: ["dotenv/config"],
     },
 });
