@@ -21,7 +21,7 @@ import type { TokenCheckpoint } from "./context.js";
 // =============================================================================
 
 const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY;
-const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "compose-manowar";
+const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "manowar";
 const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || "https://api.smith.langchain.com";
 
 // Bridge LANGSMITH_* to LANGCHAIN_* for SDK auto-tracing
@@ -54,13 +54,7 @@ export interface ExtractedTokens {
 // =============================================================================
 
 /**
- * Extract tokens from LLMResult using usage_metadata (primary) or fallbacks
- * 
- * Priority order:
- * 1. usage_metadata on message (Dec 2025 standard)
- * 2. response_metadata.token_usage (includes reasoning_tokens)
- * 3. llmOutput.tokenUsage (legacy)
- * 4. Character-based estimation (last resort)
+ * Extract tokens from LLMResult using usage_metadata
  */
 export function extractTokensFromResult(output: LLMResult): ExtractedTokens {
     // Get the last generation's message (may be nested in different ways)
@@ -109,17 +103,11 @@ export function extractTokensFromResult(output: LLMResult): ExtractedTokens {
         };
     }
 
-    // 4. Fallback: estimate from content
-    const content = lastGeneration?.text || message?.content || "";
-    const estimatedTokens = Math.ceil(String(content).length / 4);
-    console.warn(`[LangSmith] No usage_metadata found, estimating ${estimatedTokens} tokens`);
-    return {
-        inputTokens: 0,
-        outputTokens: estimatedTokens,
-        reasoningTokens: 0,
-        totalTokens: estimatedTokens,
-        source: "estimated",
-    };
+    // LangSmith provides token data - if we reach here, the LLM response is malformed
+    throw new Error(
+        `[LangSmith] Token extraction failed - no usage data in LLM response. ` +
+        `Expected usage_metadata, response_metadata.token_usage, or llmOutput.tokenUsage.`
+    );
 }
 
 // =============================================================================
@@ -186,9 +174,6 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
                 inputTokens: tokens.inputTokens,
                 outputTokens: tokens.outputTokens,
                 timestamp: Date.now(),
-                cumulativeTotal: this.ledger.getCumulativeTotal() + tokens.totalTokens,
-                estimated: tokens.source === "estimated",
-                provider: tokens.source,
             };
 
             this.ledger.recordCheckpoint(checkpoint);
@@ -351,53 +336,17 @@ export function extractTokenUsage(response: any, modelId?: string): ExtractedUsa
         };
     }
 
-    // 7. FALLBACK: Character-based estimation
-    const content = extractContentFromResponse(response);
-    const estimatedTokens = Math.ceil(content.length / 4);
-    if (modelId) {
-        console.warn(`[langsmith] No token usage in response for model ${modelId}, using estimation`);
-    }
-    return {
-        inputTokens: 0,
-        outputTokens: estimatedTokens,
-        totalTokens: estimatedTokens,
-        estimated: true,
-        source: "estimated",
-    };
-}
-
-/**
- * Extract text content from various response formats (for fallback estimation)
- */
-function extractContentFromResponse(response: any): string {
-    if (response?.content !== undefined) {
-        if (typeof response.content === "string") return response.content;
-        if (Array.isArray(response.content)) {
-            return response.content.map((p: any) => p.text || p.content || "").join("");
-        }
-    }
-    if (response?.choices?.[0]?.message?.content) {
-        return response.choices[0].message.content;
-    }
-    if (response?.content?.[0]?.text) {
-        return response.content[0].text;
-    }
-    if (typeof response?.text === "string") {
-        return response.text;
-    }
-    return "";
-}
-
-/**
- * Estimate tokens from text (fallback when no tokenizer available)
- * Uses ~4 chars per token heuristic
- */
-export function estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4);
+    // Token data is available from LangChain/LangSmith callbacks
+    throw new Error(
+        `[LangSmith] Token extraction failed. Response lacks token data. ` +
+        `Checked: llmOutput.tokenUsage, response_metadata.tokenUsage, ` +
+        `usage (OpenAI/Anthropic), usageMetadata (Google), tokenUsage.`
+    );
 }
 
 /**
  * Calculate USD cost from token counts and pricing
+ * @deprecated Cost calculation should use real LangSmith data, not estimates
  * Pricing is in USD per million tokens
  */
 export function estimateCost(
@@ -413,56 +362,9 @@ export function estimateCost(
 // =============================================================================
 
 /**
- * Fetch model metadata from the dynamic registry (2700+ models)
- * Uses the Lambda API which aggregates from all providers with real source data
- */
-export async function fetchModelMetadata(modelId: string): Promise<{ source: string; contextLength?: number } | null> {
-    if (!modelId) return null;
-
-    const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
-
-    try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/models/${encodeURIComponent(modelId)}`);
-        if (response.ok) {
-            const data = await response.json();
-            return {
-                source: data.source || data.ownedBy || "unknown",
-                contextLength: data.contextLength,
-            };
-        }
-    } catch {
-        // Fallback on error
-    }
-
-    return null;
-}
-
-// Cache for model metadata to avoid repeated API calls during a run
-const modelMetadataCache = new Map<string, { source: string; contextLength?: number }>();
-
-/**
- * Get model metadata (cached) - exported for use by context.ts and other modules
- * Fetches source (provider) and contextLength from Lambda models API (2700+ models)
- */
-export async function getModelMetadataCached(modelId: string): Promise<{ source: string; contextLength?: number }> {
-    if (modelMetadataCache.has(modelId)) {
-        return modelMetadataCache.get(modelId)!;
-    }
-
-    const metadata = await fetchModelMetadata(modelId);
-    if (metadata) {
-        modelMetadataCache.set(modelId, metadata);
-        return metadata;
-    }
-
-    // Fallback if API fails - return unknown
-    return { source: "unknown" };
-}
-
-/**
  * Create LangSmith configuration for graph invocation
  * 
- * ls_provider and ls_model_name are fetched dynamically from the Lambda models API.
+ * Note: Model metadata (contextWindow) is now fetched by context.ts via fetchModelContextWindow()
  */
 export async function createLangSmithConfig(
     workflowId: string,
@@ -473,9 +375,6 @@ export async function createLangSmithConfig(
         console.warn("[LangSmith] LANGSMITH_API_KEY not configured - tracing disabled");
         return {};
     }
-
-    // Fetch model metadata from dynamic registry (2700+ models)
-    const modelMetadata = modelName ? await getModelMetadataCached(modelName) : { source: "unknown" };
 
     return {
         configurable: {
@@ -488,8 +387,6 @@ export async function createLangSmithConfig(
             workflow_id: workflowId,
             run_id: runId,
             environment: process.env.NODE_ENV || "development",
-            // LangSmith cost tracking - dynamically fetched from 2700+ model registry
-            ls_provider: modelMetadata.source,
             ls_model_name: modelName,
         },
     };

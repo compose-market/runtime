@@ -73,40 +73,13 @@ export interface SolutionPattern {
     confidence: number;
 }
 
-// Constants for sliding window (used by orchestrator)
-export const SLIDING_WINDOW_SIZE = 4;
-
-/**
- * Get dynamic context threshold based on model's effective window
- * 
- * Formula: 55% + 0.5 × log₁₀(window/1024)
- * 
- * This provides a continuous, non-hardcoded threshold that scales with model capacity:
- * - 32k context (22.4k effective) → ~56.8%
- * - 128k context (89.6k effective) → ~58.9%
- * - 1M context (700k effective) → ~61.4%
- * - 4M context (2.8M effective) → ~62.2%
- * 
- * @param effectiveWindow - The model's effective context window (70% of advertised, from modelSpec.effectiveWindow)
- * @returns Threshold percentage at which cleanup should trigger
- */
-export function getDynamicThresholdPercent(effectiveWindow: number): number {
-    // Formula: 55% + 0.5 × log₁₀(window/1024)
-    const BASE_THRESHOLD = 55;
-    const SCALE_FACTOR = 0.5;
-    const NORMALIZATION_DIVISOR = 1024;
-
-    // Ensure minimum window size to avoid negative log
-    const normalizedWindow = Math.max(effectiveWindow, NORMALIZATION_DIVISOR) / NORMALIZATION_DIVISOR;
-    const logBonus = SCALE_FACTOR * Math.log10(normalizedWindow);
-
-    // Cap at 75% to always maintain safety margin
-    return Math.min(75, BASE_THRESHOLD + logBonus);
-}
+// NOTE: SLIDING_WINDOW_SIZE and getDynamicThresholdPercent moved to context.ts
+// Import from context.ts if needed
 
 // =============================================================================
 // Memory Priority Matrix Configuration
 // =============================================================================
+
 
 interface MemoryContext {
     user_id?: string;      // Priority 1: User context
@@ -368,7 +341,7 @@ export async function optimizeWithGraph(
 export async function performSafeWipe(
     workflowId: string,
     runId: string,
-    coordinatorModel: string,  // from AGENTIC_COORDINATOR_MODELS list
+    coordinatorModel: string,  // from coordinatorModels list
     currentContext: {
         goal: string;
         completedActions: string[];
@@ -410,7 +383,7 @@ Create a summary that:
 4. Is concise but complete (max 200 words)`;
 
     try {
-        // Use the coordinator model (selected at mint time, from AGENTIC_COORDINATOR_MODELS)
+        // Use the coordinator model (selected at mint time, from coordinatorModels)
         const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
