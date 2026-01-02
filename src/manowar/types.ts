@@ -393,22 +393,3 @@ export const MANOWAR_PRICES = {
     MCP_TOOL: "1000", // $0.001
 } as const;
 
-// =============================================================================
-// Context Window Defaults
-// =============================================================================
-
-export const CONTEXT_WINDOW_DEFAULTS = {
-    /** Default cleanup threshold percentage */
-    CLEANUP_THRESHOLD: 80,
-    /** Common model context windows (in tokens) */
-    MODEL_CONTEXT_SIZES: {
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
-        "claude-3-5-sonnet": 200000,
-        "claude-3-5-haiku": 200000,
-        "gemini-2.0-flash": 1000000,
-        "asi1-mini": 32000,
-        "default": 32000,
-    } as Record<string, number>,
-} as const;
-
