@@ -159,9 +159,12 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         userId: req.headers["x-session-user-address"] as string | undefined,
     };
 
-    // Execute workflow with Shadow Orchestra (new orchestrator)
-    const result = await executeWithOrchestrator(workflow, {
-        input: payload.input || {},
+    // Execute workflow with orchestrator
+    const userMessage = typeof payload.input === "string"
+        ? payload.input
+        : payload.input?.message || payload.message || "Execute workflow";
+
+    const result = await executeWithOrchestrator(workflow, userMessage, {
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
         manowarCardUri: manowar.manowarCardUri,
@@ -339,28 +342,25 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     res.write(`event: start\ndata: ${JSON.stringify({ runId: `run-${Date.now()}`, message: "Starting workflow..." })}\n\n`);
 
     // Execute workflow with SSE progress callback
-    const result = await executeWithOrchestrator(workflow, {
-        input: { message, threadId, attachment, image, audio },
+    const result = await executeWithOrchestrator(workflow, message, {
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
         manowarCardUri: manowar.manowarCardUri,
-        onProgress: (event) => {
+        onProgress: (event: any) => {
             // Send SSE event for each progress update
             res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
         },
     });
 
     // Mark as executed
-    markManowarExecuted(identifier);
+    markManowarExecuted(manowar.walletAddress);
 
-    // Extract output from context
-    const output = result.context?.output ||
-        result.context?.coordinatorResponse ||
-        (result.status === "success" ? "Workflow completed" : result.error || "");
+    // Extract output from result
+    const output = result.result || (result.success ? "Workflow completed" : result.error || "");
 
     // Send final result as SSE event
     const finalData = {
-        success: result.status === "success",
+        success: result.success,
         output: typeof output === "string" ? output : JSON.stringify(output),
         walletAddress: manowar.walletAddress,
         onchainTokenId: manowar.onchainTokenId,
