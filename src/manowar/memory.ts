@@ -471,32 +471,6 @@ Create a summary that:
     }
 }
 
-/**
- * Legacy wrapper for backward compatibility
- * @deprecated Use performSafeWipe instead
- */
-export async function performMemoryWipe(
-    workflowId: string,
-    runId: string,
-    coordinatorModel: string,
-    currentContext: {
-        goal: string;
-        completedActions: string[];
-        lastOutcome: string;
-        agentSummaries: Record<string, string>;
-    }
-): Promise<WipeResult | null> {
-    const result = await performSafeWipe(workflowId, runId, coordinatorModel, currentContext);
-    if (!result) return null;
-
-    return {
-        previousSummary: result.summary,
-        preservedFacts: currentContext.completedActions.slice(-3),
-        wipedMessageCount: currentContext.completedActions.length,
-        memoryId: result.memoryId,
-    };
-}
-
 // =============================================================================
 // Solution Pattern Storage
 // =============================================================================
@@ -646,72 +620,4 @@ Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
         console.error("[Summarizer] Failed:", error);
         return null;
     }
-}
-
-// =============================================================================
-// Essential Functions
-// =============================================================================
-
-export function compressToolOutput(
-    rawOutput: unknown,
-    agentName: string,
-    options?: { maxLength?: number; preserveStructure?: boolean }
-): string {
-    const maxLength = options?.maxLength || 800;
-
-    if (typeof rawOutput === "string") {
-        if (rawOutput.length <= maxLength) return `[${agentName}]: ${rawOutput}`;
-        return `[${agentName}]: ${rawOutput.slice(0, maxLength)}...`;
-    }
-
-    if (rawOutput === null || rawOutput === undefined) {
-        return `[${agentName}]: (no output)`;
-    }
-
-    const obj = rawOutput as Record<string, unknown>;
-    const content = obj.output || obj.content || obj.message || obj.result;
-
-    if (content) {
-        const str = typeof content === "string" ? content : JSON.stringify(content);
-        return `[${agentName}]: ${str.slice(0, maxLength)}`;
-    }
-
-    const cleaned = { ...obj };
-    delete cleaned.walletAddress;
-    delete cleaned.agentId;
-    delete cleaned.threadId;
-    delete cleaned.messages;
-    delete cleaned.metadata;
-
-    const json = JSON.stringify(cleaned);
-    return `[${agentName}]: ${json.slice(0, maxLength)}`;
-}
-
-export function generateStructuredTaskPrompt(
-    agentName: string,
-    task: string,
-    context?: {
-        previousStepOutput?: string;
-        currentStep?: number;
-        totalSteps?: number;
-        expectedOutputFormat?: string;
-    }
-): string {
-    const parts: string[] = [];
-
-    if (context?.currentStep && context?.totalSteps) {
-        parts.push(`[Step ${context.currentStep}/${context.totalSteps}]`);
-    }
-
-    parts.push(`Task: ${task}`);
-
-    if (context?.previousStepOutput) {
-        parts.push(`Previous: ${context.previousStepOutput.slice(0, 500)}`);
-    }
-
-    if (context?.expectedOutputFormat) {
-        parts.push(`Format: ${context.expectedOutputFormat}`);
-    }
-
-    return parts.join("\n");
 }
