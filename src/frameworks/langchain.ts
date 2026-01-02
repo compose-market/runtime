@@ -259,7 +259,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   const tools = [...composeTools, ...memTools];
 
 
-  // 2. Prepare Model - use model from on-chain metadata (NO FALLBACKS)
+  // 2. Prepare Model - use model from on-chain metadata
   // Use async factory to fetch dynamic config from Lambda
   const model = await createModelAsync(config.model, config.temperature ?? 0.7);
 

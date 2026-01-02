@@ -107,7 +107,7 @@ export async function detectModelTask(modelId: string): Promise<TaskType> {
         console.warn(`[multimodal] Failed to fetch model info for ${modelId}:`, error);
     }
 
-    // Fallback: infer from model ID
+    // Infer from model ID
     return inferTaskFromModelId(modelId);
 }
 
