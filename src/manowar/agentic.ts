@@ -1,14 +1,7 @@
 /**
  * Agentic Coordinator Models
  * 
- * Curated selection of models optimized for multi-agent workflows, tool-calling,
- * and coordinator responsibilities. These models are specifically designed for:
- * - Multi-step tool orchestration
- * - Long-horizon reasoning (200-300+ sequential tool calls)
- * - Interleaved Thinking (plan → act → reflect)
- * - Autonomous operation with tool adherence
- * 
- * Model IDs verified against the project's normalized registry in models.json
+ * Curated selection of models optimized for multi-agent workflows.
  */
 
 export interface AgenticModel {
@@ -23,9 +16,8 @@ export interface AgenticModel {
 
 /**
  * Curated list of agentic coordinator models
- * IDs match the normalized format from models.ts after deduplication
  */
-export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
+export const coordinatorModels: AgenticModel[] = [
     {
         id: "nvidia/nemotron-3-nano-30b-a3b:free",
         name: "Nemotron 3 Nano 30B",
@@ -33,7 +25,7 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         contextLength: 128000,
         activeParams: "30B",
         keyStrength: "Multi-step tool orchestration, RAG, reasoning",
-        description: "Post-trained for agentic workflows with SFT across math, code, and science. Uses RPO, RLVR, and DPO for tool-use refinement.",
+        description: "Post-trained for agentic workflows with SFT across math, code, and science.",
     },
     {
         id: "moonshotai/kimi-k2-thinking",
@@ -42,7 +34,7 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         contextLength: 256000,
         activeParams: "32B",
         keyStrength: "200-300 sequential tool calls, long-horizon reasoning",
-        description: "Advanced agentic capabilities with tool-use learning and general RL. Auto-comprehends tool usage without workflow scripting.",
+        description: "Advanced agentic capabilities with tool-use learning.",
     },
     {
         id: "minimax/minimax-m2.1",
@@ -51,7 +43,7 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         contextLength: 4000000,
         activeParams: "45.9B",
         keyStrength: "Interleaved Thinking (plan→act→reflect), 4M context",
-        description: "Agentic-first design with dynamic Plan→Act→Reflect loop. Leading multilingual coding and versatile agent brain for IDEs.",
+        description: "Agentic-first design with dynamic Plan→Act→Reflect loop.",
     },
     {
         id: "nex-agi/deepseek-v3.1-nex-n1:free",
@@ -59,8 +51,8 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         provider: "nex-agi",
         contextLength: 164000,
         activeParams: "~10B",
-        keyStrength: "Autonomous operation, tool adherence, practical coding",
-        description: "Post-trained for agent autonomy, tool use, and real-world productivity. Strong in coding and HTML generation.",
+        keyStrength: "Autonomous operation, tool adherence",
+        description: "Post-trained for agent autonomy and real-world productivity.",
     },
     {
         id: "allenai/olmo-3.1-32b-think:free",
@@ -69,7 +61,7 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         contextLength: 128000,
         activeParams: "32B",
         keyStrength: "Fully open, long chain-of-thought reasoning",
-        description: "Ai2's strongest fully open reasoning model. Excels in math, logic, and instruction-following with tool use support.",
+        description: "Ai2's strongest fully open reasoning model.",
     },
     {
         id: "arcee-ai/trinity-mini:free",
@@ -78,7 +70,7 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
         contextLength: 128000,
         activeParams: "~7B",
         keyStrength: "Fast, cost-effective, versatile",
-        description: "Compact but capable model for quick agent coordination tasks. Optimized for low-latency responses.",
+        description: "Compact model for quick agent coordination tasks.",
     },
 ];
 
@@ -86,115 +78,26 @@ export const AGENTIC_COORDINATOR_MODELS: AgenticModel[] = [
  * Get a specific agentic model by ID
  */
 export function getAgenticModel(modelId: string): AgenticModel | undefined {
-    return AGENTIC_COORDINATOR_MODELS.find(m => m.id === modelId);
+    return coordinatorModels.find(m => m.id === modelId);
 }
 
 /**
  * Get all agentic coordinator model IDs
  */
 export function getAgenticModelIds(): string[] {
-    return AGENTIC_COORDINATOR_MODELS.map(m => m.id);
+    return coordinatorModels.map(m => m.id);
 }
 
 /**
  * Check if a model ID is an approved agentic coordinator model
  */
 export function isAgenticCoordinatorModel(modelId: string): boolean {
-    return AGENTIC_COORDINATOR_MODELS.some(m => m.id === modelId);
+    return coordinatorModels.some(m => m.id === modelId);
 }
 
 /**
- * Get the coordinator model selected by user at mint time.
- * No hardcoded model dependencies.
+ * Get default coordinator model (returns null - must be set by user)
  */
 export function getDefaultCoordinatorModel(): string | null {
-    // No hardcoded default - must be set by user at mint time via compose.tsx
-    // The coordinatorModel is stored on-chain and passed to the orchestrator
     return null;
-}
-
-// =============================================================================
-// Context Sub-Agent Definitions
-// =============================================================================
-
-export type ContextAgentRole =
-    | "note_taker"
-    | "window_tracker"
-    | "mem0_optimizer"
-    | "memory_wipe"
-    | "summarizer"
-    | "tool_boxer"
-    | "evaluator"
-    | "reviewer";
-
-export interface ContextSubAgent {
-    role: ContextAgentRole;
-    name: string;
-    description: string;
-    activatesOn: "always" | "continuous-loop-only" | "threshold" | "loop-boundary";
-}
-
-/**
- * Specialized sub-agents for the context management workflow
- */
-export const CONTEXT_SUB_AGENTS: ContextSubAgent[] = [
-    {
-        role: "note_taker",
-        name: "NoteTaker",
-        description: "Tracks every token input/output per-agent per-action. Compiles checkpoints for each action.",
-        activatesOn: "always",
-    },
-    {
-        role: "window_tracker",
-        name: "WindowTracker",
-        description: "Maintains knowledge of every model's context window specs. Provides MECW calculations.",
-        activatesOn: "always",
-    },
-    {
-        role: "mem0_optimizer",
-        name: "Mem0GraphOptimizer",
-        description: "Extracts entities and relationships for semantic graph memory. Enables cross-context linking.",
-        activatesOn: "always",
-    },
-    {
-        role: "memory_wipe",
-        name: "MemoryWipe",
-        description: "Triggers cleanup when approaching context limit for each agent. Preserves critical messages.",
-        activatesOn: "threshold",
-    },
-    {
-        role: "summarizer",
-        name: "Summarizer",
-        description: "Intelligently summarizes goal, actions, and outcomes within current workflow execution (not historical).",
-        activatesOn: "threshold",
-    },
-    {
-        role: "tool_boxer",
-        name: "ToolBoxer",
-        description: "Access to 16K+ unified capabilities from registry.ts. Recommends optimal MCP/tool for each task.",
-        activatesOn: "always",
-    },
-    // Continuous-loop-only agents (activated only in multi-loop workflows)
-    {
-        role: "evaluator",
-        name: "Evaluator",
-        description: "End-of-loop agent. Evaluates performance and adherence to initial scope. Proposes improvements for next execution.",
-        activatesOn: "continuous-loop-only",
-    },
-    {
-        role: "reviewer",
-        name: "Reviewer",
-        description: "Start-of-loop agent (loop 2+). Reviews previous Evaluator's suggestions. Decides how to efficiently incorporate improvements.",
-        activatesOn: "continuous-loop-only",
-    },
-];
-
-/**
- * Get sub-agents that should be active based on workflow type
- */
-export function getActiveSubAgents(isContinuousLoop: boolean): ContextSubAgent[] {
-    if (isContinuousLoop) {
-        return CONTEXT_SUB_AGENTS;
-    }
-    return CONTEXT_SUB_AGENTS.filter(a => a.activatesOn !== "continuous-loop-only");
 }
