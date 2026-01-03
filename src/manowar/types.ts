@@ -488,6 +488,8 @@ export interface ExecutorOptions {
     coordinatorModel?: string;
     /** IPFS URI to manowarCard */
     manowarCardUri?: string;
+    /** Attachment URL (image, document, etc.) to include in context */
+    attachmentUrl?: string;
 }
 
 // =============================================================================
