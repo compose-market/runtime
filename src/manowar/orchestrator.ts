@@ -6,19 +6,19 @@
  * - Embeddings for context retrieval (not full history)
  * - Direct delegation via HTTP (not tool-based)
  * - Sliding window for recent messages
- * - No Shadow Orchestra sub-agents
  * 
  * This replaces the complex LangGraph-based Shadow Orchestra with
  * a streamlined execution flow.
  */
 
-import type { Workflow, WorkflowStep, ExecutorOptions, SSEProgressEvent } from "./types.js";
-import { TaskPlanner, type ExecutionPlan, type PlanStep } from "./planner.js";
+import type { Workflow, ExecutorOptions, SSEProgressEvent } from "./types.js";
+import { TaskPlanner } from "./planner.js";
 import { fetchManowarCard, buildSystemPromptFromCard, type ManowarCard } from "./registry.js";
-import { callAgent, delegatePlanStep, type DelegationResult } from "./delegation.js";
-import { getRelevantContext, storeEmbedding, recordConversationTurn } from "./embeddings.js";
+import { delegatePlanStep } from "./delegation.js";
+import { getRelevantContext, recordConversationTurn } from "./embeddings.js";
 import { ContextWindowManager } from "./context.js";
 import { addMemoryWithGraph, performSafeWipe } from "./memory.js";
+import { LangSmithTokenTracker } from "./langsmith.js";
 import type { TokenUsage } from "./types.js";
 
 // =============================================================================
@@ -58,16 +58,16 @@ export class ManowarOrchestrator {
     private workflow: Workflow;
     private coordinatorModel: string;
     private systemPrompt: string = "";
-    private planner: TaskPlanner;
+    private planner: TaskPlanner | null = null;
     private contextManager: ContextWindowManager;
     private manowarCard: ManowarCard | null = null;
     private initialized: boolean = false;
     private onProgress?: (event: SSEProgressEvent) => void;
+    private tokenTracker: LangSmithTokenTracker | null = null;
 
     constructor(workflow: Workflow, coordinatorModel: string) {
         this.workflow = workflow;
         this.coordinatorModel = coordinatorModel;
-        this.planner = new TaskPlanner(workflow, coordinatorModel);
         this.contextManager = new ContextWindowManager(coordinatorModel);
     }
 
@@ -78,6 +78,9 @@ export class ManowarOrchestrator {
         if (this.initialized) return;
 
         try {
+            // Initialize context manager with model context window
+            await this.contextManager.initialize();
+
             // Fetch manowarCard if URI provided
             if (manowarCardUri) {
                 this.manowarCard = await fetchManowarCard(manowarCardUri);
@@ -92,7 +95,7 @@ export class ManowarOrchestrator {
             }
 
             this.initialized = true;
-            console.log(`[orchestrator] Initialized with ${this.workflow.steps.filter(s => s.type === "agent").length} agents`);
+            console.log(`[orchestrator] Initialized with ${this.workflow.steps.filter(s => s.type === "agent").length} agents, context: ${this.contextManager.getState().maxTokens} tokens`);
         } catch (error) {
             console.error("[orchestrator] Initialization failed:", error);
             // Fall back to workflow-based prompt
@@ -152,6 +155,14 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
         const walletAddress = this.manowarCard.walletAddress;
         const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+        // Create LangSmith token tracker for this run (contextManager implements TokenLedgerInterface)
+        this.tokenTracker = new LangSmithTokenTracker(walletAddress, runId, this.contextManager);
+        this.tokenTracker.setCurrentAgent("coordinator", "planning");
+        this.tokenTracker.setCurrentModel(this.coordinatorModel);
+
+        // Create planner with callback for accurate token tracking
+        this.planner = new TaskPlanner(this.workflow, this.coordinatorModel, [this.tokenTracker]);
+
         this.emitProgress("start", { runId, message: "Starting manowar execution" });
 
         // Messages array - starts with system prompt + user request
@@ -167,7 +178,28 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
             // 1. Create execution plan
             this.emitProgress("progress", { progress: 10, message: "Creating execution plan" });
 
-            const plan = await this.planner.createPlan(userRequest);
+            // Build edges context for planner if available
+            const edgesContext = this.manowarCard?.edges?.length
+                ? `Workflow execution order: ${this.manowarCard.edges.map(e =>
+                    `Agent ${e.source} → Agent ${e.target}${e.label ? ` (${e.label})` : ""}`
+                ).join(", ")}`
+                : undefined;
+
+            // Attachment URL handling:
+            // Orchestrator only sees the URL (from Pinata), never the actual content.
+            // The URL is passed to planner for context-aware planning.
+            // Agents that need the actual content will access it at delegation time.
+            if (options.attachmentUrl) {
+                console.log(`[orchestrator] Attachment URL received: ${options.attachmentUrl} (content accessed by delegated agent)`);
+            }
+
+            // Build prior context combining edges and any prior context
+            const priorContext = [edgesContext].filter(Boolean).join("\n");
+
+            const plan = await this.planner.createPlan(userRequest, {
+                priorContext: priorContext || undefined,
+                attachmentUrl: options.attachmentUrl,
+            });
 
             if (!plan || plan.steps.length === 0) {
                 return {
@@ -241,12 +273,17 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                 if (result.tokensUsed && result.tokensUsed > 0) {
                     totalTokensUsed += result.tokensUsed;
 
+                    // Use input/output tokens from agent response when available
+                    // Only fall back to estimation if agent doesn't provide breakdown
+                    const inputTokens = result.inputTokens ?? Math.floor(result.tokensUsed * 0.4);
+                    const outputTokens = result.outputTokens ?? Math.floor(result.tokensUsed * 0.6);
+
                     // Build TokenUsage and record to context manager
                     const tokenUsage: TokenUsage = {
                         agentId: step.agentName,
                         model: this.coordinatorModel,
-                        inputTokens: Math.floor(result.tokensUsed * 0.4), // Estimate split
-                        outputTokens: Math.floor(result.tokensUsed * 0.6),
+                        inputTokens,
+                        outputTokens,
                         totalTokens: result.tokensUsed,
                         timestamp: Date.now(),
                     };
@@ -301,6 +338,40 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                     role: "assistant",
                     content: `[${step.agentName}] ${outputSummary}`,
                 });
+
+                // === STEP REFLECTION ===
+                // Reflect on the completed step for multi-loop learning
+                if (result.success) {
+                    try {
+                        const reflection = await this.planner.reflectOnStep(
+                            i + 1,
+                            result.output,
+                            result.tokensUsed || 0
+                        );
+
+                        // Store reflection insights in memory for future runs
+                        if (reflection.learnings.length > 0) {
+                            await addMemoryWithGraph({
+                                messages: [
+                                    { role: "system", content: `Step ${i + 1} reflection for ${walletAddress}` },
+                                    {
+                                        role: "assistant", content: JSON.stringify({
+                                            step: i + 1,
+                                            agent: step.agentName,
+                                            qualityScore: reflection.qualityScore,
+                                            learnings: reflection.learnings,
+                                        })
+                                    },
+                                ],
+                                agent_id: walletAddress,
+                                run_id: runId,
+                                metadata: { type: "step_reflection", step: i + 1, quality: reflection.qualityScore },
+                            });
+                        }
+                    } catch (reflectError) {
+                        console.warn(`[orchestrator] Reflection failed for step ${i + 1}:`, reflectError);
+                    }
+                }
 
                 this.emitProgress("progress", {
                     progress: stepProgress,
