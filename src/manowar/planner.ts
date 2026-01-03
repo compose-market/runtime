@@ -17,6 +17,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { Workflow } from "./types.js";
 import { searchMemoryWithGraph, addMemoryWithGraph } from "./memory.js";
+import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 
 // =============================================================================
 // Planning Types
@@ -197,13 +198,16 @@ export class TaskPlanner {
     private model: ChatOpenAI;
     private workflow: Workflow;
     private currentPlan: ExecutionPlan | null = null;
+    private callbacks: BaseCallbackHandler[];
 
     /**
      * @param workflow - The workflow definition
      * @param plannerModel - Model assigned by coordinator from coordinatorModels
+     * @param callbacks - Optional LangChain callbacks for token tracking (e.g., LangSmithTokenTracker)
      */
-    constructor(workflow: Workflow, plannerModel: string) {
+    constructor(workflow: Workflow, plannerModel: string, callbacks: BaseCallbackHandler[] = []) {
         this.workflow = workflow;
+        this.callbacks = callbacks;
 
         if (!plannerModel) {
             throw new Error("plannerModel is required - must be assigned by coordinator from coordinatorModels");
@@ -275,16 +279,19 @@ export class TaskPlanner {
             .map(m => m.memory)
             .join("\n---\n");
 
-        const response = await this.model.invoke([
-            new SystemMessage(reviewerSystemPrompt),
-            new HumanMessage(`## PAST WORKFLOW EVALUATIONS
+        const response = await this.model.invoke(
+            [
+                new SystemMessage(reviewerSystemPrompt),
+                new HumanMessage(`## PAST WORKFLOW EVALUATIONS
 ${evaluationSummary}
 
 ## UPCOMING GOAL
 "${goal}"
 
 Review the past evaluations and suggest improvements for the upcoming execution.`),
-        ]);
+            ],
+            { callbacks: this.callbacks }
+        );
 
         // Parse the response
         const content = String(response.content);
@@ -341,10 +348,13 @@ ${context?.priorContext ? `\n## PRIOR CONTEXT\n${context.priorContext}` : ""}
 
 Create an execution plan for this goal.`;
 
-        const response = await this.model.invoke([
-            new SystemMessage(plannerSystemPrompt),
-            new HumanMessage(userPrompt),
-        ]);
+        const response = await this.model.invoke(
+            [
+                new SystemMessage(plannerSystemPrompt),
+                new HumanMessage(userPrompt),
+            ],
+            { callbacks: this.callbacks }
+        );
 
         // Parse the response
         const content = String(response.content);
@@ -476,10 +486,13 @@ ${this.currentPlan.steps
 
 Evaluate this step and provide recommendations.`;
 
-        const response = await this.model.invoke([
-            new SystemMessage(reflectorSystemPrompt),
-            new HumanMessage(userPrompt),
-        ]);
+        const response = await this.model.invoke(
+            [
+                new SystemMessage(reflectorSystemPrompt),
+                new HumanMessage(userPrompt),
+            ],
+            { callbacks: this.callbacks }
+        );
 
         const content = String(response.content);
         let parsed: any;
