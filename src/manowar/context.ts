@@ -345,6 +345,34 @@ export class ContextWindowManager {
         if (!ctx || ctx.maxTokens === 0) return 0;
         return Math.max(0, ctx.maxTokens - ctx.currentTokens);
     }
+
+    // =========================================================================
+    // TokenLedgerInterface Implementation (for LangSmith integration)
+    // =========================================================================
+
+    /**
+     * Record a token checkpoint from LangSmith callback
+     * Implements TokenLedgerInterface.recordCheckpoint
+     */
+    recordCheckpoint(checkpoint: TokenCheckpoint): void {
+        const usage: TokenUsage = {
+            agentId: checkpoint.agentId,
+            model: checkpoint.modelId,
+            inputTokens: checkpoint.inputTokens,
+            outputTokens: checkpoint.outputTokens,
+            totalTokens: checkpoint.inputTokens + checkpoint.outputTokens,
+            timestamp: checkpoint.timestamp,
+        };
+        this.recordUsage(usage);
+    }
+
+    /**
+     * Get cumulative total tokens across all agents
+     * Implements TokenLedgerInterface.getCumulativeTotal
+     */
+    getCumulativeTotal(): number {
+        return this.currentTokens;
+    }
 }
 
 // =============================================================================
