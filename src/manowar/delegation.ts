@@ -23,7 +23,12 @@ export interface DelegationResult {
     stepNumber: number;
     agentName: string;
     output: string;
+    /** Total tokens used (input + output) */
     tokensUsed?: number;
+    /** Input/prompt tokens (from agent response) */
+    inputTokens?: number;
+    /** Output/completion tokens (from agent response) */
+    outputTokens?: number;
     error?: string;
     timing: {
         startedAt: number;
@@ -64,7 +69,7 @@ export async function callAgent(
     agentWallet: string,
     message: string,
     options: DelegationOptions = {}
-): Promise<{ success: boolean; output: string; tokensUsed?: number; error?: string }> {
+): Promise<{ success: boolean; output: string; tokensUsed?: number; inputTokens?: number; outputTokens?: number; error?: string }> {
     const startedAt = Date.now();
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
@@ -97,10 +102,19 @@ export async function callAgent(
 
         const result = await response.json();
 
+        // Extract token usage - agents should return usage.input_tokens/output_tokens
+        const usage = result.usage || {};
+        const inputTokens = usage.input_tokens || usage.prompt_tokens || usage.inputTokens;
+        const outputTokens = usage.output_tokens || usage.completion_tokens || usage.outputTokens;
+        const totalTokens = result.tokensUsed || usage.total_tokens || usage.totalTokens ||
+            (inputTokens && outputTokens ? inputTokens + outputTokens : undefined);
+
         return {
             success: true,
             output: result.result || result.output || result.message || JSON.stringify(result),
-            tokensUsed: result.tokensUsed || result.usage?.totalTokens,
+            tokensUsed: totalTokens,
+            inputTokens,
+            outputTokens,
         };
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -148,6 +162,8 @@ export async function delegatePlanStep(
         agentName: step.agentName,
         output: result.output,
         tokensUsed: result.tokensUsed,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
         error: result.error,
         timing: {
             startedAt,
