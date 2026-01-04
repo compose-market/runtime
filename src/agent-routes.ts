@@ -15,7 +15,7 @@ import {
     markAgentExecuted,
     uploadAgentKnowledge,
     listAgentKnowledgeKeys,
-} from "./agent-registry.js";
+} from "./frameworks/runtime.js";
 import { executeAgent, streamAgent } from "./frameworks/langchain.js";
 import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";

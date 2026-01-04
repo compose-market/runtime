@@ -7,7 +7,7 @@
 import { createPublicClient, http, type Address } from "viem";
 import { avalancheFuji } from "viem/chains";
 import type { WorkflowStep } from "./manowar/types.js";
-import { registerAgent, hasAgent } from "./agent-registry.js";
+import { registerAgent, hasAgent } from "./frameworks/runtime.js";
 
 // =============================================================================
 // Configuration

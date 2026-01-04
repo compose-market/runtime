@@ -20,8 +20,8 @@ import {
     getManowar,
     listRegisteredManowars,
     markManowarExecuted,
-} from "./manowar-registry.js";
-import { resolveAgent } from "./agent-registry.js";
+    resolveAgent,
+} from "./frameworks/runtime.js";
 import type { WorkflowStep } from "./manowar/types.js";
 
 const app = express();
