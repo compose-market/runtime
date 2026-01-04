@@ -10,7 +10,6 @@
  */
 
 import { ChatOpenAI } from "@langchain/openai";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -72,165 +71,45 @@ export interface LangChainStatus {
 const agents = new Map<string, AgentInstance>();
 
 // =============================================================================
-// Model Factory - Uses shared/models.ts logic for dynamic provider routing
-// =============================================================================
-
-// =============================================================================
-// Model Factory - Dynamic Registry Access (Lambda Gateway)
+// Model Factory - Route ALL models through Lambda Gateway
 // =============================================================================
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
-interface RemoteModelConfig {
-  baseURL: string;
-  apiKeyEnv?: string;
-  source: string;
+// Set in .env
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} environment variable is required`);
+  }
+  return value;
 }
 
-// Cache for model configs to avoid hitting Lambda on every request
-const modelConfigCache = new Map<string, RemoteModelConfig>();
+// Internal secret for bypassing x402 payment on Lambda API (for nested Manowar calls)
+const MANOWAR_INTERNAL_SECRET = requireEnv("MANOWAR_INTERNAL_SECRET");
 
-async function fetchModelConfig(modelId: string): Promise<RemoteModelConfig> {
-  if (modelConfigCache.has(modelId)) {
-    return modelConfigCache.get(modelId)!;
-  }
-
-  try {
-    const response = await fetch(`${LAMBDA_API_URL}/api/registry/model/${encodeURIComponent(modelId)}`);
-    if (!response.ok) {
-      console.warn(`[LangChain] Failed to fetch model config for ${modelId}: ${response.status} ${response.statusText}`);
-      // Fallback logic (local heuristics) if API fails
-      return inferLocalConfig(modelId);
-    }
-
-    const data = await response.json();
-
-    // Map source to specific provider configuration
-    let baseURL = "https://router.huggingface.co/v1";
-    let apiKeyEnv = "HUGGING_FACE_INFERENCE_TOKEN";
-
-    switch (data.source) {
-      case "asi-cloud":
-        baseURL = "https://inference.asicloud.cudos.org/v1";
-        apiKeyEnv = "ASI_INFERENCE_API_KEY";
-        break;
-      case "asi-one":
-        baseURL = "https://api.asi1.ai/v1";
-        apiKeyEnv = "ASI_ONE_API_KEY";
-        break;
-      case "openai":
-        baseURL = "https://api.openai.com/v1";
-        apiKeyEnv = "OPENAI_API_KEY";
-        break;
-      case "anthropic":
-        baseURL = "https://api.anthropic.com/v1";
-        apiKeyEnv = "ANTHROPIC_API_KEY";
-        break;
-      case "google":
-        baseURL = "https://generativelanguage.googleapis.com/v1beta";
-        apiKeyEnv = "GOOGLE_GENERATIVE_AI_API_KEY";
-        break;
-      case "openrouter":
-        baseURL = "https://openrouter.ai/api/v1";
-        apiKeyEnv = "OPEN_ROUTER_API_KEY";
-        break;
-      case "aiml":
-        baseURL = "https://api.aimlapi.com/v1";
-        apiKeyEnv = "AI_ML_API_KEY";
-        break;
-    }
-
-    const config = { baseURL, apiKeyEnv, source: data.source };
-    modelConfigCache.set(modelId, config);
-    return config;
-  } catch (error) {
-    console.warn(`[LangChain] Error fetching model config:`, error);
-    return inferLocalConfig(modelId);
-  }
-}
-
-function inferLocalConfig(modelId: string): RemoteModelConfig {
-  if (modelId.startsWith("asi1-mini") || modelId.startsWith("google/gemma") || modelId.startsWith("meta-llama/") || modelId.startsWith("mistralai/") || modelId.startsWith("qwen/")) {
-    return { baseURL: "https://inference.asicloud.cudos.org/v1", apiKeyEnv: "ASI_INFERENCE_API_KEY", source: "asi-cloud" };
-  } else if (modelId.startsWith("asi1-")) {
-    return { baseURL: "https://api.asi1.ai/v1", apiKeyEnv: "ASI_ONE_API_KEY", source: "asi-one" };
-  } else if (modelId.startsWith("gpt")) {
-    return { baseURL: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", source: "openai" };
-  } else if (modelId.startsWith("claude")) {
-    return { baseURL: "https://api.anthropic.com/v1", apiKeyEnv: "ANTHROPIC_API_KEY", source: "anthropic" };
-  } else if (modelId.startsWith("gemini")) {
-    return { baseURL: "https://generativelanguage.googleapis.com/v1beta", apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY", source: "google" };
-  }
-  // OpenRouter models (from agentic coordinator list and all org/model format models)
-  // These include nvidia/, minimax/, moonshotai/, nex-agi/, allenai/, arcee-ai/, nousresearch/, phind/, perplexity/
-  if (modelId.includes("/")) {
-    return { baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPEN_ROUTER_API_KEY", source: "openrouter" };
-  }
-  return { baseURL: "https://router.huggingface.co/v1", apiKeyEnv: "HUGGING_FACE_INFERENCE_TOKEN", source: "huggingface" };
-}
-
+/**
+ * Create a LangChain chat model that routes through Lambda API gateway.
+ * Lambda handles all provider routing, API keys, and response formatting.
+ * 
+ * Uses x-manowar-internal header to bypass x402 payment since Manowar
+ * already verified payment at the agent chat endpoint level.
+ */
 export function createModel(modelName: string, temperature: number = 0.7): BaseChatModel {
-
-  const config = inferLocalConfig(modelName);
-  const apiKey = process.env[config.apiKeyEnv || ""] || "";
-
-  // Use ChatGoogleGenerativeAI for Gemini models - it properly handles Gemini's function calling format
-  if (config.source === "google") {
-    console.log(`[LangChain] Creating Gemini model: ${modelName}`);
-    return new ChatGoogleGenerativeAI({
-      model: modelName,
-      temperature,
-      apiKey,
-      // Gemini-specific options for better tool calling
-      convertSystemMessageToHumanContent: true,
-    });
-  }
-
-  const modelKwargs: any = {};
-
-  // Force strict mode for ASI Cloud to enable reliable tool calling
-  if (config.source === "asi-cloud") {
-    // Legacy behavior: do not enforce strict mode
-    // modelKwargs.strict = true;
-  }
+  console.log(`[LangChain] Creating model via Lambda gateway: ${modelName}`);
 
   return new ChatOpenAI({
     modelName,
     temperature,
-    configuration: { baseURL: config.baseURL, apiKey },
+    configuration: {
+      baseURL: `${LAMBDA_API_URL}/v1`,
+      defaultHeaders: {
+        // Bypass x402 payment for internal LLM calls - payment was already verified
+        // at the Manowar agent chat endpoint level
+        "x-manowar-internal": MANOWAR_INTERNAL_SECRET,
+      },
+    },
     verbose: true,
-    modelKwargs
-  });
-}
-
-// Async version to be used in createAgent
-export async function createModelAsync(modelName: string, temperature: number = 0.7): Promise<BaseChatModel> {
-  const config = await fetchModelConfig(modelName);
-  const apiKey = process.env[config.apiKeyEnv || ""] || "";
-
-  // Use ChatGoogleGenerativeAI for Gemini models - it properly handles Gemini's function calling format
-  if (config.source === "google") {
-    console.log(`[LangChain] Creating Gemini model (async): ${modelName}`);
-    return new ChatGoogleGenerativeAI({
-      model: modelName,
-      temperature,
-      apiKey,
-      convertSystemMessageToHumanContent: true,
-    });
-  }
-
-  const modelKwargs: any = {};
-  if (config.source === "asi-cloud") {
-    // Legacy behavior: do not enforce strict mode
-    // modelKwargs.strict = true;
-  }
-
-  return new ChatOpenAI({
-    modelName,
-    temperature,
-    configuration: { baseURL: config.baseURL, apiKey },
-    verbose: true,
-    modelKwargs
   });
 }
 
@@ -259,9 +138,8 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   const tools = [...composeTools, ...memTools];
 
 
-  // 2. Prepare Model - use model from on-chain metadata
-  // Use async factory to fetch dynamic config from Lambda
-  const model = await createModelAsync(config.model, config.temperature ?? 0.7);
+  // 2. Prepare Model - use model from on-chain metadata via Lambda gateway
+  const model = createModel(config.model, config.temperature ?? 0.7);
 
   // 3. Prepare Checkpoint Directory
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");

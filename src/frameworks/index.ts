@@ -4,10 +4,12 @@
  * Exports all framework runtimes:
  * - ElizaOS: Agent framework with plugins
  * - LangChain: LLM application framework with LangGraph
+ * - Runtime: Unified agent/manowar registry (consolidated from agent-registry + manowar-registry)
  */
 
 export * as eliza from "./eliza.js";
 export * as langchain from "./langchain.js";
+export * as runtime from "./runtime.js";
 
 export type FrameworkType = "eliza" | "langchain";
 
