@@ -18,8 +18,8 @@ const USE_MAINNET = process.env.USE_MAINNET === "true";
 
 // Contract Addresses from environment (with testnet defaults from env)
 const CONTRACT_ADDRESSES = {
-    AgentFactory: (process.env.AGENT_FACTORY_CONTRACT_ADDRESS || "") as Address,
-    Manowar: (process.env.MANOWAR_CONTRACT_ADDRESS || "") as Address,
+    AgentFactory: (process.env.FUJI_AGENT_FACTORY_CONTRACT_ADDRESS || "") as Address,
+    Manowar: (process.env.FUJI_MANOWAR_CONTRACT_ADDRESS || "") as Address,
 };
 
 // =============================================================================
