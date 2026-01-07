@@ -222,14 +222,7 @@ const registeredManowars = new Map<string, RegisteredManowar>();
 
 /**
  * Register a new agent from on-chain mint
- * 
  * walletAddress uses the IPFS metadata as the single source of truth
- * The backend does NOT derive the wallet address, it trusts the frontend/IPFS metadata
- * 
- * Wallet derivation (for signing transactions) is OPTIONAL:
- * - If walletTimestamp is provided, we derive and verify the wallet
- * - If not provided, agent works fine for chat (no signing capability)
- * - The wallet can be derived later when signing is actually needed
  */
 export async function registerAgent(params: RegisterAgentParams): Promise<RegisteredAgent> {
     const agentId = params.agentId ? BigInt(params.agentId) : BigInt(0);
@@ -330,7 +323,7 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
 
     const config = {
         name: params.name,
-        agentId,
+        agentWallet: walletAddress, // Wallet address is the ONLY identifier
         wallet, // May be undefined - that's OK for chat
         model: params.model,
         plugins: params.plugins || [],

@@ -10,6 +10,7 @@
  */
 
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -27,7 +28,7 @@ import { Mem0CallbackHandler } from "../agent/callbacks.js";
 
 export interface AgentConfig {
   name: string;
-  agentId?: number | bigint;
+  agentWallet: string; // Wallet address - ONLY identifier
   wallet?: AgentWallet;
   model?: string;
   temperature?: number;
@@ -71,43 +72,113 @@ export interface LangChainStatus {
 const agents = new Map<string, AgentInstance>();
 
 // =============================================================================
-// Model Factory - Route ALL models through Lambda Gateway
+// Model Factory - Direct Provider Routing (like legacy)
+// LangChain agents call providers directly for proper tool-calling support.
+// Lambda is only used for multimodal inference and model registry, NOT chat.
 // =============================================================================
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
-// Set in .env
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} environment variable is required`);
-  }
-  return value;
+interface ProviderConfig {
+  baseURL: string;
+  apiKeyEnv: string;
+  source: string;
 }
 
-// Internal secret for bypassing x402 payment on Lambda API (for nested Manowar calls)
-const MANOWAR_INTERNAL_SECRET = requireEnv("MANOWAR_INTERNAL_SECRET");
+/**
+ * Infer provider configuration from model ID.
+ * Routes to the correct provider API based on model name patterns.
+ */
+function inferProviderConfig(modelId: string): ProviderConfig {
+  const lowerId = modelId.toLowerCase();
+
+  // Google/Gemini models
+  if (lowerId.startsWith("gemini") || lowerId.includes("gemini")) {
+    return {
+      baseURL: "https://generativelanguage.googleapis.com/v1beta",
+      apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY",
+      source: "google"
+    };
+  }
+
+  // OpenAI models
+  if (lowerId.startsWith("gpt") || lowerId.startsWith("o1") || lowerId.startsWith("o3") || lowerId.includes("openai")) {
+    return {
+      baseURL: "https://api.openai.com/v1",
+      apiKeyEnv: "OPENAI_API_KEY",
+      source: "openai"
+    };
+  }
+
+  // Anthropic models
+  if (lowerId.startsWith("claude") || lowerId.includes("anthropic")) {
+    return {
+      baseURL: "https://api.anthropic.com/v1",
+      apiKeyEnv: "ANTHROPIC_API_KEY",
+      source: "anthropic"
+    };
+  }
+
+  // ASI Cloud models
+  if (lowerId.startsWith("asi1-mini") || lowerId.startsWith("google/gemma") ||
+    lowerId.startsWith("meta-llama/") || lowerId.startsWith("mistralai/") ||
+    lowerId.startsWith("qwen/")) {
+    return {
+      baseURL: "https://inference.asicloud.cudos.org/v1",
+      apiKeyEnv: "ASI_INFERENCE_API_KEY",
+      source: "asi-cloud"
+    };
+  }
+
+  // ASI One models
+  if (lowerId.startsWith("asi1-")) {
+    return {
+      baseURL: "https://api.asi1.ai/v1",
+      apiKeyEnv: "ASI_ONE_API_KEY",
+      source: "asi-one"
+    };
+  }
+
+  // Default: HuggingFace router
+  return {
+    baseURL: "https://router.huggingface.co/v1",
+    apiKeyEnv: "HUGGING_FACE_INFERENCE_TOKEN",
+    source: "huggingface"
+  };
+}
 
 /**
- * Create a LangChain chat model that routes through Lambda API gateway.
- * Lambda handles all provider routing, API keys, and response formatting.
+ * Create a LangChain chat model that routes DIRECTLY to the provider.
+ * This is required for proper tool-calling support - Lambda's OpenAI-compatible
+ * endpoint doesn't handle the multi-turn tool conversation format.
  * 
- * Uses x-manowar-internal header to bypass x402 payment since Manowar
- * already verified payment at the agent chat endpoint level.
+ * For Gemini: Uses ChatGoogleGenerativeAI which handles Gemini's native format.
+ * For others: Uses ChatOpenAI pointing directly to provider API.
  */
 export function createModel(modelName: string, temperature: number = 0.7): BaseChatModel {
-  console.log(`[LangChain] Creating model via Lambda gateway: ${modelName}`);
+  const config = inferProviderConfig(modelName);
+  const apiKey = process.env[config.apiKeyEnv] || "";
 
+  console.log(`[LangChain] Creating model: ${modelName} via ${config.source} (${config.baseURL})`);
+
+  // Use ChatGoogleGenerativeAI for Gemini - it handles Gemini's function calling format natively
+  if (config.source === "google") {
+    return new ChatGoogleGenerativeAI({
+      model: modelName,
+      temperature,
+      apiKey,
+      // Required for proper system message handling
+      convertSystemMessageToHumanContent: true,
+    });
+  }
+
+  // For all other providers, use ChatOpenAI pointing directly to provider API
   return new ChatOpenAI({
     modelName,
     temperature,
     configuration: {
-      baseURL: `${LAMBDA_API_URL}/v1`,
-      defaultHeaders: {
-        // Bypass x402 payment for internal LLM calls - payment was already verified
-        // at the Manowar agent chat endpoint level
-        "x-manowar-internal": MANOWAR_INTERNAL_SECRET,
-      },
+      baseURL: config.baseURL,
+      apiKey
     },
     verbose: true,
   });
@@ -123,10 +194,8 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     throw new Error("Agent model is required - should be set from on-chain metadata");
   }
 
-  // Use stable ID if provided (preferred for persistence), otherwise generate random
-  const id = config.agentId
-    ? String(config.agentId)
-    : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  // Use wallet address as the stable, unique identifier
+  const id = config.agentWallet;
 
   //  1. Prepare Tools from on-chain plugins (GOAT + MCP + Eliza via Compose Runtime)
   const composeTools = await createAgentTools(
@@ -189,24 +258,24 @@ export interface ExecuteOptions {
 
 
 export async function executeAgent(
-  agentId: string,
+  agentWallet: string,
   message: string,
   options: string | ExecuteOptions = {} // Backwards compatibility: if string, it's threadId
 ): Promise<ExecutionResult> {
-  const agent = agents.get(agentId);
-  if (!agent) throw new Error(`Agent ${agentId} not found`);
+  const agent = agents.get(agentWallet);
+  if (!agent) throw new Error(`Agent ${agentWallet} not found`);
 
   // Normalize options
   const opts: ExecuteOptions = typeof options === "string" ? { threadId: options } : options;
 
-  const threadId = opts.threadId || `thread-${agentId}`;
+  const threadId = opts.threadId || `thread-${agentWallet}`;
   const userId = opts.userId;
   const manowarWallet = opts.manowarWallet;
 
   const start = Date.now();
 
   try {
-    // Update session context in config (but DON'T recreate tools - they're already bound)
+    // Update session context in config (but don't recreate tools - they're already bound)
     // Session context is passed through headers during tool execution, not via recreation
     if (opts.sessionContext && agent.config) {
       agent.config.sessionContext = opts.sessionContext;
@@ -215,7 +284,7 @@ export async function executeAgent(
     }
 
     // Setup Callbacks (Mem0) with full identity context
-    const mem0Handler = new Mem0CallbackHandler(agentId, threadId, userId, manowarWallet);
+    const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userId, manowarWallet);
 
     const input = { messages: [new HumanMessage(message)] };
     const config = {
@@ -225,7 +294,7 @@ export async function executeAgent(
     };
 
     // Invoke
-    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarWallet || 'none'})...`);
+    console.log(`[LangChain] Invoking agent ${agentWallet} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarWallet || 'none'})...`);
     const result = await agent.executor.invoke(input, config);
 
     // Parse Result
@@ -291,8 +360,110 @@ export async function executeAgent(
   }
 }
 
-// Stub for streamAgent if needed - explicitly not implemented fully yet as per plan focus on specific features
-// but we leave a placeholder to avoid breaking imports
-export async function* streamAgent(agentId: string, message: string, threadId?: string): AsyncGenerator<any> {
-  yield { type: "error", content: "Streaming not yet refactored in modular update." };
+// -----------------------------------------------------------------------------
+// Streaming Implementation
+// -----------------------------------------------------------------------------
+
+/**
+ * Stream agent execution using LangGraph streamEvents (v2)
+ * Yields OpenAI-compatible chunks for seamless frontend integration.
+ * Wraps <think>, <invoke> etc. in content deltas.
+ */
+export async function* streamAgent(
+  agentWallet: string,
+  message: string,
+  options?: ExecuteOptions
+): AsyncGenerator<any> {
+  const agent = agents.get(agentWallet);
+  if (!agent) throw new Error(`Agent ${agentWallet} not found`);
+
+  const opts: ExecuteOptions = options || {};
+  const tId = opts.threadId || `thread-${agentWallet}`;
+  const userId = opts.userId;
+  const manowarWallet = opts.manowarWallet;
+
+  // Update session context if provided
+  if (opts.sessionContext && agent.config) {
+    agent.config.sessionContext = opts.sessionContext;
+  }
+
+  // Setup Callbacks (Mem0) with full identity context
+  const mem0Handler = new Mem0CallbackHandler(agentWallet, tId, userId, manowarWallet);
+
+  const input = { messages: [new HumanMessage(message)] };
+  const config = {
+    configurable: { thread_id: tId },
+    callbacks: [mem0Handler],
+    recursionLimit: 50,
+    version: "v2" as const // Use v2 streaming (streamEvents)
+  };
+
+  console.log(`[LangChain] Streaming agent ${agentWallet} (Thread: ${tId}, User: ${userId || 'anon'}, Manowar: ${manowarWallet || 'none'})...`);
+
+  // Helper to create OpenAI-style chunk
+  const createChunk = (content: string) => ({
+    choices: [{ delta: { content } }]
+  });
+
+  try {
+    // Use streamEvents to get fine-gained events (tokens, tool start/end)
+    const eventStream = await agent.executor.streamEvents(input, config);
+
+    for await (const event of eventStream) {
+      const eventType = event.event;
+
+      // 1. Text Streaming (LLM generation)
+      if (eventType === "on_chat_model_stream") {
+        const chunk = event.data?.chunk;
+        // LangChain chunk is BaseMessageChunk
+        if (chunk && chunk.content) {
+          let text = "";
+          if (typeof chunk.content === "string") {
+            text = chunk.content;
+          } else if (Array.isArray(chunk.content)) {
+            // Handle multimodal content parts if any
+            text = chunk.content
+              .map((c: any) => c.type === "text" ? c.text : "")
+              .join("");
+          }
+
+          if (text) {
+            yield createChunk(text);
+          }
+        }
+      }
+
+      // 2. Tool Start -> <invoke> tag
+      else if (eventType === "on_tool_start") {
+        const toolName = event.name;
+        const toolInput = event.data?.input; // Arguments
+
+        // Ignore internal tools if desired, but usually we want to show everything
+        // Note: Mem0 tools might be noisy, but let's show them for now or filter if needed?
+        // "search_memory", "save_memory" are user-facing enough.
+
+        let paramBlock = "";
+        if (toolInput && typeof toolInput === "object") {
+          for (const [key, value] of Object.entries(toolInput)) {
+            const valStr = typeof value === "string" ? value : JSON.stringify(value);
+            paramBlock += `<${key}>${valStr}</${key}>\n`;
+          }
+        }
+
+        const invokeBlock = `\n<invoke>\n${toolName}\n${paramBlock}</invoke>\n`;
+        yield createChunk(invokeBlock);
+      }
+
+      // 3. Tool End -> (Optional) 
+      else if (eventType === "on_tool_end") {
+        // output is in event.data.output
+      }
+
+      // 4. Chain Start (Thinking?)
+    }
+
+  } catch (err: any) {
+    console.error("Streaming failed:", err);
+    yield createChunk(`\n\n[System Error: ${err.message}]\n`);
+  }
 }
