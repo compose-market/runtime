@@ -73,12 +73,13 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
             if (!fs.existsSync(threadDir)) return;
 
             const files = fs.readdirSync(threadDir)
-                .filter(f => f.endsWith(".json"))
+                .filter(f => f.endsWith(".bin") || f.endsWith(".json"))  // Support both formats
+                .map(f => f.replace(/\.(bin|json)$/, ""))  // Extract checkpoint ID
+                .filter((v, i, a) => a.indexOf(v) === i)  // Dedupe
                 .sort((a, b) => b.localeCompare(a)); // Descending order (newest first)
 
             let count = 0;
-            for (const file of files) {
-                const checkpointId = file.replace(".json", "");
+            for (const checkpointId of files) {
 
                 // Skip if 'before' constraint
                 if (options?.before?.configurable?.checkpoint_id && checkpointId >= options.before.configurable.checkpoint_id) continue;
@@ -115,14 +116,18 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
             fs.mkdirSync(threadDir, { recursive: true });
         }
 
-        const filePath = path.join(threadDir, `${checkpointId}.json`);
+        const filePath = path.join(threadDir, `${checkpointId}.bin`);
+        const typeFilePath = path.join(threadDir, `${checkpointId}.type`);
         const data = {
             config,
             checkpoint,
             metadata,
         };
 
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+        // Use LangChain serde to properly serialize messages (including ChatMessageChunk)
+        const [type, bytes] = await this.serde.dumpsTyped(data);
+        fs.writeFileSync(filePath, Buffer.from(bytes));
+        fs.writeFileSync(typeFilePath, type);
 
         // Also update "latest" pointer if needed, but file sorting handles it
 
@@ -158,19 +163,37 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
      * Private helper to load a checkpoint from disk
      */
     private async loadCheckpoint(threadId: string, checkpointId: string): Promise<CheckpointTuple | undefined> {
-        const filePath = path.join(this.dataDir, threadId, `${checkpointId}.json`);
-        if (!fs.existsSync(filePath)) return undefined;
+        // Try new binary format first, fall back to legacy JSON
+        const binFilePath = path.join(this.dataDir, threadId, `${checkpointId}.bin`);
+        const typeFilePath = path.join(this.dataDir, threadId, `${checkpointId}.type`);
+        const jsonFilePath = path.join(this.dataDir, threadId, `${checkpointId}.json`);
 
         try {
-            const content = fs.readFileSync(filePath, "utf-8");
-            const data = JSON.parse(content);
+            if (fs.existsSync(binFilePath) && fs.existsSync(typeFilePath)) {
+                // New serde format
+                const bytes = fs.readFileSync(binFilePath);
+                const type = fs.readFileSync(typeFilePath, "utf-8");
+                const data = await this.serde.loadsTyped(type, bytes);
 
-            return {
-                config: data.config,
-                checkpoint: data.checkpoint,
-                metadata: data.metadata,
-                parentConfig: data.config // This is a simplification; ideally we track parent
-            };
+                return {
+                    config: data.config,
+                    checkpoint: data.checkpoint,
+                    metadata: data.metadata,
+                    parentConfig: data.config
+                };
+            } else if (fs.existsSync(jsonFilePath)) {
+                // Legacy JSON format - read but will be upgraded on next save
+                const content = fs.readFileSync(jsonFilePath, "utf-8");
+                const data = JSON.parse(content);
+
+                return {
+                    config: data.config,
+                    checkpoint: data.checkpoint,
+                    metadata: data.metadata,
+                    parentConfig: data.config
+                };
+            }
+            return undefined;
         } catch (error) {
             console.error(`[Checkpoint] Failed to load checkpoint ${checkpointId}:`, error);
             return undefined;
@@ -185,11 +208,13 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
         if (!fs.existsSync(threadDir)) return undefined;
 
         const files = fs.readdirSync(threadDir)
-            .filter(f => f.endsWith(".json"))
+            .filter(f => f.endsWith(".bin") || f.endsWith(".json"))  // Support both formats
+            .map(f => f.replace(/\.(bin|json)$/, ""))  // Extract checkpoint ID
+            .filter((v, i, a) => a.indexOf(v) === i)  // Dedupe
             .sort((a, b) => b.localeCompare(a)); // Descending
 
         if (files.length === 0) return undefined;
 
-        return files[0].replace(".json", "");
+        return files[0];
     }
 }
