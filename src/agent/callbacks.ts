@@ -38,14 +38,14 @@ async function addMemory(params: {
 
 export class Mem0CallbackHandler extends BaseCallbackHandler {
     name = "mem0_callback_handler";
-    private agentId: string;
+    private agentWallet: string;
     private threadId: string;
     private userId?: string;
     private manowarWallet?: string;
 
-    constructor(agentId: string, threadId: string, userId?: string, manowarWallet?: string) {
+    constructor(agentWallet: string, threadId: string, userId?: string, manowarWallet?: string) {
         super();
-        this.agentId = agentId;
+        this.agentWallet = agentWallet;
         this.threadId = threadId;
         this.userId = userId;
         this.manowarWallet = manowarWallet;
@@ -77,7 +77,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 { role: "system", content: `Tool '${toolName}' started.` },
                 { role: "user", content: `Input: ${typeof input === 'string' ? input : JSON.stringify(input)}` }
             ],
-            agent_id: this.agentId,
+            agent_id: this.agentWallet,
             user_id: this.userId,
             run_id: this.threadId,
             metadata: {
@@ -111,7 +111,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                     messages: [
                         { role: "assistant", content: content }
                     ],
-                    agent_id: this.agentId,
+                    agent_id: this.agentWallet,
                     user_id: this.userId,
                     run_id: this.threadId,
                     metadata: {
@@ -146,7 +146,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 // Don't await this to avoid blocking latency
                 addMemory({
                     messages: [{ role: "user", content: userMsg }],
-                    agent_id: this.agentId,
+                    agent_id: this.agentWallet,
                     user_id: this.userId,
                     run_id: this.threadId,
                     metadata: {
