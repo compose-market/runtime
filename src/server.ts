@@ -250,8 +250,8 @@ app.get("/manowar", (_req: Request, res: Response) => {
 // Manowar Chat (x402 Payable, Streaming)
 // ============================================================================
 
-app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) => {
-    const identifier = req.params.id;
+app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: Response) => {
+    const identifier = req.params.walletAddress;
 
     // x402 Payment Verification
     const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
@@ -370,6 +370,12 @@ app.post("/manowar/:id/chat", asyncHandler(async (req: Request, res: Response) =
     res.write(`event: done\ndata: {}\n\n`);
     res.end();
 }));
+
+// Alias /run to /chat to match ManowarManifestSchema endpoint definition
+app.post("/manowar/:id/run", (req, res, next) => {
+    req.url = req.url.replace("/run", "/chat");
+    app._router.handle(req, res, next);
+});
 
 // ============================================================================
 // Framework Routes (Summary - agents handle actual execution)

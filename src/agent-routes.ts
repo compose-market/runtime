@@ -54,7 +54,17 @@ const RegisterAgentSchema = z.object({
     agentCardUri: z.string().startsWith("ipfs://"),
     creator: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
     model: z.string().min(1, "model is required from on-chain metadata"),
-    plugins: z.array(z.string()).default(["coingecko"]),
+    // Plugins can be simple strings (legacy) or full Plugin objects (schema compliant)
+    plugins: z.array(
+        z.union([
+            z.string(),
+            z.object({
+                registryId: z.string(),
+                name: z.string(),
+                origin: z.string()
+            })
+        ])
+    ).default(["coingecko"]),
     systemPrompt: z.string().optional(),
 });
 
@@ -112,7 +122,7 @@ router.post(
                 agentCardUri: params.agentCardUri,
                 creator: params.creator,
                 model: params.model,
-                plugins: params.plugins,
+                plugins: params.plugins.map(p => typeof p === "string" ? p : p.registryId),
                 systemPrompt: params.systemPrompt,
             });
 
@@ -165,13 +175,13 @@ router.get("/list", (_req: Request, res: Response) => {
 // =============================================================================
 
 /**
- * GET /agent/:id
+ * GET /agent/:walletAddress
  * Get agent metadata
  */
 router.get(
-    "/:id",
+    "/:walletAddress",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -213,9 +223,9 @@ const KnowledgeUploadSchema = z.object({
  * Upload knowledge to an agent's knowledge base
  */
 router.post(
-    "/:id/knowledge",
+    "/:walletAddress/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -251,9 +261,9 @@ router.post(
  * List all knowledge items for an agent
  */
 router.get(
-    "/:id/knowledge",
+    "/:walletAddress/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -281,9 +291,9 @@ router.get(
  * Chat with an agent (x402 payable)
  */
 router.post(
-    "/:id/chat",
+    "/:walletAddress/chat",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
 
         // x402 Payment Verification - always required, verified on-chain
         // For nested Manowar calls, x-manowar-internal header bypasses payment
@@ -372,7 +382,7 @@ router.post(
         const sessionActive = req.headers["x-session-active"] === "true";
         const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
 
-        // Execute agent
+        // Execute agent (non-streaming to avoid ChatMessageChunk checkpoint corruption)
         console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarWallet || 'none'}, Session: ${sessionActive}]`);
 
         const result = await executeAgent(instance.id, message, {
@@ -389,7 +399,6 @@ router.post(
         markAgentExecuted(identifier);
 
         res.json({
-            agentId: agent.agentId.toString(),
             walletAddress: agent.walletAddress,
             name: agent.name,
             ...result,
@@ -402,9 +411,9 @@ router.post(
  * Stream chat with an agent (x402 payable, SSE)
  */
 router.post(
-    "/:id/stream",
+    "/:walletAddress/stream",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
 
         // x402 Payment Verification - ALWAYS required, no session bypass
         const { paymentData } = extractPaymentInfo(
@@ -449,17 +458,31 @@ router.post(
             return;
         }
 
-        const { message, threadId } = parseResult.data;
+        const { message, threadId, manowarWallet, grantedPermissions } = parseResult.data;
+
+        // Extract user address and session context (like /chat)
+        const userId = req.headers["x-session-user-address"] as string | undefined;
+        const sessionActive = req.headers["x-session-active"] === "true";
+        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
 
         // Set up SSE
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
 
-        console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..."`);
+        console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}]`);
 
         try {
-            for await (const event of streamAgent(instance.id, message, threadId)) {
+            for await (const event of streamAgent(instance.id, message, {
+                threadId,
+                userId,
+                manowarWallet,
+                sessionContext: {
+                    sessionActive,
+                    sessionBudgetRemaining,
+                    grantedPermissions: grantedPermissions || []
+                }
+            })) {
                 res.write(`data: ${JSON.stringify(event)}\n\n`);
             }
             res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
@@ -483,9 +506,9 @@ router.post(
  * Same x402 pattern as /chat but routes to multimodal handler instead of LangChain
  */
 router.post(
-    "/:id/multimodal",
+    "/:walletAddress/multimodal",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.id;
+        const identifier = req.params.walletAddress;
 
         // x402 Payment Verification - always required, verified on-chain
         const { paymentData } = extractPaymentInfo(
