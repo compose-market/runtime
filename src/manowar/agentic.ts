@@ -46,7 +46,7 @@ export const coordinatorModels: AgenticModel[] = [
         description: "Agentic-first design with dynamic Plan→Act→Reflect loop.",
     },
     {
-        id: "nex-agi/deepseek-v3.1-nex-n1:free",
+        id: "nex-agi/deepseek-v3.1-nex-n1",
         name: "DeepSeek V3.1 Nex N1",
         provider: "nex-agi",
         contextLength: 164000,
@@ -55,22 +55,13 @@ export const coordinatorModels: AgenticModel[] = [
         description: "Post-trained for agent autonomy and real-world productivity.",
     },
     {
-        id: "allenai/olmo-3.1-32b-think:free",
+        id: "allenai/olmo-3.1-32b-think",
         name: "OLMo 3.1 Think 32B",
         provider: "allenai",
         contextLength: 128000,
         activeParams: "32B",
         keyStrength: "Fully open, long chain-of-thought reasoning",
         description: "Ai2's strongest fully open reasoning model.",
-    },
-    {
-        id: "arcee-ai/trinity-mini:free",
-        name: "Arcee Trinity Mini",
-        provider: "arcee-ai",
-        contextLength: 128000,
-        activeParams: "~7B",
-        keyStrength: "Fast, cost-effective, versatile",
-        description: "Compact model for quick agent coordination tasks.",
     },
 ];
 
