@@ -161,7 +161,13 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
         this.tokenTracker.setCurrentModel(this.coordinatorModel);
 
         // Create planner with callback for accurate token tracking
-        this.planner = new TaskPlanner(this.workflow, this.coordinatorModel, [this.tokenTracker]);
+        // Pass manowarCard.agents for correct agent names (not fallback workflow step names)
+        this.planner = new TaskPlanner(
+            this.workflow,
+            this.coordinatorModel,
+            [this.tokenTracker],
+            this.manowarCard?.agents
+        );
 
         this.emitProgress("start", { runId, message: "Starting manowar execution" });
 
@@ -246,6 +252,23 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                     message: `Delegating to ${step.agentName}`,
                 });
 
+                // Look up agent card by name first (from manowarCard.agents)
+                let agentCard = this.manowarCard?.agents?.find((a: { name: string }) => a.name === step.agentName);
+
+                // Also try to find workflow step (may have different name due to fallback)
+                const workflowStep = this.workflow.steps.find(s => s.name === step.agentName);
+
+                // Get wallet address: prefer agentCard, then workflow step
+                let agentWallet = (agentCard as { walletAddress?: string })?.walletAddress;
+                if (!agentWallet) {
+                    agentWallet = workflowStep?.agentAddress || (workflowStep?.inputTemplate as { agentAddress?: string })?.agentAddress;
+                }
+
+                // If no agentCard found by name, try by wallet address
+                if (!agentCard && agentWallet) {
+                    agentCard = this.manowarCard?.agents?.find((a: { walletAddress?: string }) => a.walletAddress === agentWallet);
+                }
+
                 const result = await delegatePlanStep(
                     {
                         agentName: step.agentName,
@@ -255,8 +278,10 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                         dependsOn: step.dependsOn || [],
                         estimatedTokens: step.estimatedTokens,
                         priority: step.priority || "medium",
+                        // Pass wallet address for reliable agent lookup
+                        agentWallet: agentWallet,
                     },
-                    this.manowarCard?.agents?.find((a: { name: string }) => a.name === step.agentName),
+                    agentCard,
                     { priorOutputs: previousOutputs.map(p => `${p.agentName}: ${p.summary}`) }
                 );
 
