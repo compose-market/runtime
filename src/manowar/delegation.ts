@@ -50,7 +50,9 @@ export interface DelegationOptions {
 // Configuration
 // =============================================================================
 
-const API_URL = process.env.API_URL || process.env.LAMBDA_API_URL || "http://localhost:4003";
+// Agent delegation calls go to MANOWAR SERVER (manowar.compose.market)
+// The /agent/:wallet/chat endpoint is defined in agent-routes.ts on Manowar
+const MANOWAR_URL = process.env.MANOWAR_URL || "https://manowar.compose.market";
 const DEFAULT_TIMEOUT = 120000; // 2 minutes
 
 // Internal secret for agent-to-agent calls (bypasses payment)
@@ -77,7 +79,7 @@ export async function callAgent(
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-        const response = await fetch(`${API_URL}/agent/${agentWallet}/run`, {
+        const response = await fetch(`${MANOWAR_URL}/agent/${agentWallet}/chat`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -140,7 +142,8 @@ export async function delegatePlanStep(
     options: DelegationOptions = {}
 ): Promise<DelegationResult> {
     const startedAt = Date.now();
-    const agentWallet = agentCard?.walletAddress || step.agentName;
+    // Prefer explicit wallet address from step, then from agentCard, then fallback to agentName
+    const agentWallet = step.agentWallet || agentCard?.walletAddress || step.agentName;
 
     // Build the task message
     let message = step.task;
@@ -227,7 +230,7 @@ export async function executePlan(
  */
 export async function isAgentAvailable(agentWallet: string): Promise<boolean> {
     try {
-        const response = await fetch(`${API_URL}/agent/${agentWallet}`, {
+        const response = await fetch(`${MANOWAR_URL}/agent/${agentWallet}`, {
             method: "GET",
         });
         return response.ok;
