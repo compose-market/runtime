@@ -13,7 +13,7 @@
  * Based on Manus Context Engineering principles (Jan 2026)
  */
 
-import { ChatOpenAI } from "@langchain/openai";
+import { createModel } from "../frameworks/langchain.js";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { Workflow } from "./types.js";
 import { searchMemoryWithGraph, addMemoryWithGraph } from "./memory.js";
@@ -31,6 +31,8 @@ export interface PlanStep {
     stepNumber: number;
     /** Target agent name */
     agentName: string;
+    /** Agent wallet address (optional, for reliable lookup when name is fallback) */
+    agentWallet?: string;
     /** Specific task to delegate */
     task: string;
     /** Expected output format */
@@ -195,37 +197,57 @@ OUTPUT FORMAT (JSON):
 // =============================================================================
 
 export class TaskPlanner {
-    private model: ChatOpenAI;
+    private model: ReturnType<typeof createModel>;
     private workflow: Workflow;
+    private agentCards?: Array<{ name: string; description?: string; skills?: string[]; walletAddress?: string; model?: string; plugins?: Array<{ name: string }> }>;
     private currentPlan: ExecutionPlan | null = null;
     private callbacks: BaseCallbackHandler[];
 
     /**
      * @param workflow - The workflow definition
      * @param plannerModel - Model assigned by coordinator from coordinatorModels
-     * @param callbacks - Optional LangChain callbacks for token tracking (e.g., LangSmithTokenTracker)
+     * @param callbacks - Optional LangChain callbacks for token tracking
+     * @param agentCards - Optional agent cards from manowarCard (preferred source for agent info)
      */
-    constructor(workflow: Workflow, plannerModel: string, callbacks: BaseCallbackHandler[] = []) {
+    constructor(
+        workflow: Workflow,
+        plannerModel: string,
+        callbacks: BaseCallbackHandler[] = [],
+        agentCards?: Array<{ name: string; description?: string; skills?: string[]; walletAddress?: string; model?: string; plugins?: Array<{ name: string }> }>
+    ) {
         this.workflow = workflow;
         this.callbacks = callbacks;
+        this.agentCards = agentCards;
 
         if (!plannerModel) {
             throw new Error("plannerModel is required - must be assigned by coordinator from coordinatorModels");
         }
 
         console.log(`[planner] Using coordinator-assigned model: ${plannerModel}`);
+        if (agentCards?.length) {
+            console.log(`[planner] Received ${agentCards.length} agent cards: ${agentCards.map(a => a.name).join(", ")}`);
+        }
 
-        this.model = new ChatOpenAI({
-            modelName: plannerModel,
-            temperature: 0.2,
-            maxTokens: 2000,
-        });
+        // Use createModel() for proper provider routing (OpenRouter, AI/ML, etc.)
+        this.model = createModel(plannerModel, 0.2);
     }
 
     /**
-     * Get available agents from workflow for planning context
+     * Get available agents - prefers agentCards from manowarCard (IPFS source of truth),
+     * falls back to workflow steps if not provided.
      */
-    private getAvailableAgents(): { name: string; description: string; capabilities: string[] }[] {
+    private getAvailableAgents(): { name: string; description: string; capabilities: string[]; walletAddress?: string }[] {
+        // Prefer agentCards from manowarCard (contains correct names from IPFS)
+        if (this.agentCards?.length) {
+            return this.agentCards.map(agent => ({
+                name: agent.name,
+                description: agent.description || "Specialized agent",
+                capabilities: agent.skills || [],
+                walletAddress: agent.walletAddress,
+            }));
+        }
+
+        // Fallback to workflow steps (may have fallback names)
         return this.workflow.steps
             .filter(s => s.type === "agent")
             .map(s => ({
@@ -234,6 +256,7 @@ export class TaskPlanner {
                 capabilities: Array.isArray(s.inputTemplate?.skills)
                     ? s.inputTemplate.skills as string[]
                     : [],
+                walletAddress: s.agentAddress || (s.inputTemplate as { agentAddress?: string })?.agentAddress,
             }));
     }
 
@@ -404,9 +427,11 @@ Create an execution plan for this goal.`;
      * Validate that the plan is executable
      */
     private validatePlan(plan: ExecutionPlan): boolean {
-        // Check all agent names are valid
+        // Check all agent names are valid - use same source as getAvailableAgents
         const validAgentNames = new Set(
-            this.workflow.steps.filter(s => s.type === "agent").map(s => s.name)
+            this.agentCards?.length
+                ? this.agentCards.map(a => a.name)
+                : this.workflow.steps.filter(s => s.type === "agent").map(s => s.name)
         );
 
         for (const step of plan.steps) {
