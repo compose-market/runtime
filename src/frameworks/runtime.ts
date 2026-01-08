@@ -82,6 +82,73 @@ async function fetchFromPinata<T = unknown>(cid: string): Promise<T | null> {
     }
 }
 
+/**
+ * Upload base64-encoded media to Pinata IPFS
+ * Returns the full HTTPS gateway URL for immediate display
+ */
+export async function uploadBase64ToPinata(
+    base64: string,
+    type: "image" | "audio" | "video",
+    agentWallet?: string
+): Promise<string | null> {
+    if (!PINATA_JWT) {
+        console.warn("[runtime] Pinata not configured for base64 upload");
+        return null;
+    }
+
+    const mimeTypes = {
+        image: "image/png",
+        audio: "audio/wav",
+        video: "video/mp4",
+    };
+    const extensions = {
+        image: "png",
+        audio: "wav",
+        video: "mp4",
+    };
+
+    try {
+        // Convert base64 to binary Buffer
+        const binaryData = Buffer.from(base64, "base64");
+        const blob = new Blob([binaryData], { type: mimeTypes[type] });
+        const filename = `${type}-${Date.now()}.${extensions[type]}`;
+
+        const formData = new FormData();
+        formData.append("file", blob, filename);
+        formData.append("pinataMetadata", JSON.stringify({
+            name: filename,
+            keyvalues: {
+                type,
+                agentWallet: agentWallet || "unknown",
+                source: "manowar-multimodal",
+            },
+        }));
+        formData.append("pinataOptions", JSON.stringify({ cidVersion: 1 }));
+
+        const response = await fetch(`${PINATA_API_URL}/pinning/pinFileToIPFS`, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${PINATA_JWT}`,
+            },
+            body: formData,
+        });
+
+        if (!response.ok) {
+            const error = await response.text();
+            console.error(`[runtime] Pinata base64 upload failed: ${error}`);
+            return null;
+        }
+
+        const result: PinataUploadResponse = await response.json();
+        const url = `https://${PINATA_GATEWAY}/ipfs/${result.IpfsHash}`;
+        console.log(`[runtime] Uploaded ${type} to IPFS: ${url}`);
+        return url;
+    } catch (err) {
+        console.error(`[runtime] Error uploading base64 to Pinata:`, err);
+        return null;
+    }
+}
+
 // =============================================================================
 // Agent Types
 // =============================================================================

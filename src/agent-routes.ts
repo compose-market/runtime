@@ -15,6 +15,7 @@ import {
     markAgentExecuted,
     uploadAgentKnowledge,
     listAgentKnowledgeKeys,
+    uploadBase64ToPinata,
 } from "./frameworks/runtime.js";
 import { executeAgent, streamAgent } from "./frameworks/langchain.js";
 import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
@@ -354,14 +355,31 @@ router.post(
             const result = await executeMultimodal(agent.model, task, message, mediaData);
             markAgentExecuted(identifier);
 
-            // For binary outputs (image/audio/video), send as base64 in JSON response
+            // For binary outputs (image/audio/video), upload to Pinata and return URL
+            // This prevents bloating the orchestrator memory with huge base64 strings
+            let mediaUrl: string | null = null;
+            if (result.success && result.data && (result.type === "image" || result.type === "audio" || result.type === "video")) {
+                mediaUrl = await uploadBase64ToPinata(result.data, result.type, agent.walletAddress);
+                if (mediaUrl) {
+                    console.log(`[agent] Uploaded ${result.type} to Pinata: ${mediaUrl}`);
+                }
+            }
+
             res.json({
                 agentId: agent.agentId.toString(),
                 walletAddress: agent.walletAddress,
                 name: agent.name,
                 model: agent.model,
                 task,
-                ...result,
+                success: result.success,
+                type: result.type,
+                // Return URL instead of base64 data if upload succeeded
+                url: mediaUrl || undefined,
+                data: mediaUrl ? undefined : result.data, // Only include base64 as fallback
+                content: result.content,
+                mimeType: result.mimeType,
+                error: result.error,
+                executionTime: result.executionTime,
             });
             return;
         }
