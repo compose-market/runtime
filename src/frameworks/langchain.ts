@@ -139,6 +139,34 @@ function inferProviderConfig(modelId: string): ProviderConfig {
     };
   }
 
+  // AI/ML API models (e.g., gpt-image-1, flux models)
+  // These typically have specific model naming from aimlapi.com catalog
+  if (lowerId.includes("flux") && !lowerId.includes("huggingface")) {
+    return {
+      baseURL: "https://api.aimlapi.com/v1",
+      apiKeyEnv: "AI_ML_API_KEY",
+      source: "aiml"
+    };
+  }
+
+  // OpenRouter models - identified by org/model pattern
+  // Common patterns: nvidia/, moonshotai/, allenai/, minimax/, arcee-ai/, nex-agi/, etc.
+  // Most coordinator models use OpenRouter for access to diverse model providers
+  const openRouterPatterns = [
+    "nvidia/", "moonshotai/", "allenai/", "minimax/", "arcee-ai/", "nex-agi/",
+    "deepseek/", "cohere/", "perplexity/", "fireworks/", "together/",
+    "01-ai/", "x-ai/", "cognitivecomputations/", "sao10k/", "neversleep/",
+    "sophosympatheia/", "pygmalionai/", "recursal/", "undi95/", "gryphe/",
+    ":free", ":extended"  // OpenRouter free/extended tier suffixes
+  ];
+  if (openRouterPatterns.some(p => lowerId.includes(p))) {
+    return {
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKeyEnv: "OPEN_ROUTER_API_KEY",
+      source: "openrouter"
+    };
+  }
+
   // Default: HuggingFace router
   return {
     baseURL: "https://router.huggingface.co/v1",
