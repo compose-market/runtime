@@ -23,6 +23,41 @@ import { createAgentTools, createMem0Tools } from "../agent/tools.js";
 import { Mem0CallbackHandler } from "../agent/callbacks.js";
 
 // =============================================================================
+// Helpers
+// =============================================================================
+
+/**
+ * Check if a model ID is a Google/Gemini model
+ */
+function isGeminiModel(modelId: string): boolean {
+  const lowerId = modelId.toLowerCase();
+  return lowerId.startsWith("gemini") || lowerId.includes("gemini");
+}
+
+/**
+ * Fetch a URL and convert it to a base64 data URL
+ * Required for Google/Gemini models which don't accept HTTP URLs for images
+ */
+async function fetchUrlAsDataUrl(url: string): Promise<string> {
+  console.log(`[LangChain] Fetching URL for base64 conversion: ${url.slice(0, 60)}...`);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch URL ${url}: ${response.status}`);
+  }
+
+  // Get MIME type from content-type header or infer from URL
+  let mimeType = response.headers.get("content-type") || "image/png";
+  // Clean up MIME type (remove charset etc)
+  mimeType = mimeType.split(";")[0].trim();
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const base64 = buffer.toString("base64");
+
+  console.log(`[LangChain] Converted to data URL (${mimeType}, ${buffer.length} bytes)`);
+  return `data:${mimeType};base64,${base64}`;
+}
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -277,6 +312,7 @@ export interface ExecuteOptions {
   threadId?: string;
   userId?: string;
   manowarWallet?: string;
+  attachment?: { type: "image" | "audio" | "video"; url: string };  // For vision models
   sessionContext?: {
     sessionActive: boolean;
     sessionBudgetRemaining: number;
@@ -314,7 +350,37 @@ export async function executeAgent(
     // Setup Callbacks (Mem0) with full identity context
     const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userId, manowarWallet);
 
-    const input = { messages: [new HumanMessage(message)] };
+    // Create message - use multipart content if attachment is provided (for vision/audio models)
+    let humanMessage: HumanMessage;
+    if (opts.attachment?.url) {
+      const contentParts: any[] = [{ type: "text", text: message }];
+
+      if (opts.attachment.type === "image") {
+        console.log(`[LangChain] Including image attachment: ${opts.attachment.url.slice(0, 60)}...`);
+        // Gemini models require base64 data URLs, not HTTP URLs
+        const modelId = agent.config.model || "";
+        if (isGeminiModel(modelId)) {
+          const dataUrl = await fetchUrlAsDataUrl(opts.attachment.url);
+          contentParts.push({ type: "image_url", image_url: { url: dataUrl } });
+        } else {
+          contentParts.push({ type: "image_url", image_url: { url: opts.attachment.url } });
+        }
+      } else if (opts.attachment.type === "audio") {
+        console.log(`[LangChain] Including audio attachment: ${opts.attachment.url.slice(0, 60)}...`);
+        // Use input_audio format for audio-capable models
+        contentParts.push({ type: "input_audio", input_audio: { url: opts.attachment.url } });
+      } else if (opts.attachment.type === "video") {
+        console.log(`[LangChain] Including video attachment: ${opts.attachment.url.slice(0, 60)}...`);
+        // Some vision models can process video frames - use similar format to image
+        contentParts.push({ type: "video_url", video_url: { url: opts.attachment.url } });
+      }
+
+      humanMessage = new HumanMessage({ content: contentParts });
+    } else {
+      humanMessage = new HumanMessage(message);
+    }
+
+    const input = { messages: [humanMessage] };
     const config = {
       configurable: { thread_id: threadId },
       callbacks: [mem0Handler],
@@ -418,7 +484,35 @@ export async function* streamAgent(
   // Setup Callbacks (Mem0) with full identity context
   const mem0Handler = new Mem0CallbackHandler(agentWallet, tId, userId, manowarWallet);
 
-  const input = { messages: [new HumanMessage(message)] };
+  // Create message - use multipart content if attachment is provided
+  let humanMessage: HumanMessage;
+  if (opts.attachment?.url) {
+    const contentParts: any[] = [{ type: "text", text: message }];
+
+    if (opts.attachment.type === "image") {
+      console.log(`[LangChain Stream] Including image attachment: ${opts.attachment.url.slice(0, 60)}...`);
+      // Gemini models require base64 data URLs, not HTTP URLs
+      const modelId = agent.config.model || "";
+      if (isGeminiModel(modelId)) {
+        const dataUrl = await fetchUrlAsDataUrl(opts.attachment.url);
+        contentParts.push({ type: "image_url", image_url: { url: dataUrl } });
+      } else {
+        contentParts.push({ type: "image_url", image_url: { url: opts.attachment.url } });
+      }
+    } else if (opts.attachment.type === "audio") {
+      console.log(`[LangChain Stream] Including audio attachment: ${opts.attachment.url.slice(0, 60)}...`);
+      contentParts.push({ type: "input_audio", input_audio: { url: opts.attachment.url } });
+    } else if (opts.attachment.type === "video") {
+      console.log(`[LangChain Stream] Including video attachment: ${opts.attachment.url.slice(0, 60)}...`);
+      contentParts.push({ type: "video_url", video_url: { url: opts.attachment.url } });
+    }
+
+    humanMessage = new HumanMessage({ content: contentParts });
+  } else {
+    humanMessage = new HumanMessage(message);
+  }
+
+  const input = { messages: [humanMessage] };
   const config = {
     configurable: { thread_id: tId },
     callbacks: [mem0Handler],

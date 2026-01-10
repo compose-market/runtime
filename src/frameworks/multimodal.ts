@@ -206,6 +206,9 @@ async function callLambdaImageGeneration(
     imageData: string | undefined,
     start: number
 ): Promise<MultimodalResult> {
+    // Detect if imageData is a URL or base64 and send appropriate field
+    const isUrl = imageData?.startsWith("http://") || imageData?.startsWith("https://");
+
     const response = await fetch(`${LAMBDA_API_URL}/v1/images/generations`, {
         method: "POST",
         headers: {
@@ -215,7 +218,8 @@ async function callLambdaImageGeneration(
         body: JSON.stringify({
             model: modelId,
             prompt,
-            image: imageData,
+            // Send as image_url if URL, otherwise as image (base64)
+            ...(isUrl ? { image_url: imageData } : { image: imageData }),
         }),
     });
 
@@ -246,6 +250,9 @@ async function callLambdaVideoGeneration(
     imageData: string | undefined,
     start: number
 ): Promise<MultimodalResult> {
+    // Detect if imageData is a URL or base64 and send appropriate field
+    const isUrl = imageData?.startsWith("http://") || imageData?.startsWith("https://");
+
     const response = await fetch(`${LAMBDA_API_URL}/v1/videos/generations`, {
         method: "POST",
         headers: {
@@ -255,7 +262,8 @@ async function callLambdaVideoGeneration(
         body: JSON.stringify({
             model: modelId,
             prompt,
-            image: imageData,
+            // Send as image_url if URL, otherwise as image (base64)
+            ...(isUrl ? { image_url: imageData } : { image: imageData }),
         }),
     });
 
