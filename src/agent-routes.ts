@@ -75,7 +75,7 @@ const ChatSchema = z.object({
     manowarWallet: z.string().optional(), // Wallet address of the orchestrating Manowar (if any)
     // New attachment format (Pinata URL)
     attachment: z.object({
-        type: z.enum(["image", "audio"]),
+        type: z.enum(["image", "audio", "video"]),
         url: z.string().url(),
     }).optional(),
     grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
@@ -407,6 +407,7 @@ router.post(
             threadId,
             userId,
             manowarWallet,
+            attachment,  // Pass attachment for vision models
             sessionContext: {
                 sessionActive,
                 sessionBudgetRemaining,
