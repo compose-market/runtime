@@ -42,14 +42,15 @@ app.use(cors({
     allowedHeaders: [
         "Content-Type",
         "Authorization",
-        "x-payment",
+        "PAYMENT-SIGNATURE",
+        "payment-signature",
         "x-session-user-address",
         "x-session-active",
         "x-session-budget-remaining",
         "x-manowar-internal",
         "access-control-expose-headers"
     ],
-    exposedHeaders: ["x-payment-response", "x-session-id"]
+    exposedHeaders: ["PAYMENT-RESPONSE", "payment-response", "x-session-id"]
 }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -152,7 +153,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
 
     // Prepare payment context
     const paymentContext: PaymentContext = {
-        paymentData: req.headers["x-payment"] as string || null,
+        paymentData: req.headers["payment-signature"] as string || req.headers["PAYMENT-SIGNATURE"] as string || null,
         sessionActive: paymentInfo.sessionActive,
         sessionBudgetRemaining: paymentInfo.sessionBudgetRemaining,
         resourceUrlBase: `${req.protocol}://${req.get("host")}`,
@@ -320,7 +321,7 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
 
     // Prepare payment context
     const paymentContext: PaymentContext = {
-        paymentData: req.headers["x-payment"] as string || null,
+        paymentData: req.headers["payment-signature"] as string || req.headers["PAYMENT-SIGNATURE"] as string || null,
         sessionActive: paymentInfo.sessionActive,
         sessionBudgetRemaining: paymentInfo.sessionBudgetRemaining,
         resourceUrlBase: `${req.protocol}://${req.get("host")}`,

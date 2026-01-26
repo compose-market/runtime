@@ -409,7 +409,7 @@ export interface WorkflowExecutionState {
 // =============================================================================
 
 export interface PaymentContext {
-    /** x-payment header value from client */
+    /** PAYMENT-SIGNATURE header value from client (v2) */
     paymentData: string | null;
     /** Whether a session budget is active */
     sessionActive: boolean;

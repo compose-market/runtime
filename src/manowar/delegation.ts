@@ -83,7 +83,7 @@ export async function callAgent(
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                ...(options.paymentData && { "x-payment": options.paymentData }),
+                ...(options.paymentData && { "PAYMENT-SIGNATURE": options.paymentData }),
                 // Use internal secret to bypass payment for orchestrator-initiated calls
                 "x-manowar-internal": options.internalSecret || MANOWAR_INTERNAL_SECRET,
             },

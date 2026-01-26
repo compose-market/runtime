@@ -79,7 +79,7 @@ export interface X402Result {
 /**
  * Handle x402 payment verification and settlement
  * 
- * @param paymentData - The x-payment header value from client
+ * @param paymentData - The PAYMENT-SIGNATURE header value from client (v2)
  * @param resourceUrl - Full URL of the resource being accessed
  * @param method - HTTP method (GET, POST, etc.)
  * @param amountWei - Amount to charge in USDC wei (6 decimals)
@@ -163,7 +163,8 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
   sessionActive: boolean;
   sessionBudgetRemaining: number;
 } {
-  const paymentData = typeof headers["x-payment"] === "string" ? headers["x-payment"] : null;
+  const paymentData = typeof headers["payment-signature"] === "string" ? headers["payment-signature"] :
+    (typeof headers["PAYMENT-SIGNATURE"] === "string" ? headers["PAYMENT-SIGNATURE"] : null);
   const sessionActive = headers["x-session-active"] === "true";
   const sessionBudgetRemaining = parseInt(
     typeof headers["x-session-budget-remaining"] === "string"
@@ -198,14 +199,14 @@ export function buildPaymentRequiredHeaders(
   args: { pricing: { amount: string } }
 ): Record<string, string> {
   return {
-    "x-payment-required": "true",
-    "x-payment-method": details.method,
-    "x-payment-id": details.id,
-    "x-payment-network": details.network,
-    "x-payment-asset-address": details.assetAddress,
-    "x-payment-asset-symbol": details.assetSymbol,
-    "x-payment-payee": details.payee,
-    "x-payment-scheme": details.x402.scheme,
-    "x-payment-price-amount": args.pricing.amount,
+    "payment-required": "true",
+    "payment-method": details.method,
+    "payment-id": details.id,
+    "payment-network": details.network,
+    "payment-asset-address": details.assetAddress,
+    "payment-asset-symbol": details.assetSymbol,
+    "payment-payee": details.payee,
+    "payment-scheme": details.x402.scheme,
+    "payment-price-amount": args.pricing.amount,
   };
 }
