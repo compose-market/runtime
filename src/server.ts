@@ -42,15 +42,26 @@ app.use(cors({
     allowedHeaders: [
         "Content-Type",
         "Authorization",
-        "PAYMENT-SIGNATURE",
-        "payment-signature",
+        "PAYMENT-SIGNATURE",           // x402 V2 payment header (ThirdWeb)
+        "payment-signature",           // x402 V2 payment header (lowercase)
+        "X-PAYMENT",                   // x402 V1 payment header (Cronos)
+        "x-payment",                   // x402 V1 payment header (lowercase)
+        "X-CHAIN-ID",                  // Multichain support
         "x-session-user-address",
         "x-session-active",
         "x-session-budget-remaining",
         "x-manowar-internal",
+        "x-chain-id",
         "access-control-expose-headers"
     ],
-    exposedHeaders: ["PAYMENT-RESPONSE", "payment-response", "x-session-id"]
+    exposedHeaders: [
+        "*",                               // Expose ALL headers (required for ThirdWeb x402)
+        "PAYMENT-RESPONSE",            // x402 V2 response header
+        "payment-response",            // x402 V2 response header (lowercase)
+        "X-Transaction-Hash",          // Cronos settlement response
+        "X-PAYMENT-RESPONSE",          // Cronos payment response
+        "x-session-id"
+    ]
 }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -71,6 +82,14 @@ function asyncHandler(
     return (req: Request, res: Response, next: NextFunction) => {
         fn(req, res, next).catch(next);
     };
+}
+
+/**
+ * Helper to extract string from route params (Express v5 types them as string | string[])
+ */
+function getParam(value: string | string[] | undefined): string {
+    if (Array.isArray(value)) return value[0] || "";
+    return value || "";
 }
 
 // ============================================================================
@@ -96,15 +115,17 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
 app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) => {
     const { payload } = req.body;
 
-    // Extract payment info
+    // Extract payment info (includes chainId from X-CHAIN-ID header)
     const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
 
-    // Handle x402 payment
+    // Handle x402 payment with multichain support
     const paymentResult = await handleX402Payment(
         paymentInfo.paymentData,
         `${req.protocol}://${req.get("host")}${req.path}`,
         req.method,
-        DEFAULT_PRICES.WORKFLOW_RUN
+        DEFAULT_PRICES.WORKFLOW_RUN,
+        undefined, // internalSecret
+        paymentInfo.chainId,
     );
 
     if (paymentResult.status !== 200) {
@@ -252,9 +273,9 @@ app.get("/manowar", (_req: Request, res: Response) => {
 // ============================================================================
 
 app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: Response) => {
-    const identifier = req.params.walletAddress;
+    const identifier = getParam(req.params.walletAddress);
 
-    // x402 Payment Verification
+    // x402 Payment Verification (includes chainId from X-CHAIN-ID header)
     const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
     const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
@@ -264,7 +285,8 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
         resourceUrl,
         "POST",
         DEFAULT_PRICES.WORKFLOW_RUN,
-        internalSecret
+        internalSecret,
+        paymentInfo.chainId, // Multichain support
     );
 
     if (paymentResult.status !== 200) {

@@ -38,6 +38,14 @@ function asyncHandler(
     };
 }
 
+/**
+ * Helper to extract string from route params (Express v5 types them as string | string[])
+ */
+function getParam(value: string | string[] | undefined): string {
+    if (Array.isArray(value)) return value[0] || "";
+    return value || "";
+}
+
 // =============================================================================
 // Schemas
 // =============================================================================
@@ -182,7 +190,7 @@ router.get("/list", (_req: Request, res: Response) => {
 router.get(
     "/:walletAddress",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -226,7 +234,7 @@ const KnowledgeUploadSchema = z.object({
 router.post(
     "/:walletAddress/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -264,7 +272,7 @@ router.post(
 router.get(
     "/:walletAddress/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
         const agent = resolveAgent(identifier);
 
         if (!agent) {
@@ -294,22 +302,23 @@ router.get(
 router.post(
     "/:walletAddress/chat",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
 
         // x402 Payment Verification - always required, verified on-chain
         // For nested Manowar calls, x-manowar-internal header bypasses payment
-        const { paymentData } = extractPaymentInfo(
+        const paymentInfo = extractPaymentInfo(
             req.headers as Record<string, string | string[] | undefined>
         );
         const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
         const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
         const paymentResult = await handleX402Payment(
-            paymentData,
+            paymentInfo.paymentData,
             resourceUrl,
             "POST",
             DEFAULT_PRICES.AGENT_CHAT,
-            internalSecret // Pass internal secret for nested call bypass
+            internalSecret, // Pass internal secret for nested call bypass
+            paymentInfo.chainId, // Multichain support
         );
 
         if (paymentResult.status !== 200) {
@@ -432,19 +441,21 @@ router.post(
 router.post(
     "/:walletAddress/stream",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
 
-        // x402 Payment Verification - ALWAYS required, no session bypass
-        const { paymentData } = extractPaymentInfo(
+        // x402 Payment Verification - always required, no session bypass
+        const paymentInfo = extractPaymentInfo(
             req.headers as Record<string, string | string[] | undefined>
         );
 
         const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
         const paymentResult = await handleX402Payment(
-            paymentData,
+            paymentInfo.paymentData,
             resourceUrl,
             "POST",
-            DEFAULT_PRICES.AGENT_CHAT
+            DEFAULT_PRICES.AGENT_CHAT,
+            undefined, // internalSecret
+            paymentInfo.chainId, // Multichain support
         );
 
         if (paymentResult.status !== 200) {
@@ -527,19 +538,21 @@ router.post(
 router.post(
     "/:walletAddress/multimodal",
     asyncHandler(async (req: Request, res: Response) => {
-        const identifier = req.params.walletAddress;
+        const identifier = getParam(req.params.walletAddress);
 
         // x402 Payment Verification - always required, verified on-chain
-        const { paymentData } = extractPaymentInfo(
+        const paymentInfo = extractPaymentInfo(
             req.headers as Record<string, string | string[] | undefined>
         );
 
         const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
         const paymentResult = await handleX402Payment(
-            paymentData,
+            paymentInfo.paymentData,
             resourceUrl,
             "POST",
-            DEFAULT_PRICES.AGENT_CHAT // Same price as chat
+            DEFAULT_PRICES.AGENT_CHAT, // Same price as chat
+            undefined, // internalSecret
+            paymentInfo.chainId, // Multichain support
         );
 
         if (paymentResult.status !== 200) {

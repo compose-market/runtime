@@ -33,19 +33,22 @@ export function x402Middleware(options: {
             return next();
         }
 
-        // 1. Extract payment info from headers
+        // 1. Extract payment info from headers (includes chainId from X-CHAIN-ID)
         // NOTE: Server NEVER trusts client session headers. Always verify payment on-chain.
-        const { paymentData } = extractPaymentInfo(req.headers);
+        const paymentInfo = extractPaymentInfo(req.headers);
 
         // 2. If paymentData is present, we verify and settle it on-chain
-        if (paymentData) {
+        if (paymentInfo.paymentData) {
             try {
                 // Use the helper which handles facilitator and settlePayment correctly
+                // Pass chainId for multichain x402 support
                 const result = await handleX402Payment(
-                    paymentData,
+                    paymentInfo.paymentData,
                     req.protocol + "://" + req.get("host") + req.originalUrl,
                     req.method,
-                    options.pricing?.amount
+                    options.pricing?.amount,
+                    undefined, // internalSecret
+                    paymentInfo.chainId, // Multichain support
                 );
 
                 if (result.status === 200) {
