@@ -319,6 +319,7 @@ router.post(
             DEFAULT_PRICES.AGENT_CHAT,
             internalSecret, // Pass internal secret for nested call bypass
             paymentInfo.chainId, // Multichain support
+            paymentInfo.authHeader, // Compose Key authentication
         );
 
         if (paymentResult.status !== 200) {

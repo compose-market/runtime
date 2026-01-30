@@ -126,6 +126,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         DEFAULT_PRICES.WORKFLOW_RUN,
         undefined, // internalSecret
         paymentInfo.chainId,
+        paymentInfo.authHeader, // Compose Key authentication
     );
 
     if (paymentResult.status !== 200) {
@@ -287,6 +288,7 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
         DEFAULT_PRICES.WORKFLOW_RUN,
         internalSecret,
         paymentInfo.chainId, // Multichain support
+        paymentInfo.authHeader, // Compose Key authentication
     );
 
     if (paymentResult.status !== 200) {

@@ -258,13 +258,66 @@ const thirdwebFacilitator = serverClient && SERVER_WALLET_ADDRESS
 // =============================================================================
 
 export const DEFAULT_PRICES = {
-  MCP_TOOL_CALL: "1000",        // $0.001
-  GOAT_EXECUTE: "1000",         // $0.001  
-  ELIZA_MESSAGE: "1000",        // $0.001
-  ELIZA_ACTION: "2000",         // $0.002
-  WORKFLOW_RUN: "10000",        // $0.01
-  AGENT_CHAT: "5000",           // $0.005
+  MCP_TOOL_CALL: "10000",        // $0.01
+  GOAT_EXECUTE: "10000",         // $0.01  
+  ELIZA_MESSAGE: "10000",        // $0.01
+  ELIZA_ACTION: "10000",         // $0.01
+  WORKFLOW_RUN: "100000",        // $0.1
+  AGENT_CHAT: "50000",           // $0.05
 } as const;
+
+// =============================================================================
+// Compose Key Settlement via Lambda
+// =============================================================================
+
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+/**
+ * Settle payment via Lambda's Compose Key endpoint
+ * Used for session-based payments where frontend provides Authorization: Bearer compose-xxx
+ */
+async function settleViaLambda(authHeader: string, amountWei: string): Promise<X402Result> {
+  console.log(`[x402] Settling via Lambda Compose Keys for amount ${amountWei}...`);
+
+  try {
+    const response = await fetch(`${LAMBDA_API_URL}/api/keys/settle`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": authHeader,
+      },
+      body: JSON.stringify({ amount: amountWei }),
+    });
+
+    const result = await response.json();
+
+    if (response.ok) {
+      console.log(`[x402] Compose Key settlement successful: tx=${result.txHash}`);
+      return {
+        status: 200,
+        responseBody: result,
+        responseHeaders: {
+          "x-compose-key-budget-remaining": String(result.budgetRemaining || 0),
+          "X-Transaction-Hash": result.txHash || "",
+        },
+      };
+    }
+
+    console.log(`[x402] Compose Key settlement failed: ${result.error}`);
+    return {
+      status: response.status,
+      responseBody: result,
+      responseHeaders: {},
+    };
+  } catch (error) {
+    console.error(`[x402] Compose Key settlement error:`, error);
+    return {
+      status: 500,
+      responseBody: { error: error instanceof Error ? error.message : String(error) },
+      responseHeaders: {},
+    };
+  }
+}
 
 // =============================================================================
 // Payment Handler
@@ -297,6 +350,7 @@ export async function handleX402Payment(
   amountWei: string = DEFAULT_PRICES.MCP_TOOL_CALL,
   internalSecret?: string,
   chainId?: number,
+  authHeader?: string,
 ): Promise<X402Result> {
   // Check for internal Manowar bypass (nested calls within workflow execution)
   if (internalSecret === MANOWAR_INTERNAL_SECRET) {
@@ -306,6 +360,12 @@ export async function handleX402Payment(
       responseBody: { success: true, internal: true },
       responseHeaders: {},
     };
+  }
+
+  // Compose Key flow - delegate to Lambda for on-chain settlement
+  if (authHeader?.startsWith("Bearer compose-")) {
+    console.log(`[x402] Compose Key detected, delegating to Lambda for settlement`);
+    return settleViaLambda(authHeader, amountWei);
   }
 
   // Default chain if not specified (Cronos Testnet for x402 payments)
@@ -448,6 +508,7 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
   sessionActive: boolean;
   sessionBudgetRemaining: number;
   chainId: number | undefined;
+  authHeader: string | undefined;
 } {
   // Check ThirdWeb format (PAYMENT-SIGNATURE)
   let paymentData = typeof headers["payment-signature"] === "string" ? headers["payment-signature"] :
@@ -472,11 +533,15 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
   console.log(`[x402] extractPaymentInfo: x-chain-id header = "${chainIdHeader}"`);
   const chainId = typeof chainIdHeader === "string" ? parseInt(chainIdHeader, 10) : undefined;
 
+  // Extract Authorization header for Compose Key authentication
+  const authHeader = typeof headers["authorization"] === "string" ? headers["authorization"] : undefined;
+
   return {
     paymentData,
     sessionActive,
     sessionBudgetRemaining,
     chainId: chainId && !isNaN(chainId) ? chainId : undefined,
+    authHeader,
   };
 }
 
