@@ -49,6 +49,7 @@ export function x402Middleware(options: {
                     options.pricing?.amount,
                     undefined, // internalSecret
                     paymentInfo.chainId, // Multichain support
+                    paymentInfo.authHeader, // Compose Key authentication
                 );
 
                 if (result.status === 200) {

@@ -457,6 +457,7 @@ router.post(
             DEFAULT_PRICES.AGENT_CHAT,
             undefined, // internalSecret
             paymentInfo.chainId, // Multichain support
+            paymentInfo.authHeader, // Compose Key authentication
         );
 
         if (paymentResult.status !== 200) {
@@ -554,6 +555,7 @@ router.post(
             DEFAULT_PRICES.AGENT_CHAT, // Same price as chat
             undefined, // internalSecret
             paymentInfo.chainId, // Multichain support
+            paymentInfo.authHeader, // Compose Key authentication
         );
 
         if (paymentResult.status !== 200) {
