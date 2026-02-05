@@ -14,7 +14,7 @@ module.exports = {
         {
             name: "manowar",
             script: "dist/server.js",
-            cwd: "/home/ubuntu/manowar",
+            cwd: "/home/alex/manowar",
             instances: 1,
             autorestart: true,
             watch: false,
@@ -22,8 +22,8 @@ module.exports = {
             env: {
                 NODE_ENV: "production",
             },
-            error_file: "/home/ubuntu/logs/manowar-error.log",
-            out_file: "/home/ubuntu/logs/manowar-out.log",
+            error_file: "/home/alex/logs/manowar-error.log",
+            out_file: "/home/alex/logs/manowar-out.log",
             log_date_format: "YYYY-MM-DD HH:mm:ss Z",
         },
     ],
