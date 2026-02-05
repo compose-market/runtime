@@ -10,7 +10,7 @@ import type { ComposeTool } from "../types.js";
 import type { AgentWallet } from "../agent-wallet.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
-const MCP_SERVICE_URL = process.env.MCP_SERVICE_URL || "https://mcp.compose.market";
+const RUNTIME_SERVICE_URL = process.env.RUNTIME_SERVICE_URL || "https://runtime.compose.market";
 
 // =============================================================================
 // Failed Tool Tracking
@@ -201,8 +201,8 @@ export async function createAgentTools(
             console.log(`[createAgentTools] Normalized "${pluginId}" → source="${source}", id="${id}"`);
 
             if (source === "goat") {
-                // Fetch GOAT plugin tools from MCP service
-                const response = await fetch(`${MCP_SERVICE_URL}/goat/plugins/${id}`);
+                // Fetch GOAT plugin tools from MCP server
+                const response = await fetch(`${RUNTIME_SERVICE_URL}/goat/plugins/${id}`);
                 if (!response.ok) {
                     console.warn(`[createAgentTools] GOAT plugin ${id} not found`);
                     continue;
@@ -237,7 +237,7 @@ export async function createAgentTools(
                             headers["x-tool-price"] = "1000"; // $0.001 default
 
                             const execResponse = await fetch(
-                                `${MCP_SERVICE_URL}/goat/plugins/${id}/tools/${toolDef.name}`,
+                                `${RUNTIME_SERVICE_URL}/goat/plugins/${id}/tools/${toolDef.name}`,
                                 {
                                     method: "POST",
                                     headers,
@@ -267,7 +267,7 @@ export async function createAgentTools(
 
                 let response: Response;
                 try {
-                    response = await fetch(`${MCP_SERVICE_URL}/mcp/servers/${id}/tools`, {
+                    response = await fetch(`${RUNTIME_SERVICE_URL}/mcp/servers/${id}/tools`, {
                         signal: controller.signal
                     });
                 } catch (err: any) {
@@ -348,7 +348,7 @@ export async function createAgentTools(
 
                         try {
                             const execResponse = await fetch(
-                                `${MCP_SERVICE_URL}/mcp/servers/${id}/tools/${input.tool}`,
+                                `${RUNTIME_SERVICE_URL}/mcp/servers/${id}/tools/${input.tool}`,
                                 {
                                     method: "POST",
                                     headers,
