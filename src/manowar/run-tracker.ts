@@ -6,18 +6,15 @@
  * - Trigger-based execution tracking
  * - Cron job execution history
  * 
- * Works alongside triggers.ts for scheduled execution tracking.
+ * Uses langsmith.ts for all LangSmith SDK operations (centralized).
  */
 
-import { Client as LangSmithClient } from "langsmith";
-import type { Run } from "langsmith/schemas";
-
-// =============================================================================
-// Configuration
-// =============================================================================
-
-const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY;
-const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "compose-manowar";
+import {
+    isLangSmithEnabled,
+    fetchLangSmithRuns as fetchRuns,
+    getLangSmithRun as getRemoteRun,
+    type Run,
+} from "./langsmith.js";
 
 // =============================================================================
 // Types
@@ -70,27 +67,14 @@ const runsByWorkflow = new Map<string, Set<string>>();
 const MAX_RUNS_PER_WORKFLOW = 100;
 
 // =============================================================================
-// LangSmith Client
+// LangSmith Integration (via langsmith.ts)
 // =============================================================================
-
-let langsmithClient: LangSmithClient | null = null;
-
-function getLangSmithClient(): LangSmithClient | null {
-    if (!LANGSMITH_API_KEY) return null;
-
-    if (!langsmithClient) {
-        langsmithClient = new LangSmithClient({
-            apiKey: LANGSMITH_API_KEY,
-        });
-    }
-    return langsmithClient;
-}
 
 /**
  * Check if LangSmith is available
  */
 export function isLangSmithAvailable(): boolean {
-    return !!LANGSMITH_API_KEY;
+    return isLangSmithEnabled();
 }
 
 // =============================================================================
@@ -308,51 +292,26 @@ export function getRunStats(workflowId: string): {
 }
 
 // =============================================================================
-// LangSmith Integration
+// LangSmith Integration (delegated to langsmith.ts)
 // =============================================================================
 
 /**
  * Fetch runs from LangSmith for a project
+ * @deprecated Use fetchLangSmithRuns from langsmith.ts directly
  */
 export async function fetchLangSmithRuns(params: {
     limit?: number;
     projectName?: string;
 }): Promise<Run[]> {
-    const client = getLangSmithClient();
-    if (!client) return [];
-
-    try {
-        const runs: Run[] = [];
-        const iterator = client.listRuns({
-            projectName: params.projectName || LANGSMITH_PROJECT,
-            limit: params.limit || 50,
-        });
-
-        for await (const run of iterator) {
-            runs.push(run);
-            if (runs.length >= (params.limit || 50)) break;
-        }
-
-        return runs;
-    } catch (error) {
-        console.error("[RunTracker] Failed to fetch LangSmith runs:", error);
-        return [];
-    }
+    return fetchRuns(params);
 }
 
 /**
  * Get LangSmith run details
+ * @deprecated Use getLangSmithRun from langsmith.ts directly
  */
 export async function getLangSmithRun(runId: string): Promise<Run | null> {
-    const client = getLangSmithClient();
-    if (!client) return null;
-
-    try {
-        return await client.readRun(runId);
-    } catch (error) {
-        console.error("[RunTracker] Failed to get LangSmith run:", error);
-        return null;
-    }
+    return getRemoteRun(runId);
 }
 
 // =============================================================================

@@ -4,14 +4,21 @@
  * Provides ephemeral checkpoints for internal agents to:
  * 1. Maintain context between steps
  * 2. Share experiences between manowars/executions
- * 3. Store cleaned, embeddable data for Mem0
+ * 3. Persist to LangSmith feedback (primary) and Mem0 (fallback)
  * 
  * Checkpoints are stored in-memory for the current run,
- * then summarized and embedded to Mem0 for persistence.
+ * then persisted to LangSmith feedback and/or Mem0.
  */
 
 import { searchByEmbedding } from "./embeddings.js";
 import { addMemoryWithGraph } from "./memory.js";
+import {
+    isLangSmithEnabled,
+    recordInsightFeedback,
+    recordDecisionFeedback,
+    recordQualityScore,
+    recordErrorFeedback,
+} from "./langsmith.js";
 
 // =============================================================================
 // Types
@@ -137,19 +144,64 @@ export function summarizeCheckpoints(runId: string): CheckpointSummary {
 }
 
 /**
- * Persist checkpoints to Mem0 (called at end of workflow)
+ * Persist checkpoints to LangSmith feedback (primary) and Mem0 (fallback)
  * 
- * Stores a clean, embedded summary for graph retrieval
+ * When langsmithRunId is provided, stores feedback directly on the run.
+ * Always stores to Mem0 for graph retrieval and long-term persistence.
  */
 export async function persistCheckpoints(
     runId: string,
-    manowarWallet: string
+    manowarWallet: string,
+    langsmithRunId?: string
 ): Promise<string | null> {
     const summary = summarizeCheckpoints(runId);
 
     if (summary.totalCheckpoints === 0) {
         return null;
     }
+
+    const checkpoints = getCheckpoints(runId);
+
+    // =========================================================================
+    // LangSmith Feedback (primary - when langsmithRunId available)
+    // =========================================================================
+    if (langsmithRunId && isLangSmithEnabled()) {
+        console.log(`[checkpoint] Persisting ${summary.totalCheckpoints} checkpoints to LangSmith`);
+
+        for (const cp of checkpoints) {
+            switch (cp.type) {
+                case "insight":
+                    await recordInsightFeedback(langsmithRunId, cp.content, cp.agentId);
+                    break;
+                case "decision":
+                    await recordDecisionFeedback(
+                        langsmithRunId,
+                        cp.content,
+                        (cp.metadata?.reasoning as string) || undefined
+                    );
+                    break;
+                case "error":
+                    await recordErrorFeedback(langsmithRunId, cp.content, cp.agentId);
+                    break;
+                default:
+                    // observations and outputs don't need feedback
+                    break;
+            }
+        }
+
+        // Record overall quality score for the run
+        const errorRate = summary.errors.length / summary.totalCheckpoints;
+        const qualityScore = Math.max(0, 1 - errorRate);
+        await recordQualityScore(
+            langsmithRunId,
+            qualityScore,
+            `${summary.agents.length} agents, ${summary.insights.length} insights, ${summary.errors.length} errors`
+        );
+    }
+
+    // =========================================================================
+    // Mem0 Persistence (fallback - always for graph retrieval)
+    // =========================================================================
 
     // Build embeddable content
     const content = [
@@ -179,6 +231,7 @@ export async function persistCheckpoints(
             checkpoint_count: summary.totalCheckpoints,
             agent_count: summary.agents.length,
             has_errors: summary.errors.length > 0,
+            langsmith_run_id: langsmithRunId,
         },
     });
 
