@@ -8,8 +8,9 @@
  * a simpler embeddings-based approach as recommended in suggestions.md.
  */
 
+import { addMemoryWithGraph, searchMemoryWithGraph } from "./memory.js";
+
 const MEM0_API_KEY = process.env.MEM0_API_KEY;
-const MEM0_API_URL = "https://api.mem0.ai/v1";
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 
 // Embedding model from user specification
@@ -78,34 +79,17 @@ export async function storeEmbedding(
     }
 
     try {
-        const response = await fetch(`${MEM0_API_URL}/memories/`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Token ${MEM0_API_KEY}`,
+        const memories = await addMemoryWithGraph({
+            messages: [{ role: "assistant", content }],
+            agent_id: workflowId,
+            run_id: String(metadata?.run_id || "unknown"),
+            metadata: {
+                ...metadata,
+                timestamp: Date.now(),
+                embedding_model: EMBEDDING_MODEL,
             },
-            body: JSON.stringify({
-                messages: [
-                    { role: "assistant", content },
-                ],
-                agent_id: workflowId,
-                metadata: {
-                    ...metadata,
-                    timestamp: Date.now(),
-                    embedding_model: EMBEDDING_MODEL,
-                },
-                enable_graph: true,
-            }),
         });
-
-        if (!response.ok) {
-            console.error(`[embeddings] Store failed: ${response.status}`);
-            return null;
-        }
-
-        const result = await response.json();
-        const memories = Array.isArray(result) ? result : [result];
-        return memories[0]?.id || null;
+        return memories?.[0]?.id || null;
     } catch (error) {
         console.error("[embeddings] Store error:", error);
         return null;
@@ -126,32 +110,18 @@ export async function searchByEmbedding(
     }
 
     try {
-        const response = await fetch(`${MEM0_API_URL}/memories/search/`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Token ${MEM0_API_KEY}`,
-            },
-            body: JSON.stringify({
-                query,
-                agent_id: workflowId,
-                limit,
-                // Mem0 advanced retrieval features
+        const results = await searchMemoryWithGraph({
+            query,
+            agent_id: workflowId,
+            limit,
+            options: {
                 rerank: true,
                 keyword_search: true,
                 filter_memories: true,
-            }),
+            },
         });
 
-        if (!response.ok) {
-            console.error(`[embeddings] Search failed: ${response.status}`);
-            return [];
-        }
-
-        const data = await response.json();
-        const memories = data.memories || data.results || [];
-
-        return memories.map((m: any) => ({
+        return results.memories.map((m: any) => ({
             id: m.id,
             content: m.memory || m.content || "",
             score: m.score || m.relevance_score || 0,
@@ -190,11 +160,13 @@ export async function recordConversationTurn(
     workflowId: string,
     role: "user" | "assistant",
     content: string,
-    stepNumber?: number
+    stepNumber?: number,
+    runId?: string
 ): Promise<void> {
     await storeEmbedding(workflowId, content, {
         role,
         step_number: stepNumber,
         type: "conversation_turn",
+        run_id: runId,
     });
 }

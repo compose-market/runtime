@@ -30,6 +30,50 @@ export function isMem0Available(): boolean {
 }
 
 // =============================================================================
+// Centralized Mem0 API Fetch Helper
+// =============================================================================
+
+/**
+ * Centralized fetch wrapper for all Mem0 Platform API calls.
+ * Reduces boilerplate and ensures consistent error handling.
+ * 
+ * @param endpoint - API endpoint (e.g., "/memories/", "/memories/search/")
+ * @param method - HTTP method
+ * @param body - Request body (for POST/PUT)
+ */
+async function mem0Fetch<T>(
+    endpoint: string,
+    method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
+    body?: object
+): Promise<T | null> {
+    if (!MEM0_API_KEY) return null;
+
+    try {
+        const options: RequestInit = {
+            method,
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Token ${MEM0_API_KEY}`,
+            },
+        };
+        if (body && method !== "GET") {
+            options.body = JSON.stringify(body);
+        }
+
+        const response = await fetch(`${MEM0_API_URL}${endpoint}`, options);
+        if (!response.ok) {
+            console.error(`[mem0] ${method} ${endpoint} failed: ${response.status}`);
+            return null;
+        }
+        return await response.json() as T;
+    } catch (error) {
+        console.error(`[mem0] ${method} ${endpoint} error:`, error);
+        return null;
+    }
+}
+
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -102,43 +146,21 @@ export async function addMemoryWithGraph(params: {
     run_id: string;
     metadata?: Record<string, unknown>;
 }): Promise<MemoryItem[]> {
-    if (!MEM0_API_KEY) {
-        console.warn("[mem0] API key not configured, skipping memory add");
-        return [];
-    }
+    const result = await mem0Fetch<MemoryItem[] | { memories: MemoryItem[] }>("/memories/", "POST", {
+        messages: params.messages,
+        user_id: params.user_id,       // Priority 1
+        agent_id: params.agent_id,     // Priority 2
+        run_id: params.run_id,         // Priority 3
+        metadata: {
+            ...params.metadata,
+            run_id: params.run_id,
+            timestamp: Date.now(),
+        },
+        enable_graph: true,
+    });
 
-    try {
-        const response = await fetch(`${MEM0_API_URL}/memories/`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Token ${MEM0_API_KEY}`,
-            },
-            body: JSON.stringify({
-                messages: params.messages,
-                user_id: params.user_id,       // Priority 1
-                agent_id: params.agent_id,     // Priority 2
-                run_id: params.run_id,         // Priority 3
-                metadata: {
-                    ...params.metadata,
-                    run_id: params.run_id,
-                    timestamp: Date.now(),
-                },
-                enable_graph: true,
-            }),
-        });
-
-        if (!response.ok) {
-            console.error(`[mem0] Add failed: ${response.status}`);
-            return [];
-        }
-
-        const result = await response.json();
-        return Array.isArray(result) ? result : result.memories || [result];
-    } catch (error) {
-        console.error("[mem0] Failed to add memory:", error);
-        return [];
-    }
+    if (!result) return [];
+    return Array.isArray(result) ? result : result.memories || [];
 }
 
 /**
@@ -158,52 +180,32 @@ export async function searchMemoryWithGraph(params: {
         keyword_search?: boolean;
     };
 }): Promise<GraphMemoryResult> {
-    if (!MEM0_API_KEY) {
-        return { memories: [], entities: [], relations: [] };
+    // Build V2 filters with priority
+    const filterConditions: unknown[] = [];
+    if (params.agent_id) filterConditions.push({ agent_id: params.agent_id });
+    if (params.user_id) filterConditions.push({ user_id: params.user_id });
+    if (params.run_id) filterConditions.push({ run_id: params.run_id });
+
+    const data = await mem0Fetch<{ memories?: MemoryItem[]; results?: MemoryItem[]; entities?: GraphMemoryResult['entities']; relations?: GraphMemoryResult['relations'] }>(
+        "/memories/search/", "POST", {
+        query: params.query,
+        agent_id: params.agent_id,
+        user_id: params.user_id,
+        limit: params.limit || 10,
+        filters: filterConditions.length > 0 ? { AND: filterConditions } : params.filters,
+        enable_graph: true,
+        rerank: params.options?.rerank ?? true,
+        keyword_search: params.options?.keyword_search ?? true,
+        filter_memories: params.options?.filter_memories ?? true,
     }
+    );
 
-    try {
-        // Build V2 filters with priority
-        const filterConditions: unknown[] = [];
-        if (params.agent_id) filterConditions.push({ agent_id: params.agent_id });
-        if (params.user_id) filterConditions.push({ user_id: params.user_id });
-        if (params.run_id) filterConditions.push({ run_id: params.run_id });
-
-        const response = await fetch(`${MEM0_API_URL}/memories/search/`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Token ${MEM0_API_KEY}`,
-            },
-            body: JSON.stringify({
-                query: params.query,
-                agent_id: params.agent_id,
-                user_id: params.user_id,
-                limit: params.limit || 10,
-                filters: filterConditions.length > 0 ? { AND: filterConditions } : params.filters,
-                enable_graph: true,
-                // Advanced retrieval options - all passed to Mem0 API
-                rerank: params.options?.rerank ?? true,
-                keyword_search: params.options?.keyword_search ?? true,
-                filter_memories: params.options?.filter_memories ?? true,
-            }),
-        });
-
-        if (!response.ok) {
-            console.error(`[mem0] Search failed: ${response.status}`);
-            return { memories: [], entities: [], relations: [] };
-        }
-
-        const data = await response.json();
-        return {
-            memories: data.memories || data.results || (Array.isArray(data) ? data : []),
-            entities: data.entities || [],
-            relations: data.relations || [],
-        };
-    } catch (error) {
-        console.error("[mem0] Failed to search memory:", error);
-        return { memories: [], entities: [], relations: [] };
-    }
+    if (!data) return { memories: [], entities: [], relations: [] };
+    return {
+        memories: data.memories || data.results || [],
+        entities: data.entities || [],
+        relations: data.relations || [],
+    };
 }
 
 /**
@@ -214,26 +216,15 @@ export async function getAllMemories(params: {
     user_id?: string;
     run_id?: string;
 }): Promise<MemoryItem[]> {
-    if (!MEM0_API_KEY) return [];
+    // Build query string for GET request
+    const queryParams = new URLSearchParams();
+    if (params.agent_id) queryParams.set("agent_id", params.agent_id);
+    if (params.user_id) queryParams.set("user_id", params.user_id);
 
-    try {
-        const url = new URL(`${MEM0_API_URL}/memories/`);
-        if (params.agent_id) url.searchParams.set("agent_id", params.agent_id);
-        if (params.user_id) url.searchParams.set("user_id", params.user_id);
-
-        const response = await fetch(url.toString(), {
-            method: "GET",
-            headers: {
-                "Authorization": `Token ${MEM0_API_KEY}`,
-            },
-        });
-
-        if (!response.ok) return [];
-        const data = await response.json();
-        return data.memories || data.results || [];
-    } catch {
-        return [];
-    }
+    const data = await mem0Fetch<{ memories?: MemoryItem[]; results?: MemoryItem[] }>(
+        `/memories/?${queryParams.toString()}`, "GET"
+    );
+    return data?.memories || data?.results || [];
 }
 
 // =============================================================================
@@ -594,3 +585,212 @@ Respond with JSON: {"summary": "...", "keyFacts": ["...", "..."]}`;
         return null;
     }
 }
+
+/**
+ * Execution learning from past runs
+ */
+export interface ExecutionLearning {
+    step: number;
+    agent: string;
+    task: string;
+    qualityScore: number;
+    learnings: string[];
+    tokenEfficiency: number;
+    hasErrors: boolean;
+    runId: string;
+    timestamp: number;
+}
+
+/**
+ * Advanced memory search with full Mem0 Platform features.
+ * Exposes threshold, top_k, and enable_graph toggle for performance tuning.
+ * 
+ * @param params - Search parameters with advanced options
+ */
+export async function searchMemoryAdvanced(params: {
+    query: string;
+    agent_id: string;
+    user_id?: string;
+    run_id?: string;
+    /** Minimum similarity score (0-1), memories below this are excluded */
+    threshold?: number;
+    /** Number of results to return (replaces limit) */
+    top_k?: number;
+    /** Toggle reranking per request for precision vs speed */
+    rerank?: boolean;
+    /** Toggle graph memory per request for performance */
+    enable_graph?: boolean;
+    /** V2 filters with AND/OR/NOT and operators (gt, lt, in, contains, etc.) */
+    filters?: {
+        AND?: Array<Record<string, unknown>>;
+        OR?: Array<Record<string, unknown>>;
+        NOT?: Array<Record<string, unknown>>;
+        [key: string]: unknown;
+    };
+}): Promise<GraphMemoryResult> {
+    if (!MEM0_API_KEY) {
+        return { memories: [], entities: [], relations: [] };
+    }
+
+    try {
+        const response = await fetch(`${MEM0_API_URL}/memories/search/`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Token ${MEM0_API_KEY}`,
+            },
+            body: JSON.stringify({
+                query: params.query,
+                agent_id: params.agent_id,
+                user_id: params.user_id,
+                run_id: params.run_id,
+                // Advanced parameters
+                limit: params.top_k || 10,
+                threshold: params.threshold,
+                rerank: params.rerank ?? true,
+                enable_graph: params.enable_graph ?? true,
+                keyword_search: true,
+                filter_memories: true,
+                // V2 filter syntax
+                filters: params.filters,
+            }),
+        });
+
+        if (!response.ok) {
+            console.error(`[mem0] Advanced search failed: ${response.status}`);
+            return { memories: [], entities: [], relations: [] };
+        }
+
+        const data = await response.json();
+        return {
+            memories: data.memories || data.results || (Array.isArray(data) ? data : []),
+            entities: data.entities || [],
+            relations: data.relations || [],
+        };
+    } catch (error) {
+        console.error("[mem0] Advanced search failed:", error);
+        return { memories: [], entities: [], relations: [] };
+    }
+}
+
+/**
+ * Get execution learnings for a specific agent or task type from past runs.
+ * Uses Mem0's V2 metadata filtering instead of parsing JSON from text.
+ * 
+ * @param agentId - The manowar wallet address (agent_id for Mem0)
+ * @param query - Description of the current task for semantic matching
+ * @param options - Filter options (agentName, successOnly, limit)
+ */
+export async function getExecutionLearnings(
+    agentId: string,
+    query: string,
+    options?: {
+        agentName?: string;
+        successOnly?: boolean;
+        limit?: number;
+    }
+): Promise<ExecutionLearning[]> {
+    // Build V2 filters using proper metadata operators
+    const filterConditions: Array<Record<string, unknown>> = [
+        { "metadata.type": { eq: "execution_learning" } },
+    ];
+
+    // Filter by agent name using metadata
+    if (options?.agentName) {
+        filterConditions.push({ "metadata.agent": { eq: options.agentName } });
+    }
+
+    // Filter by quality score for success-only queries
+    if (options?.successOnly) {
+        filterConditions.push({ "metadata.quality": { gte: 7 } });
+        filterConditions.push({ "metadata.hasErrors": { eq: false } });
+    }
+
+    // Use advanced search with proper V2 filters
+    const result = await searchMemoryAdvanced({
+        query: `execution learning ${query}`,
+        agent_id: agentId,
+        top_k: options?.limit || 10,
+        rerank: true,
+        enable_graph: false, // Performance: skip graph for execution queries
+        filters: { AND: filterConditions },
+    });
+
+    // Map memory items to ExecutionLearning type using metadata
+    // Mem0 stores metadata directly - no need to parse JSON from text
+    return result.memories.map(mem => ({
+        step: (mem.metadata?.step as number) || 0,
+        agent: (mem.metadata?.agent as string) || "unknown",
+        task: mem.memory || "",
+        qualityScore: (mem.metadata?.quality as number) || 0,
+        learnings: [], // Learnings are in graph relations, not parsed from text
+        tokenEfficiency: (mem.metadata?.tokenEfficiency as number) ?? 1,
+        hasErrors: (mem.metadata?.hasErrors as boolean) ?? false,
+        runId: mem.run_id || "",
+        timestamp: mem.created_at ? new Date(mem.created_at).getTime() : Date.now(),
+    }));
+}
+
+/**
+ * Get memories related to a specific entity via graph relations.
+ * Uses Mem0's graph memory to traverse entity relationships.
+ * 
+ * @param entityName - Name of the entity to find relations for
+ * @param relation - Type of relation to follow (e.g., "used", "created", "depends_on")
+ * @param agent_id - Manowar wallet address for scoping
+ */
+export async function getRelatedMemories(
+    entityName: string,
+    relation: string,
+    agent_id: string
+): Promise<MemoryItem[]> {
+    // Search with entity name and enable graph for relation extraction
+    const result = await searchMemoryAdvanced({
+        query: entityName,
+        agent_id,
+        enable_graph: true,
+        rerank: true,
+        top_k: 20,
+    });
+
+    // Filter to memories that have the specified relation
+    return result.memories.filter(mem => {
+        const relations = mem.relations || [];
+        return relations.some(
+            r => (r.source === entityName || r.target === entityName) &&
+                r.relation.toLowerCase().includes(relation.toLowerCase())
+        );
+    });
+}
+
+/**
+ * Get agent reliability score based on past execution learnings.
+ * Uses proper Mem0 metadata filtering for accurate statistics.
+ */
+export async function getAgentReliability(
+    manowarWallet: string,
+    agentName: string
+): Promise<{ avgQuality: number; successRate: number; avgTokenEfficiency: number; totalRuns: number }> {
+    const learnings = await getExecutionLearnings(manowarWallet, agentName, {
+        agentName,
+        limit: 50,
+    });
+
+    if (learnings.length === 0) {
+        // Return optimistic defaults for new agents
+        return { avgQuality: 7, successRate: 0.8, avgTokenEfficiency: 1, totalRuns: 0 };
+    }
+
+    const totalRuns = learnings.length;
+    const avgQuality = learnings.reduce((sum, l) => sum + l.qualityScore, 0) / totalRuns;
+    const successCount = learnings.filter(l => l.qualityScore >= 7 && !l.hasErrors).length;
+    const successRate = successCount / totalRuns;
+    const avgTokenEfficiency = learnings.reduce((sum, l) => sum + l.tokenEfficiency, 0) / totalRuns;
+
+    return { avgQuality, successRate, avgTokenEfficiency, totalRuns };
+}
+
+// Mem0 automatically extracts entities and facts when enable_graph: true.
+// Use custom_prompt in addMemoryWithGraph() to customize extraction behavior.
+
+
