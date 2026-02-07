@@ -56,6 +56,8 @@ interface ServerSpawnConfig {
   env?: Record<string, string>;
   image?: string;
   remoteUrl?: string;
+  /** Protocol hint for HTTP transport: "sse" or "streamable-http" */
+  protocol?: "sse" | "streamable-http";
   package?: string;
 }
 
@@ -131,7 +133,10 @@ export class McpRuntime {
       if (!config.remoteUrl) {
         throw new Error("remoteUrl required for HTTP transport");
       }
-      transport = new HttpSseClientTransport({ baseUrl: config.remoteUrl });
+      transport = new HttpSseClientTransport({
+        baseUrl: config.remoteUrl,
+        protocol: config.protocol,
+      });
       transportType = "http";
     } else if (config.transport === "docker") {
       if (!config.image) {
