@@ -8,14 +8,56 @@
 // Core types
 export * from "./types.js";
 
-// State management
-export * from "./state.js";
-
-// Token tracking (LangSmith integration)
-export * from "./langsmith.js";
+// Token tracking & LangSmith Observability Hub
+export {
+    // Token extraction
+    extractTokens,
+    extractTokensFromResult,
+    extractTokenUsage,
+    estimateCost,
+    LangSmithTokenTracker,
+    type ExtractedTokens,
+    type ExtractedUsage,
+    type TokenLedgerInterface,
+    // Configuration
+    createLangSmithConfig,
+    isLangSmithEnabled,
+    // SDK Client
+    getLangSmithClient,
+    type Run,
+    type LangSmithFeedback,
+    // Run Tracking
+    fetchLangSmithRuns as fetchRemoteLangSmithRuns,
+    getLangSmithRun as getRemoteLangSmithRun,
+    // Feedback/Annotations
+    recordFeedback,
+    getRunFeedback,
+    recordInsightFeedback,
+    recordDecisionFeedback,
+    recordQualityScore,
+    recordErrorFeedback,
+    type FeedbackOptions,
+    // Dataset Integration
+    recordLearning,
+    getRelevantLearnings,
+} from "./langsmith.js";
 
 // Memory (Mem0 Graph integration)
 export * from "./memory.js";
+
+/**
+ * Validate required environment variables for Manowar.
+ * Call during app initialization for early warning of missing config.
+ */
+export function validateEnv(): { valid: boolean; missing: string[] } {
+    const required = ["MEM0_API_KEY", "LANGSMITH_API_KEY"];
+    const missing = required.filter(k => !process.env[k]);
+    if (missing.length > 0) {
+        console.warn(`[manowar] Missing required env vars: ${missing.join(", ")}`);
+    }
+    return { valid: missing.length === 0, missing };
+}
+
 
 // Context management
 export {
@@ -90,24 +132,6 @@ export {
     type ReviewerSuggestions,
 } from "./planner.js";
 
-// Structured Task Contracts
-export {
-    TaskContractBuilder,
-    generateStructuredPrompt,
-    parseAgentOutput,
-    summarizeOutput,
-    createContractFromStep,
-    createResearchContract,
-    createImplementationContract,
-    createDesignContract,
-    BaseTaskContractSchema,
-    ContextualTaskContractSchema,
-    AgentOutputSchema,
-    type BaseTaskContract,
-    type ContextualTaskContract,
-    type AgentOutput,
-} from "./task-contracts.js";
-
 // Embeddings
 export {
     computeEmbedding,
@@ -123,7 +147,6 @@ export {
 export {
     callAgent,
     delegatePlanStep,
-    isAgentAvailable,
     type DelegationResult,
     type DelegationOptions,
 } from "./delegation.js";

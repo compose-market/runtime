@@ -490,6 +490,20 @@ export interface ExecutorOptions {
     manowarCardUri?: string;
     /** Attachment URL (image, document, etc.) to include in context */
     attachmentUrl?: string;
+    /** Whether to synthesize final response using coordinator model */
+    synthesizeFinal?: boolean;
+    /** Allow replanning on invalid plans or failed steps */
+    replanOnFailure?: boolean;
+    /** Maximum number of plan iterations (default 2) */
+    maxPlanIterations?: number;
+    /** Enable continuous/looping execution */
+    continuous?: boolean;
+    /** Maximum number of continuous loop iterations (default 3) */
+    maxLoopIterations?: number;
+    /** Delay between continuous loops (ms, default 0) */
+    loopDelayMs?: number;
+    /** Cancellation check for long-running workflows */
+    shouldCancel?: () => boolean;
 }
 
 // =============================================================================
@@ -506,4 +520,3 @@ export const MANOWAR_PRICES = {
     /** Per-MCP tool call within agent */
     MCP_TOOL: "1000", // $0.001
 } as const;
-

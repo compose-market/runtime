@@ -22,6 +22,7 @@ vi.mock("@langchain/openai", () => {
                             {
                                 stepNumber: 1,
                                 agentName: "TestAgent",
+                                agentWallet: "0x0000000000000000000000000000000000000001",
                                 task: "Test task",
                                 expectedOutput: "Test output",
                                 dependsOn: [],
@@ -51,6 +52,7 @@ describe("TaskPlanner", () => {
                     id: "step-1",
                     name: "TestAgent",
                     type: "agent",
+                    agentAddress: "0x0000000000000000000000000000000000000001",
                     inputTemplate: {
                         description: "A test agent",
                         skills: ["testing", "analysis"],
@@ -62,6 +64,7 @@ describe("TaskPlanner", () => {
                     id: "step-2",
                     name: "SecondAgent",
                     type: "agent",
+                    agentAddress: "0x0000000000000000000000000000000000000002",
                     inputTemplate: {
                         description: "A second test agent",
                         skills: ["synthesis"],

@@ -16,6 +16,40 @@ import type { AgentCard, ManowarCard } from "./types.js";
 // Re-export for consumers that import from registry
 export type { AgentCard, ManowarCard };
 
+// =============================================================================
+// Validation & Normalization
+// =============================================================================
+
+export function normalizeManowarCard(card: ManowarCard): ManowarCard {
+    return {
+        ...card,
+        agents: (card.agents || []).map(agent => ({
+            ...agent,
+            plugins: agent.plugins || [],
+            protocols: agent.protocols || [],
+        })),
+        edges: card.edges || [],
+    };
+}
+
+export function assertManowarCard(card: ManowarCard): void {
+    const issues: string[] = [];
+    if (!card.walletAddress) issues.push("manowarCard.walletAddress is required");
+    if (!Array.isArray(card.agents) || card.agents.length === 0) {
+        issues.push("manowarCard.agents must be a non-empty array");
+    }
+    for (const agent of card.agents || []) {
+        if (!agent.name) issues.push("agent.name is required");
+        if (!agent.walletAddress) issues.push(`agent.walletAddress missing for ${agent.name || "unknown agent"}`);
+        if (!agent.model) issues.push(`agent.model missing for ${agent.name || agent.walletAddress || "unknown agent"}`);
+        if (!Array.isArray(agent.plugins)) issues.push(`agent.plugins must be an array for ${agent.name || agent.walletAddress || "unknown agent"}`);
+        if (!Array.isArray(agent.protocols)) issues.push(`agent.protocols must be an array for ${agent.name || agent.walletAddress || "unknown agent"}`);
+    }
+    if (issues.length > 0) {
+        throw new Error(`[registry] Invalid manowarCard: ${issues.join("; ")}`);
+    }
+}
+
 
 
 // =============================================================================
@@ -122,33 +156,19 @@ export function getAgentCard(manowarCard: ManowarCard, agentWallet: string): Age
  * to maximize KV-cache efficiency.
  */
 export function buildSystemPromptFromCard(card: ManowarCard): string {
-    const agentList = card.agents?.map((a: AgentCard, i: number) =>
-        `${i + 1}. **${a.name}** (${a.walletAddress?.slice(0, 8)}...)\n` +
-        `   Model: ${a.model || "default"}\n` +
-        `   Skills: ${a.skills?.join(", ") || "general"}\n` +
-        `   Plugins: ${a.plugins?.map(p => p.name).join(", ") || "none"}`
-    ).join("\n") || "No agents available";
+    const cardJson = JSON.stringify(card, null, 2);
 
-    return `# Manowar Orchestrator: ${card.title}
+    return `# MANOWAR_CARD (authoritative metadata)
+${cardJson}
 
-## Description
-${card.description || "Multi-agent workflow orchestrator"}
+# COORDINATOR ROLE
+You coordinate agents without altering their configuration.
 
-## Available Agents
-${agentList}
-
-## Your Role
-You are the COORDINATOR for this workflow. Your job is to:
-1. Understand user requests
-2. Create execution plans
-3. Delegate tasks to the appropriate agents
-4. Synthesize results into coherent responses
-
-## Rules
-- Each agent call is via HTTP - you delegate, they execute
-- Use agents' specific skills for relevant tasks
-- Respect agent autonomy - they handle their own tool use
-- Track progress and report to user`;
+# RULES
+- Do NOT modify any agent's model, tools, or metadata
+- Do NOT execute tools on behalf of agents
+- Delegate tasks to agents; they execute with their own tools
+- Keep coordination concise and efficient`;
 }
 
 /**
@@ -162,12 +182,129 @@ export function clearCardCache(uri?: string): void {
     }
 }
 
-/**
- * Get cache stats (for debugging)
- */
 export function getCacheStats(): { size: number; keys: string[] } {
     return {
         size: cardCache.size,
         keys: Array.from(cardCache.keys()),
     };
+}
+
+// =============================================================================
+// Tool Self-Discovery (via Connector Service)
+// =============================================================================
+
+const CONNECTOR_URL = process.env.CONNECTOR_URL;
+const TOOL_DISCOVERY_MODE = process.env.MANOWAR_TOOL_DISCOVERY_MODE || "registry";
+const TOOL_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+interface CachedTools {
+    tools: DiscoveredTool[];
+    fetchedAt: number;
+}
+
+const toolCache = new Map<string, CachedTools>();
+
+/**
+ * Tool schema from connector service
+ */
+export interface DiscoveredTool {
+    name: string;
+    description?: string;
+    inputSchema?: Record<string, unknown>;
+}
+
+/**
+ * Discover tools for an agent's plugins via connector service.
+ * 
+ * Uses the connector's self-discovery endpoint which spawns MCP servers
+ * on-demand and returns their tool schemas. This allows the planner
+ * to understand what tools each agent can use.
+ * 
+ * @param agentCard - Agent card with plugins array
+ * @returns Array of discovered tools (limited to top 10 per agent to save tokens)
+ */
+export async function discoverAgentTools(
+    agentCard: AgentCard,
+    mode: "registry" | "runtime" | "auto" = (TOOL_DISCOVERY_MODE as "registry" | "runtime" | "auto")
+): Promise<DiscoveredTool[]> {
+    if (!agentCard.plugins?.length || !CONNECTOR_URL) {
+        return [];
+    }
+
+    const allTools: DiscoveredTool[] = [];
+
+    for (const plugin of agentCard.plugins) {
+        if (!plugin.registryId) continue;
+
+        const cached = toolCache.get(plugin.registryId);
+        if (cached && Date.now() - cached.fetchedAt < TOOL_CACHE_TTL) {
+            allTools.push(...cached.tools);
+            continue;
+        }
+
+        let tools: DiscoveredTool[] = [];
+
+        // Preferred: read-only registry lookup (no server spawn)
+        if (mode === "registry" || mode === "auto") {
+            try {
+                const response = await fetch(
+                    `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(plugin.registryId)}`,
+                    {
+                        headers: { Accept: "application/json" },
+                        signal: AbortSignal.timeout(5000),
+                    }
+                );
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (Array.isArray(data?.tools)) {
+                        tools = data.tools.map((tool: any) => ({
+                            name: tool.name,
+                            description: tool.description,
+                            inputSchema: tool.inputSchema,
+                        }));
+                    }
+                } else if (mode === "registry") {
+                    console.warn(`[registry] Registry lookup failed for ${plugin.registryId}: HTTP ${response.status}`);
+                }
+            } catch (error) {
+                if (mode === "registry") {
+                    console.warn(`[registry] Registry lookup error for ${plugin.registryId}:`, error);
+                }
+            }
+        }
+
+        // Fallback: runtime tool listing (may spawn MCP servers)
+        if (tools.length === 0 && (mode === "runtime" || mode === "auto")) {
+            try {
+                const response = await fetch(
+                    `${CONNECTOR_URL}/mcp/servers/${encodeURIComponent(plugin.registryId)}/tools`,
+                    {
+                        headers: { Accept: "application/json" },
+                        signal: AbortSignal.timeout(5000),
+                    }
+                );
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.tools && Array.isArray(data.tools)) {
+                        tools = data.tools.map((tool: any) => ({
+                            name: tool.name,
+                            description: tool.description,
+                            inputSchema: tool.inputSchema,
+                        }));
+                    }
+                } else {
+                    console.warn(`[registry] Runtime tool discovery failed for ${plugin.name}: HTTP ${response.status}`);
+                }
+            } catch (error) {
+                console.warn(`[registry] Runtime tool discovery error for ${plugin.name}:`, error);
+            }
+        }
+
+        toolCache.set(plugin.registryId, { tools, fetchedAt: Date.now() });
+        allTools.push(...tools);
+    }
+
+    return allTools.slice(0, 10);
 }

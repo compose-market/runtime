@@ -11,7 +11,6 @@ const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
 
 // Import types and helpers
-import type { ManowarState } from "../state.js";
 import { ManowarOrchestrator, executeWithOrchestrator } from "../orchestrator.js";
 import type { Workflow } from "../types.js";
 import { clearCardCache } from "../registry.js";
@@ -70,8 +69,8 @@ describe("ManowarOrchestrator: Initialization", () => {
             json: () => Promise.resolve({
                 name: "Test Card",
                 description: "Test description",
-                agentCards: [
-                    { name: "Agent1", modelId: "gpt-4o", plugins: ["tool1"] },
+                agents: [
+                    { name: "Agent1", walletAddress: "0x0000000000000000000000000000000000000001", model: "gpt-4o", skills: [], dnaHash: "test", chain: 1, licensePrice: "0", licenses: 0, cloneable: false, protocols: [], createdAt: "2025-01-01", plugins: [] },
                 ],
             }),
         });
@@ -114,8 +113,8 @@ describe("ManowarOrchestrator: Execution", () => {
                         walletAddress: "0x1234567890123456789012345678901234567890",
                         description: "Test manowar for unit tests",
                         creator: "0x1234567890123456789012345678901234567890",
-                        agentCards: [
-                            { name: "DataAnalyst", walletAddress: "0x0000000000000000000000000000000000000001", modelId: "gpt-4o", plugins: ["brave-search"] },
+                        agents: [
+                            { name: "DataAnalyst", walletAddress: "0x0000000000000000000000000000000000000001", model: "gpt-4o", skills: [], dnaHash: "test", chain: 1, licensePrice: "0", licenses: 0, cloneable: false, protocols: [], createdAt: "2025-01-01", plugins: [] },
                         ],
                     }),
                 });
@@ -164,6 +163,7 @@ describe("ManowarOrchestrator: Execution", () => {
 
         const result = await orchestrator.execute("Test request", {
             manowarCardUri: "ipfs://test-cid",
+            synthesizeFinal: false,
         });
 
         expect(result).toBeDefined();
@@ -179,6 +179,7 @@ describe("ManowarOrchestrator: Execution", () => {
         await orchestrator.execute("Test request", {
             manowarCardUri: "ipfs://test-cid",
             onProgress: (event) => progressEvents.push(event),
+            synthesizeFinal: false,
         });
 
         expect(progressEvents.length).toBeGreaterThan(0);
@@ -203,7 +204,7 @@ describe("executeWithOrchestrator", () => {
                         walletAddress: "0x1234567890123456789012345678901234567890",
                         description: "Test manowar",
                         creator: "0x1234567890123456789012345678901234567890",
-                        agentCards: [],
+                        agents: [],
                     }),
                 });
             }

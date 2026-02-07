@@ -81,7 +81,7 @@ export async function fetchModelContextWindow(modelId: string): Promise<number> 
 }
 
 // =============================================================================
-// Token Checkpoint (for LangSmith integration)
+// Token Checkpoint (type exported to langsmith.ts)
 // =============================================================================
 
 export interface TokenCheckpoint {
