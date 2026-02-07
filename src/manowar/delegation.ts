@@ -138,12 +138,26 @@ export async function callAgent(
 export async function delegatePlanStep(
     step: PlanStep,
     agentCard: AgentCard | undefined,
-    context: { priorOutputs?: string[] } = {},
+    context: { priorOutputs?: string[]; relevantContext?: string } = {},
     options: DelegationOptions = {}
 ): Promise<DelegationResult> {
     const startedAt = Date.now();
     // Prefer explicit wallet address from step, then from agentCard, then fallback to agentName
     const agentWallet = step.agentWallet || agentCard?.walletAddress || step.agentName;
+    if (!agentWallet) {
+        return {
+            success: false,
+            stepNumber: step.stepNumber,
+            agentName: step.agentName,
+            output: "",
+            error: "Missing agent wallet address for delegation",
+            timing: {
+                startedAt,
+                completedAt: Date.now(),
+                durationMs: 0,
+            },
+        };
+    }
 
     // Build the task message
     let message = step.task;
@@ -152,6 +166,9 @@ export async function delegatePlanStep(
     }
     if (context.priorOutputs?.length) {
         message += `\n\n## Prior context:\n${context.priorOutputs.join("\n---\n")}`;
+    }
+    if (context.relevantContext) {
+        message += `\n\n## Relevant context:\n${context.relevantContext}`;
     }
 
     console.log(`[delegation] Step ${step.stepNumber}: Calling ${step.agentName} (${agentWallet?.slice(0, 8)}...)`);
@@ -174,67 +191,4 @@ export async function delegatePlanStep(
             durationMs: completedAt - startedAt,
         },
     };
-}
-
-/**
- * Execute all steps of a plan in order
- * 
- * Respects step dependencies and passes prior outputs as context.
- */
-export async function executePlan(
-    plan: ExecutionPlan,
-    manowarCard: ManowarCard,
-    options: DelegationOptions = {}
-): Promise<DelegationResult[]> {
-    const results: DelegationResult[] = [];
-    const outputs: Map<number, string> = new Map();
-
-    for (const step of plan.steps) {
-        // Get prior outputs for dependencies
-        const priorOutputs: string[] = [];
-        for (const depNum of step.dependsOn || []) {
-            const depOutput = outputs.get(depNum);
-            if (depOutput) {
-                priorOutputs.push(`[Step ${depNum}]: ${depOutput}`);
-            }
-        }
-
-        // Get agent card from manowarCard
-        const agentCard = manowarCard.agents?.find(
-            (a: { name: string; walletAddress: string }) => a.name === step.agentName || a.walletAddress?.includes(step.agentName)
-        );
-
-        // Execute step
-        const result = await delegatePlanStep(
-            step,
-            agentCard,
-            { priorOutputs },
-            options
-        );
-
-        results.push(result);
-        outputs.set(step.stepNumber, result.output);
-
-        // Stop on failure for critical steps
-        if (!result.success && step.priority === "critical") {
-            console.error(`[delegation] Critical step ${step.stepNumber} failed, stopping execution`);
-            break;
-        }
-    }
-
-    return results;
-}
-
-/**
- * Check if an agent is available
- */
-export async function isAgentAvailable(agentWallet: string): Promise<boolean> {
-    try {
-        const response = await fetch(`${MANOWAR_URL}/agent/${agentWallet}`, {
-            method: "GET",
-        });
-        return response.ok;
-    } catch {
-        return false;
-    }
 }
