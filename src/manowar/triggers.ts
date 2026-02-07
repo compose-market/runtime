@@ -1,16 +1,43 @@
 /**
  * Trigger Management Service
  * 
- * Handles NL-to-cron parsing, trigger storage via mem0 graph memory,
+ * Handles NL-to-cron parsing, trigger storage via Redis,
  * and cron scheduling for autonomous workflow execution.
+ * 
+ * Redis Key Patterns (isolated from session/key storage):
+ * - manowar:trigger:{wallet}:{triggerId} - Individual trigger hash
+ * - manowar:triggers:{wallet} - Set of trigger IDs for a manowar
  */
 
 import {
     TriggerDefinition,
     TriggerType,
 } from "./types.js";
+import {
+    redisHGetAll,
+    redisHSet,
+    redisSAdd,
+    redisSMembers,
+    redisSRem,
+    redisDel,
+} from "../../../lambda/shared/config/redis.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+// =============================================================================
+// Redis Key Patterns (isolated namespace - doesn't conflict with session/keys)
+// =============================================================================
+
+const TRIGGER_PREFIX = "manowar:trigger:";
+const TRIGGER_SET_PREFIX = "manowar:triggers:";
+
+function getTriggerKey(wallet: string, triggerId: string): string {
+    return `${TRIGGER_PREFIX}${wallet.toLowerCase()}:${triggerId}`;
+}
+
+function getTriggerSetKey(wallet: string): string {
+    return `${TRIGGER_SET_PREFIX}${wallet.toLowerCase()}`;
+}
 
 // =============================================================================
 // NL to Cron Parser
@@ -167,156 +194,182 @@ export async function parseTriggerFromNL(
 }
 
 // =============================================================================
-// Trigger Store (mem0 graph memory)
+// Trigger Store (Redis - isolated from session/key storage)
 // =============================================================================
 
 /**
- * Store a trigger definition in mem0
+ * Store a trigger definition in Redis
+ * 
+ * Keys created:
+ * - manowar:trigger:{wallet}:{id} (hash with all trigger fields)
+ * - manowar:triggers:{wallet} (set containing trigger IDs)
  */
 export async function storeTrigger(
     trigger: TriggerDefinition,
-    userId?: string
+    _userId?: string
 ): Promise<string | null> {
     try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                messages: [
-                    {
-                        role: "system",
-                        content: `Trigger definition for Manowar ${trigger.manowarWallet}`,
-                    },
-                    {
-                        role: "assistant",
-                        content: `Trigger "${trigger.name}" (${trigger.type}): ${trigger.nlDescription}. Cron: ${trigger.cronExpression || "N/A"}. Enabled: ${trigger.enabled}.`,
-                    },
-                ],
-                agent_id: `manowar-${trigger.manowarWallet}`,
-                user_id: userId,
-                enable_graph: true, // Enable graph memory for relation extraction
-                metadata: {
-                    type: "trigger",
-                    trigger_id: trigger.id,
-                    trigger_type: trigger.type,
-                    manowar_wallet: trigger.manowarWallet,
-                    cron_expression: trigger.cronExpression,
-                    enabled: trigger.enabled,
-                    timezone: trigger.timezone,
-                    created_at: trigger.createdAt,
-                    // Store full trigger as JSON for retrieval
-                    trigger_data: JSON.stringify(trigger),
-                },
-            }),
+        const wallet = trigger.manowarWallet.toLowerCase();
+        const key = getTriggerKey(wallet, trigger.id);
+
+        // Store trigger as hash fields
+        await redisHSet(key, {
+            id: trigger.id,
+            name: trigger.name,
+            type: trigger.type,
+            manowarWallet: wallet,
+            nlDescription: trigger.nlDescription || "",
+            cronExpression: trigger.cronExpression || "",
+            cronReadable: trigger.cronReadable || "",
+            enabled: String(trigger.enabled),
+            timezone: trigger.timezone || "UTC",
+            inputTemplate: JSON.stringify(trigger.inputTemplate || {}),
+            createdAt: String(trigger.createdAt || Date.now()),
+            updatedAt: String(trigger.updatedAt || Date.now()),
         });
 
-        if (!response.ok) {
-            console.error("[triggers] Failed to store in mem0:", response.status);
-            return null;
-        }
+        // Add to the manowar's trigger set for fast listing
+        await redisSAdd(getTriggerSetKey(wallet), trigger.id);
 
-        const data = await response.json();
-        return data.memory_id || data.id || trigger.id;
+        console.log(`[triggers] Stored trigger ${trigger.id} for ${wallet} in Redis`);
+        return trigger.id;
     } catch (error) {
-        console.error("[triggers] mem0 storage error:", error);
+        console.error("[triggers] Redis storage error:", error);
         return null;
     }
 }
 
 /**
- * Retrieve triggers for a Manowar from mem0
+ * Retrieve all triggers for a Manowar from Redis
+ * Deterministic retrieval - no vector search needed
  */
 export async function retrieveTriggers(
     manowarWallet: string,
-    userId?: string
+    _userId?: string
 ): Promise<TriggerDefinition[]> {
     try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                query: `triggers for manowar ${manowarWallet}`,
-                agent_id: `manowar-${manowarWallet}`,
-                user_id: userId,
-                limit: 50,
-                enable_graph: true, // Enable graph memory for better retrieval
-                rerank: true, // Enable reranking for relevance
-                filters: {
-                    type: "trigger",
-                    manowar_wallet: manowarWallet,
-                },
-            }),
-        });
+        const wallet = manowarWallet.toLowerCase();
+        const triggerIds = await redisSMembers(getTriggerSetKey(wallet));
 
-        if (!response.ok) {
+        if (!triggerIds || triggerIds.length === 0) {
             return [];
         }
 
-        const data = await response.json();
-        const memories = data.memories || data.results || [];
-
         const triggers: TriggerDefinition[] = [];
-        for (const memory of memories) {
-            try {
-                // Extract trigger from metadata
-                if (memory.metadata?.trigger_data) {
-                    triggers.push(JSON.parse(memory.metadata.trigger_data));
-                }
-            } catch {
-                // Skip malformed triggers
+        for (const triggerId of triggerIds) {
+            const data = await redisHGetAll(getTriggerKey(wallet, triggerId));
+            if (data && Object.keys(data).length > 0) {
+                triggers.push({
+                    id: data.id || triggerId,
+                    name: data.name || "Unnamed Trigger",
+                    type: data.type as TriggerType,
+                    manowarWallet: data.manowarWallet || wallet,
+                    nlDescription: data.nlDescription || "",
+                    cronExpression: data.cronExpression || undefined,
+                    cronReadable: data.cronReadable || undefined,
+                    enabled: data.enabled === "true",
+                    timezone: data.timezone || "UTC",
+                    inputTemplate: data.inputTemplate ? JSON.parse(data.inputTemplate) : undefined,
+                    createdAt: parseInt(data.createdAt, 10) || Date.now(),
+                    updatedAt: parseInt(data.updatedAt, 10) || Date.now(),
+                });
             }
         }
 
+        // Sort by creation date, newest first
+        triggers.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        console.log(`[triggers] Retrieved ${triggers.length} triggers for ${wallet} from Redis`);
         return triggers;
     } catch (error) {
-        console.error("[triggers] Failed to retrieve:", error);
+        console.error("[triggers] Redis retrieval error:", error);
         return [];
     }
 }
 
 /**
- * Delete a trigger from mem0
+ * Delete a trigger from Redis
  */
 export async function deleteTriggerFromMemory(
     triggerId: string,
     manowarWallet: string,
-    userId?: string
+    _userId?: string
 ): Promise<boolean> {
     try {
-        // Search for the specific trigger
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                query: `trigger ${triggerId}`,
-                agent_id: `manowar-${manowarWallet}`,
-                user_id: userId,
-                limit: 1,
-                filters: {
-                    type: "trigger",
-                    trigger_id: triggerId,
-                },
-            }),
-        });
+        const wallet = manowarWallet.toLowerCase();
 
-        if (!response.ok) return false;
+        // Remove from the trigger set
+        await redisSRem(getTriggerSetKey(wallet), triggerId);
 
-        const data = await response.json();
-        const memories = data.memories || data.results || [];
+        // Delete the trigger hash
+        const deleted = await redisDel(getTriggerKey(wallet, triggerId));
 
-        if (memories.length === 0) return true; // Already deleted
+        // Also unregister from scheduler if active
+        unregisterTrigger(triggerId);
 
-        const memoryId = memories[0].id;
-
-        // Delete the memory
-        const deleteResponse = await fetch(`${LAMBDA_API_URL}/api/memory/${memoryId}`, {
-            method: "DELETE",
-        });
-
-        return deleteResponse.ok;
+        console.log(`[triggers] Deleted trigger ${triggerId} for ${wallet} from Redis`);
+        return deleted;
     } catch (error) {
-        console.error("[triggers] Delete error:", error);
+        console.error("[triggers] Redis delete error:", error);
         return false;
+    }
+}
+
+/**
+ * Update a trigger's enabled status in Redis
+ */
+export async function updateTriggerEnabled(
+    triggerId: string,
+    manowarWallet: string,
+    enabled: boolean
+): Promise<boolean> {
+    try {
+        const wallet = manowarWallet.toLowerCase();
+        const key = getTriggerKey(wallet, triggerId);
+
+        await redisHSet(key, "enabled", String(enabled));
+        await redisHSet(key, "updatedAt", String(Date.now()));
+
+        console.log(`[triggers] Updated trigger ${triggerId} enabled=${enabled}`);
+        return true;
+    } catch (error) {
+        console.error("[triggers] Redis update error:", error);
+        return false;
+    }
+}
+
+/**
+ * Get a single trigger by ID from Redis
+ */
+export async function getTriggerById(
+    triggerId: string,
+    manowarWallet: string
+): Promise<TriggerDefinition | null> {
+    try {
+        const wallet = manowarWallet.toLowerCase();
+        const data = await redisHGetAll(getTriggerKey(wallet, triggerId));
+
+        if (!data || Object.keys(data).length === 0) {
+            return null;
+        }
+
+        return {
+            id: data.id || triggerId,
+            name: data.name || "Unnamed Trigger",
+            type: data.type as TriggerType,
+            manowarWallet: data.manowarWallet || wallet,
+            nlDescription: data.nlDescription || "",
+            cronExpression: data.cronExpression || undefined,
+            cronReadable: data.cronReadable || undefined,
+            enabled: data.enabled === "true",
+            timezone: data.timezone || "UTC",
+            inputTemplate: data.inputTemplate ? JSON.parse(data.inputTemplate) : undefined,
+            createdAt: parseInt(data.createdAt, 10) || Date.now(),
+            updatedAt: parseInt(data.updatedAt, 10) || Date.now(),
+        };
+    } catch (error) {
+        console.error("[triggers] Redis get error:", error);
+        return null;
     }
 }
 
@@ -418,4 +471,57 @@ export function unregisterAllTriggers(): void {
  */
 export function getActiveTriggerCount(): number {
     return activeJobs.size;
+}
+
+/**
+ * Initialize triggers from Redis on server startup
+ * 
+ * Call this when the server starts to reload all persisted triggers
+ * and re-register them with the in-memory scheduler.
+ * 
+ * @param manowarWallets - List of manowar wallet addresses to load triggers for
+ * @param executor - Function to execute when a trigger fires
+ * @returns Number of triggers registered
+ */
+export async function initTriggersFromRedis(
+    manowarWallets: string[],
+    executor: (trigger: TriggerDefinition) => Promise<void>
+): Promise<number> {
+    let totalRegistered = 0;
+
+    console.log(`[triggers] Initializing triggers from Redis for ${manowarWallets.length} manowars...`);
+
+    for (const wallet of manowarWallets) {
+        try {
+            const triggers = await retrieveTriggers(wallet);
+
+            for (const trigger of triggers) {
+                if (trigger.enabled && trigger.cronExpression) {
+                    registerTrigger(trigger, executor);
+                    totalRegistered++;
+                }
+            }
+
+            if (triggers.length > 0) {
+                console.log(`[triggers] Loaded ${triggers.length} triggers for ${wallet}, ${triggers.filter(t => t.enabled).length} enabled`);
+            }
+        } catch (error) {
+            console.error(`[triggers] Failed to load triggers for ${wallet}:`, error);
+        }
+    }
+
+    console.log(`[triggers] Initialization complete: ${totalRegistered} triggers registered`);
+    return totalRegistered;
+}
+
+/**
+ * Initialize triggers for a single manowar
+ * 
+ * Convenience function for loading triggers when a manowar is accessed.
+ */
+export async function initTriggersForManowar(
+    manowarWallet: string,
+    executor: (trigger: TriggerDefinition) => Promise<void>
+): Promise<number> {
+    return initTriggersFromRedis([manowarWallet], executor);
 }
