@@ -1,16 +1,21 @@
 /**
- * LangSmith Integration for Production Token Tracking
+ * LangSmith Observability Hub
  * 
- * Uses LangSmith callbacks to extract accurate token usage from
- * usage_metadata in LLM responses (Dec 2025 standard).
+ * Centralized observability for the Manowar framework:
+ * - Token extraction from LLM responses (usage_metadata)
+ * - LangSmith client for run tracking and feedback
+ * - Feedback/annotations for checkpoints
+ * - Dataset integration for execution learnings
  * 
- * Key features:
- * - Extracts usage_metadata (input_tokens, output_tokens)
- * - Handles reasoning_tokens for thinking models (Kimi K2, DeepSeek)
- * - Per-agent, per-action token tracking
- * - Integration with TokenLedger for context window management
+ * All observability flows through this module:
+ * - orchestrator.ts → uses LangSmithTokenTracker
+ * - run-tracker.ts → uses client functions
+ * - checkpoint.ts → uses feedback functions
+ * - planner.ts → uses dataset functions
  */
 
+import { Client as LangSmithClient } from "langsmith";
+import type { Run, Feedback as LangSmithFeedback } from "langsmith/schemas";
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { LLMResult } from "@langchain/core/outputs";
 import type { Serialized } from "@langchain/core/load/serializable";
@@ -54,29 +59,36 @@ export interface ExtractedTokens {
 // =============================================================================
 
 /**
- * Extract tokens from LLMResult using usage_metadata
+ * Unified token extraction from any LLM response format.
+ * 
+ * Handles:
+ * - LangChain LLMResult (from callbacks)
+ * - usage_metadata (Dec 2025 standard)
+ * - response_metadata.token_usage (thinking models)
+ * - OpenRouter/OpenAI compatible responses
+ * - Anthropic format (input_tokens/output_tokens)
+ * - Google GenAI format (usageMetadata)
+ * 
+ * @throws Error if no token data is found
  */
-export function extractTokensFromResult(output: LLMResult): ExtractedTokens {
-    // Get the last generation's message (may be nested in different ways)
-    const lastGeneration = output.generations?.[0]?.[0] as any;
+export function extractTokens(response: any): ExtractedTokens {
+    // Handle LangChain LLMResult (nested generations)
+    const generation = response?.generations?.[0]?.[0];
+    const message = generation?.message ?? response;
 
-    // Check for message in generation (ChatGeneration type)
-    const message = lastGeneration?.message;
-
-    // 1. Check usage_metadata (Dec 2025 primary standard)
+    // 1. usage_metadata (Dec 2025 primary standard)
     if (message?.usage_metadata) {
         const usage = message.usage_metadata;
         return {
             inputTokens: usage.input_tokens || 0,
             outputTokens: usage.output_tokens || 0,
-            reasoningTokens: 0, // Not in usage_metadata, check response_metadata
-            totalTokens: usage.total_tokens ||
-                (usage.input_tokens || 0) + (usage.output_tokens || 0),
+            reasoningTokens: 0,
+            totalTokens: usage.total_tokens || (usage.input_tokens || 0) + (usage.output_tokens || 0),
             source: "usage_metadata",
         };
     }
 
-    // 2. Check response_metadata.token_usage (includes reasoning_tokens for thinking models)
+    // 2. response_metadata.token_usage (includes reasoning_tokens)
     if (message?.response_metadata?.token_usage) {
         const usage = message.response_metadata.token_usage;
         const inputTokens = usage.prompt_tokens || usage.input_tokens || 0;
@@ -91,9 +103,9 @@ export function extractTokensFromResult(output: LLMResult): ExtractedTokens {
         };
     }
 
-    // 3. Legacy: llmOutput.tokenUsage
-    if (output.llmOutput?.tokenUsage) {
-        const usage = output.llmOutput.tokenUsage;
+    // 3. llmOutput.tokenUsage (LangChain legacy)
+    if (response?.llmOutput?.tokenUsage) {
+        const usage = response.llmOutput.tokenUsage;
         return {
             inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
             outputTokens: usage.completionTokens || usage.completion_tokens || 0,
@@ -103,11 +115,59 @@ export function extractTokensFromResult(output: LLMResult): ExtractedTokens {
         };
     }
 
-    // LangSmith provides token data - if we reach here, the LLM response is malformed
+    // 4. OpenRouter/OpenAI compatible (usage.prompt_tokens)
+    if (response?.usage?.prompt_tokens !== undefined || response?.usage?.promptTokens !== undefined) {
+        const usage = response.usage;
+        const inputTokens = usage.prompt_tokens || usage.promptTokens || 0;
+        const outputTokens = usage.completion_tokens || usage.completionTokens || 0;
+        return {
+            inputTokens,
+            outputTokens,
+            reasoningTokens: 0,
+            totalTokens: usage.total_tokens || usage.totalTokens || inputTokens + outputTokens,
+            source: "usage_metadata", // Compatible format
+        };
+    }
+
+    // 5. Anthropic format (input_tokens)
+    if (response?.usage?.input_tokens !== undefined) {
+        return {
+            inputTokens: response.usage.input_tokens || 0,
+            outputTokens: response.usage.output_tokens || 0,
+            reasoningTokens: 0,
+            totalTokens: (response.usage.input_tokens || 0) + (response.usage.output_tokens || 0),
+            source: "usage_metadata",
+        };
+    }
+
+    // 6. Google GenAI format
+    if (response?.usageMetadata?.promptTokenCount !== undefined) {
+        return {
+            inputTokens: response.usageMetadata.promptTokenCount || 0,
+            outputTokens: response.usageMetadata.candidatesTokenCount || 0,
+            reasoningTokens: 0,
+            totalTokens: response.usageMetadata.totalTokenCount || 0,
+            source: "usage_metadata",
+        };
+    }
+
     throw new Error(
-        `[LangSmith] Token extraction failed - no usage data in LLM response. ` +
-        `Expected usage_metadata, response_metadata.token_usage, or llmOutput.tokenUsage.`
+        `[LangSmith] Token extraction failed - no usage data found. ` +
+        `Checked: usage_metadata, response_metadata, llmOutput.tokenUsage, usage, usageMetadata.`
     );
+}
+
+/**
+ * @deprecated Use extractTokens() instead
+ */
+export const extractTokensFromResult = extractTokens;
+
+/**
+ * @deprecated Use extractTokens() instead
+ */
+export function extractTokenUsage(response: any): ExtractedTokens & { estimated: boolean } {
+    const tokens = extractTokens(response);
+    return { ...tokens, estimated: false };
 }
 
 // =============================================================================
@@ -164,7 +224,7 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
      * Handle LLM generation end - extract and record tokens
      */
     async handleLLMEnd(output: LLMResult, runId: string): Promise<void> {
-        const tokens = extractTokensFromResult(output);
+        const tokens = extractTokens(output);
 
         if (tokens.totalTokens > 0) {
             const checkpoint: TokenCheckpoint = {
@@ -238,111 +298,11 @@ export class LangSmithTokenTracker extends BaseCallbackHandler {
     }
 }
 
-// =============================================================================
-// Token Extraction & Cost Estimation (Centralized Utilities)
-// =============================================================================
+// ExtractedUsage is now deprecated - use ExtractedTokens instead
+/** @deprecated Use ExtractedTokens instead */
+export type ExtractedUsage = ExtractedTokens & { estimated: boolean };
 
-/**
- * Extracted token usage from any LLM response format
- */
-export interface ExtractedUsage {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-    estimated: boolean;
-    source: string;
-}
 
-/**
- * Extract token usage from LangChain LLMResult or raw API response
- * 
- * WORKS FOR ALL 2700+ MODELS because:
- * 1. All coordinator models (nvidia, minimax, moonshotai, nex-agi, allenai, arcee-ai)
- *    are accessed via OpenRouter which uses OpenAI-compatible response format
- * 2. LangChain's ChatOpenAI wrapper normalizes all OpenRouter responses to llmOutput.tokenUsage
- * 3. This function handles both LangChain LLMResult AND raw OpenRouter API responses
- */
-export function extractTokenUsage(response: any, modelId?: string): ExtractedUsage {
-    // 1. LangChain LLMResult format (from handleLLMEnd callback)
-    if (response?.llmOutput?.tokenUsage) {
-        const usage = response.llmOutput.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
-            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
-            totalTokens: usage.totalTokens || usage.total_tokens ||
-                ((usage.promptTokens || 0) + (usage.completionTokens || 0)),
-            estimated: false,
-            source: "langchain",
-        };
-    }
-
-    // 2. LangChain AIMessage with response_metadata
-    if (response?.response_metadata?.tokenUsage) {
-        const usage = response.response_metadata.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || 0,
-            outputTokens: usage.completionTokens || 0,
-            totalTokens: usage.totalTokens || 0,
-            estimated: false,
-            source: "langchain-metadata",
-        };
-    }
-
-    // 3. OpenRouter / OpenAI-compatible format
-    if (response?.usage?.prompt_tokens !== undefined || response?.usage?.promptTokens !== undefined) {
-        const usage = response.usage;
-        return {
-            inputTokens: usage.prompt_tokens || usage.promptTokens || 0,
-            outputTokens: usage.completion_tokens || usage.completionTokens || 0,
-            totalTokens: usage.total_tokens || usage.totalTokens ||
-                ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0)),
-            estimated: false,
-            source: "openrouter",
-        };
-    }
-
-    // 4. Anthropic format (input_tokens / output_tokens)
-    if (response?.usage?.input_tokens !== undefined) {
-        return {
-            inputTokens: response.usage.input_tokens || 0,
-            outputTokens: response.usage.output_tokens || 0,
-            totalTokens: (response.usage.input_tokens + response.usage.output_tokens) || 0,
-            estimated: false,
-            source: "anthropic",
-        };
-    }
-
-    // 5. Google GenAI format (usageMetadata)
-    if (response?.usageMetadata?.promptTokenCount !== undefined) {
-        return {
-            inputTokens: response.usageMetadata.promptTokenCount || 0,
-            outputTokens: response.usageMetadata.candidatesTokenCount || 0,
-            totalTokens: response.usageMetadata.totalTokenCount ||
-                (response.usageMetadata.promptTokenCount + response.usageMetadata.candidatesTokenCount) || 0,
-            estimated: false,
-            source: "google",
-        };
-    }
-
-    // 6. Direct tokenUsage object (some LangChain versions)
-    if (response?.tokenUsage) {
-        const usage = response.tokenUsage;
-        return {
-            inputTokens: usage.promptTokens || usage.prompt_tokens || 0,
-            outputTokens: usage.completionTokens || usage.completion_tokens || 0,
-            totalTokens: usage.totalTokens || usage.total_tokens || 0,
-            estimated: false,
-            source: "direct",
-        };
-    }
-
-    // Token data is available from LangChain/LangSmith callbacks
-    throw new Error(
-        `[LangSmith] Token extraction failed. Response lacks token data. ` +
-        `Checked: llmOutput.tokenUsage, response_metadata.tokenUsage, ` +
-        `usage (OpenAI/Anthropic), usageMetadata (Google), tokenUsage.`
-    );
-}
 
 /**
  * Calculate USD cost from token counts and pricing
@@ -397,4 +357,283 @@ export async function createLangSmithConfig(
  */
 export function isLangSmithEnabled(): boolean {
     return !!LANGSMITH_API_KEY;
+}
+
+// =============================================================================
+// LangSmith SDK Client (Centralized)
+// =============================================================================
+
+let langsmithClient: LangSmithClient | null = null;
+
+/**
+ * Get the singleton LangSmith client.
+ * Used by run-tracker.ts and checkpoint.ts.
+ */
+export function getLangSmithClient(): LangSmithClient | null {
+    if (!LANGSMITH_API_KEY) return null;
+
+    if (!langsmithClient) {
+        langsmithClient = new LangSmithClient({
+            apiKey: LANGSMITH_API_KEY,
+            apiUrl: LANGSMITH_ENDPOINT,
+        });
+    }
+    return langsmithClient;
+}
+
+// Re-export Run type for run-tracker.ts
+export type { Run, LangSmithFeedback };
+
+// =============================================================================
+// Run Tracking (moved from run-tracker.ts direct SDK usage)
+// =============================================================================
+
+/**
+ * Fetch runs from LangSmith for a project
+ */
+export async function fetchLangSmithRuns(params: {
+    limit?: number;
+    projectName?: string;
+    filter?: string;
+    isRoot?: boolean;
+}): Promise<Run[]> {
+    const client = getLangSmithClient();
+    if (!client) return [];
+
+    try {
+        const runs: Run[] = [];
+        const iterator = client.listRuns({
+            projectName: params.projectName || LANGSMITH_PROJECT,
+            limit: params.limit || 50,
+            filter: params.filter,
+            isRoot: params.isRoot,
+        });
+
+        for await (const run of iterator) {
+            runs.push(run);
+            if (runs.length >= (params.limit || 50)) break;
+        }
+
+        return runs;
+    } catch (error) {
+        console.error("[LangSmith] Failed to fetch runs:", error);
+        return [];
+    }
+}
+
+/**
+ * Get LangSmith run details by ID
+ */
+export async function getLangSmithRun(runId: string): Promise<Run | null> {
+    const client = getLangSmithClient();
+    if (!client) return null;
+
+    try {
+        return await client.readRun(runId);
+    } catch (error) {
+        console.error("[LangSmith] Failed to get run:", error);
+        return null;
+    }
+}
+
+// =============================================================================
+// Feedback/Annotations (replaces checkpoint.ts persistence)
+// =============================================================================
+
+export interface FeedbackOptions {
+    score?: number;
+    value?: string;
+    comment?: string;
+    correction?: Record<string, unknown>;
+}
+
+/**
+ * Record feedback on a LangSmith run.
+ * Use for checkpoint annotations, quality scores, and learnings.
+ */
+export async function recordFeedback(
+    runId: string,
+    key: string,
+    options: FeedbackOptions = {}
+): Promise<string | null> {
+    const client = getLangSmithClient();
+    if (!client) {
+        console.warn("[LangSmith] No client available for feedback");
+        return null;
+    }
+
+    try {
+        const result = await client.createFeedback(runId, key, {
+            score: options.score,
+            value: options.value,
+            comment: options.comment,
+            correction: options.correction,
+        });
+        console.log(`[LangSmith] Recorded feedback: ${key} on run ${runId}`);
+        return result.id;
+    } catch (error) {
+        console.error("[LangSmith] Failed to record feedback:", error);
+        return null;
+    }
+}
+
+/**
+ * Get all feedback for a run
+ */
+export async function getRunFeedback(runId: string): Promise<LangSmithFeedback[]> {
+    const client = getLangSmithClient();
+    if (!client) return [];
+
+    try {
+        const feedback: LangSmithFeedback[] = [];
+        const iterator = client.listFeedback({ runIds: [runId] });
+
+        for await (const fb of iterator) {
+            feedback.push(fb);
+        }
+
+        return feedback;
+    } catch (error) {
+        console.error("[LangSmith] Failed to get feedback:", error);
+        return [];
+    }
+}
+
+// =============================================================================
+// Checkpoint Annotations (high-level convenience)
+// =============================================================================
+
+/**
+ * Record insight from a workflow step.
+ * Stores as feedback with key "insight".
+ */
+export async function recordInsightFeedback(
+    runId: string,
+    insight: string,
+    agentId: string
+): Promise<string | null> {
+    return recordFeedback(runId, "insight", {
+        value: insight,
+        comment: `Agent: ${agentId}`,
+    });
+}
+
+/**
+ * Record decision from a workflow step.
+ * Stores as feedback with key "decision".
+ */
+export async function recordDecisionFeedback(
+    runId: string,
+    decision: string,
+    reasoning?: string
+): Promise<string | null> {
+    return recordFeedback(runId, "decision", {
+        value: decision,
+        comment: reasoning,
+    });
+}
+
+/**
+ * Record quality score for a workflow step.
+ * Score from 0-1.
+ */
+export async function recordQualityScore(
+    runId: string,
+    score: number,
+    comment?: string
+): Promise<string | null> {
+    return recordFeedback(runId, "quality", {
+        score: Math.max(0, Math.min(1, score)),
+        comment,
+    });
+}
+
+/**
+ * Record error annotation for a workflow step.
+ */
+export async function recordErrorFeedback(
+    runId: string,
+    error: string,
+    agentId: string
+): Promise<string | null> {
+    return recordFeedback(runId, "error", {
+        value: error,
+        comment: `Agent: ${agentId}`,
+        score: 0,
+    });
+}
+
+// =============================================================================
+// Dataset Integration (for execution learnings)
+// =============================================================================
+
+/**
+ * Record an execution learning to a LangSmith dataset.
+ * Used for multi-run improvement in planner.ts.
+ */
+export async function recordLearning(
+    datasetName: string,
+    input: Record<string, unknown>,
+    output: Record<string, unknown>,
+    metadata?: Record<string, unknown>
+): Promise<string | null> {
+    const client = getLangSmithClient();
+    if (!client) {
+        console.warn("[LangSmith] No client available for dataset write");
+        return null;
+    }
+
+    try {
+        // Get or create dataset
+        let dataset;
+        try {
+            dataset = await client.readDataset({ datasetName });
+        } catch {
+            dataset = await client.createDataset(datasetName, {
+                description: "Execution learnings for multi-run improvement",
+            });
+        }
+
+        // Create example
+        const example = await client.createExample(input, output, {
+            datasetId: dataset.id,
+            metadata,
+        });
+
+        console.log(`[LangSmith] Recorded learning to dataset ${datasetName}`);
+        return example.id;
+    } catch (error) {
+        console.error("[LangSmith] Failed to record learning:", error);
+        return null;
+    }
+}
+
+/**
+ * Get relevant learnings from a dataset.
+ * Used by planner.ts for ReviewerSuggestions.
+ */
+export async function getRelevantLearnings(
+    datasetName: string,
+    limit: number = 10
+): Promise<Array<{ inputs: Record<string, unknown>; outputs: Record<string, unknown> }>> {
+    const client = getLangSmithClient();
+    if (!client) return [];
+
+    try {
+        const examples: Array<{ inputs: Record<string, unknown>; outputs: Record<string, unknown> }> = [];
+        const iterator = client.listExamples({ datasetName, limit });
+
+        for await (const ex of iterator) {
+            examples.push({
+                inputs: ex.inputs as Record<string, unknown>,
+                outputs: ex.outputs as Record<string, unknown>,
+            });
+            if (examples.length >= limit) break;
+        }
+
+        return examples;
+    } catch (error) {
+        console.error("[LangSmith] Failed to get learnings:", error);
+        return [];
+    }
 }
