@@ -16,15 +16,54 @@ import {
     type PaymentContext,
 } from "./manowar/index.js";
 import {
+    parseTriggerFromNL,
+    retrieveTriggers,
+    storeTrigger,
+    deleteTriggerFromMemory,
+    registerTrigger,
+    unregisterTrigger,
+} from "./manowar/triggers.js";
+import {
     registerManowar,
     getManowar,
     listRegisteredManowars,
     markManowarExecuted,
     resolveAgent,
 } from "./frameworks/runtime.js";
-import type { WorkflowStep } from "./manowar/types.js";
+import type { WorkflowStep, TriggerDefinition } from "./manowar/types.js";
 
 const app = express();
+const cancellationTokens = new Map<string, { cancelled: boolean }>();
+
+function buildWorkflowFromManowar(manowar: {
+    walletAddress: string;
+    title?: string;
+    description?: string;
+    agentWalletAddresses?: string[];
+}) : Workflow {
+    const steps: WorkflowStep[] = [];
+    for (const agentWallet of (manowar.agentWalletAddresses || [])) {
+        const agent = resolveAgent(agentWallet);
+        steps.push({
+            id: `agent-${agentWallet.slice(0, 8)}`,
+            name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
+            type: "agent",
+            agentAddress: agentWallet,
+            inputTemplate: {
+                agentAddress: agentWallet,
+                agentCardUri: agent?.agentCardUri,
+            },
+            saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
+        });
+    }
+
+    return {
+        id: `manowar-${manowar.walletAddress}`,
+        name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
+        description: manowar.description || "",
+        steps,
+    };
+}
 
 // CORS Configuration
 app.use(cors({
@@ -270,6 +309,118 @@ app.get("/manowar", (_req: Request, res: Response) => {
 });
 
 // ============================================================================
+// Trigger Routes (parse, list, create, update, delete)
+// ============================================================================
+
+app.post("/api/manowar/triggers/parse", asyncHandler(async (req: Request, res: Response) => {
+    const { nlDescription } = req.body || {};
+    if (!nlDescription) {
+        res.status(400).json({ error: "nlDescription is required" });
+        return;
+    }
+    const parsed = await parseTriggerFromNL(nlDescription);
+    if (!parsed.success) {
+        res.status(400).json({ error: parsed.error || "Could not parse schedule" });
+        return;
+    }
+    res.json({ cronExpression: parsed.cronExpression, cronReadable: parsed.cronReadable });
+}));
+
+app.get("/api/manowar/:walletAddress/triggers", asyncHandler(async (req: Request, res: Response) => {
+    const manowarWallet = getParam(req.params.walletAddress);
+    const userId = req.headers["x-session-user-address"] as string | undefined;
+    const triggers = await retrieveTriggers(manowarWallet, userId);
+    res.json({ triggers });
+}));
+
+app.post("/api/manowar/:walletAddress/triggers", asyncHandler(async (req: Request, res: Response) => {
+    const manowarWallet = getParam(req.params.walletAddress);
+    const userId = req.headers["x-session-user-address"] as string | undefined;
+    const trigger = req.body as TriggerDefinition;
+    if (!trigger?.id || !trigger?.name || !trigger?.type) {
+        res.status(400).json({ error: "Invalid trigger payload" });
+        return;
+    }
+    trigger.manowarWallet = manowarWallet;
+    const memoryId = await storeTrigger(trigger, userId);
+    trigger.memoryId = memoryId || trigger.memoryId;
+
+    if (trigger.enabled && trigger.cronExpression) {
+        registerTrigger(trigger, async (t) => {
+            const manowar = getManowar(t.manowarWallet);
+            if (!manowar) return;
+            const workflow = buildWorkflowFromManowar(manowar);
+            await executeWithOrchestrator(workflow, (t.inputTemplate as any)?.message || t.nlDescription || "Scheduled run", {
+                payment: {
+                    paymentData: null,
+                    sessionActive: false,
+                    sessionBudgetRemaining: 0,
+                    resourceUrlBase: "",
+                },
+                coordinatorModel: manowar.coordinatorModel,
+                manowarCardUri: manowar.manowarCardUri,
+                triggerId: t.id,
+                synthesizeFinal: true,
+            });
+        });
+    }
+
+    res.json(trigger);
+}));
+
+app.put("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async (req: Request, res: Response) => {
+    const manowarWallet = getParam(req.params.walletAddress);
+    const triggerId = getParam(req.params.triggerId);
+    const userId = req.headers["x-session-user-address"] as string | undefined;
+    const updates = req.body as Partial<TriggerDefinition>;
+
+    const triggers = await retrieveTriggers(manowarWallet, userId);
+    const existing = triggers.find(t => t.id === triggerId);
+    if (!existing) {
+        res.status(404).json({ error: "Trigger not found" });
+        return;
+    }
+
+    const updated: TriggerDefinition = { ...existing, ...updates, id: triggerId, manowarWallet };
+    await deleteTriggerFromMemory(triggerId, manowarWallet, userId);
+    const memoryId = await storeTrigger(updated, userId);
+    updated.memoryId = memoryId || updated.memoryId;
+
+    if (updated.enabled && updated.cronExpression) {
+        registerTrigger(updated, async (t) => {
+            const manowar = getManowar(t.manowarWallet);
+            if (!manowar) return;
+            const workflow = buildWorkflowFromManowar(manowar);
+            await executeWithOrchestrator(workflow, (t.inputTemplate as any)?.message || t.nlDescription || "Scheduled run", {
+                payment: {
+                    paymentData: null,
+                    sessionActive: false,
+                    sessionBudgetRemaining: 0,
+                    resourceUrlBase: "",
+                },
+                coordinatorModel: manowar.coordinatorModel,
+                manowarCardUri: manowar.manowarCardUri,
+                triggerId: t.id,
+                synthesizeFinal: true,
+            });
+        });
+    } else {
+        unregisterTrigger(triggerId);
+    }
+
+    res.json(updated);
+}));
+
+app.delete("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async (req: Request, res: Response) => {
+    const manowarWallet = getParam(req.params.walletAddress);
+    const triggerId = getParam(req.params.triggerId);
+    const userId = req.headers["x-session-user-address"] as string | undefined;
+    const ok = await deleteTriggerFromMemory(triggerId, manowarWallet, userId);
+    unregisterTrigger(triggerId);
+    res.json({ success: ok });
+}));
+
+// ============================================================================
 // Manowar Chat (x402 Payable, Streaming)
 // ============================================================================
 
@@ -308,36 +459,11 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
 
     console.log(`[manowar] Resolved manowar: ${manowar.title} (${manowar.walletAddress})`);
 
-    // Build workflow steps from agent wallet addresses (using agent-registry for lookup)
-    // Only pass agentCardUri - orchestrator resolves full metadata from IPFS
-    const steps: WorkflowStep[] = [];
-    for (const agentWallet of (manowar.agentWalletAddresses || [])) {
-        const agent = resolveAgent(agentWallet);
-        steps.push({
-            id: `agent-${agentWallet.slice(0, 8)}`,
-            name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
-            type: "agent",
-            agentAddress: agentWallet,
-            // Pass only agentCardUri - orchestrator resolves full metadata from IPFS
-            inputTemplate: {
-                agentAddress: agentWallet,
-                agentCardUri: agent?.agentCardUri,
-            },
-            saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
-        });
-    }
-    console.log(`[manowar] Built ${steps.length} agent steps from wallets: [${manowar.agentWalletAddresses?.join(", ") || "none"}]`);
-
-    // Build workflow from registry data - use wallet address as ID
-    const workflow: Workflow = {
-        id: `manowar-${manowar.walletAddress}`,
-        name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
-        description: manowar.description || "",
-        steps,
-    };
+    const workflow = buildWorkflowFromManowar(manowar);
+    console.log(`[manowar] Built ${workflow.steps.length} agent steps from wallets: [${manowar.agentWalletAddresses?.join(", ") || "none"}]`);
 
     // Parse request - handle both legacy (image/audio) and new (attachment) formats
-    const { message, threadId, image, audio, attachment } = req.body;
+    const { message, threadId, image, audio, attachment, continuous } = req.body;
     if (!message) {
         res.status(400).json({ error: "message is required" });
         return;
@@ -366,16 +492,25 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
     // Send initial SSE event
     res.write(`event: start\ndata: ${JSON.stringify({ runId: `run-${Date.now()}`, message: "Starting workflow..." })}\n\n`);
 
+    const cancellationKey = `${manowar.walletAddress}:${threadId || "default"}`;
+    const cancellationToken = { cancelled: false };
+    cancellationTokens.set(cancellationKey, cancellationToken);
+
     // Execute workflow with SSE progress callback
     const result = await executeWithOrchestrator(workflow, message, {
         payment: paymentContext,
         coordinatorModel: manowar.coordinatorModel,
         manowarCardUri: manowar.manowarCardUri,
+        continuous: Boolean(continuous),
+        maxLoopIterations: Boolean(continuous) ? 5 : undefined,
+        shouldCancel: () => cancellationToken.cancelled,
         onProgress: (event: any) => {
             // Send SSE event for each progress update
             res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
         },
     });
+
+    cancellationTokens.delete(cancellationKey);
 
     // Mark as executed
     markManowarExecuted(manowar.walletAddress);
@@ -394,6 +529,20 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
     res.write(`event: result\ndata: ${JSON.stringify(finalData)}\n\n`);
     res.write(`event: done\ndata: {}\n\n`);
     res.end();
+}));
+
+// Stop a running workflow (best-effort, cancels between steps)
+app.post("/manowar/:walletAddress/stop", asyncHandler(async (req: Request, res: Response) => {
+    const walletAddress = getParam(req.params.walletAddress);
+    const { threadId } = req.body || {};
+    const cancellationKey = `${walletAddress}:${threadId || "default"}`;
+    const token = cancellationTokens.get(cancellationKey);
+    if (token) {
+        token.cancelled = true;
+        res.json({ success: true });
+        return;
+    }
+    res.status(404).json({ success: false, error: "No active run found" });
 }));
 
 // Alias /run to /chat to match ManowarManifestSchema endpoint definition
