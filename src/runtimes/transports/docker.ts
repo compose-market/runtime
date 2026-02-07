@@ -84,7 +84,7 @@ export class DockerClientTransport implements Transport {
             const baseUrl = `http://localhost:${this.port}`;
             this.httpTransport = new HttpSseClientTransport({ baseUrl });
 
-            await this.httpTransport.connect();
+            await this.httpTransport.start();
 
             console.log(`[DockerTransport] Connected to container via HTTP/SSE`);
 
