@@ -19,9 +19,18 @@ import { NpxClientTransport } from "./transports/npx.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ComposeTool } from "../types.js";
 import { randomUUID } from "crypto";
+import { execSync } from "child_process";
+import { existsSync, readdirSync, statSync, rmSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 // Spawn timeout to prevent hanging on failed MCP servers
 const SPAWN_TIMEOUT_MS = 20000;  // 20s - NPX packages need time to download on cold start
+
+// Disk health thresholds
+const MIN_DISK_MB = 500;         // Refuse spawns below 500MB free
+const NPX_CACHE_MAX_MB = 2048;   // Auto-clean npx cache above 2GB
+const NPX_CACHE_DIR = join(homedir(), ".npm", "_npx");
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -30,6 +39,110 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
       .then((result) => { clearTimeout(timer); resolve(result); })
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
+}
+
+/**
+ * Check available disk space. Returns MB free, or -1 on error.
+ */
+function getFreeDiskMB(): number {
+  try {
+    const output = execSync("df -m / | tail -1", { encoding: "utf8", timeout: 5000 });
+    const parts = output.trim().split(/\s+/);
+    // df -m output: Filesystem 1M-blocks Used Available Use% Mounted
+    const available = parseInt(parts[3], 10);
+    return isNaN(available) ? -1 : available;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Get total size of npx cache directory in MB.
+ */
+function getNpxCacheSizeMB(): number {
+  try {
+    if (!existsSync(NPX_CACHE_DIR)) return 0;
+    const output = execSync(`du -sm "${NPX_CACHE_DIR}" 2>/dev/null`, { encoding: "utf8", timeout: 10000 });
+    return parseInt(output.trim().split("\t")[0], 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Clean oldest npx cache entries until total size is under target.
+ * Called after session termination to prevent unbounded cache growth.
+ */
+function cleanNpxCacheIfNeeded(): void {
+  try {
+    const sizeMB = getNpxCacheSizeMB();
+    if (sizeMB < NPX_CACHE_MAX_MB) return;
+
+    console.log(`[mcp] npx cache at ${sizeMB}MB (limit: ${NPX_CACHE_MAX_MB}MB), cleaning oldest entries...`);
+
+    if (!existsSync(NPX_CACHE_DIR)) return;
+
+    // List cache dirs sorted by access time (oldest first)
+    const entries = readdirSync(NPX_CACHE_DIR)
+      .map(name => {
+        const fullPath = join(NPX_CACHE_DIR, name);
+        try {
+          const stat = statSync(fullPath);
+          return { name, fullPath, atime: stat.atimeMs };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is NonNullable<typeof e> => e !== null)
+      .sort((a, b) => a.atime - b.atime);
+
+    // Remove oldest half
+    const toRemove = Math.ceil(entries.length / 2);
+    let removed = 0;
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      try {
+        rmSync(entries[i].fullPath, { recursive: true, force: true });
+        removed++;
+      } catch {
+        // Skip entries that can't be removed
+      }
+    }
+
+    const newSize = getNpxCacheSizeMB();
+    console.log(`[mcp] npx cache cleanup: removed ${removed} entries, ${sizeMB}MB → ${newSize}MB`);
+  } catch (err) {
+    console.warn(`[mcp] npx cache cleanup failed:`, err);
+  }
+}
+
+/**
+ * Classify spawn errors for actionable diagnostics.
+ */
+function classifySpawnError(error: unknown, serverId: string): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack || "" : "";
+  const combined = `${msg} ${stack}`;
+
+  if (combined.includes("ENOSPC")) {
+    return `Server "${serverId}" failed: disk full (ENOSPC). The runtime server has no disk space for package installation.`;
+  }
+  if (combined.includes("E404") || combined.includes("404 Not Found")) {
+    return `Server "${serverId}" failed: npm package not found (404). The package name may be incorrect or the server has been removed from the npm registry.`;
+  }
+  if (combined.includes("environment variable required") || combined.includes("env") && combined.includes("required")) {
+    // Extract the env var name if possible
+    const envMatch = combined.match(/([A-Z_]+)\s+environment variable required/i);
+    const envVar = envMatch ? envMatch[1] : "unknown";
+    return `Server "${serverId}" requires credentials: ${envVar}. Add your API key via the Backpack credentials to use this server.`;
+  }
+  if (combined.includes("Connection closed") || combined.includes("-32000")) {
+    return `Server "${serverId}" crashed on startup (connection closed). Check server logs or required environment variables.`;
+  }
+  if (combined.includes("Request timed out") || combined.includes("-32001")) {
+    return `Server "${serverId}" timed out during initialization. The server may be overloaded or require more time to start.`;
+  }
+
+  return `Server "${serverId}" spawn failed: ${msg}`;
 }
 
 export interface McpRuntimeConfig {
@@ -123,6 +236,23 @@ export class McpRuntime {
       throw new Error(`Session limit reached (${this.config.maxSessions})`);
     }
 
+    // Disk space pre-check for transports that write to disk (npx, stdio)
+    if (config.transport === "npx" || config.transport === "stdio") {
+      const freeMB = getFreeDiskMB();
+      if (freeMB !== -1 && freeMB < MIN_DISK_MB) {
+        // Try emergency cleanup first
+        console.warn(`[MCP Runtime] Low disk space (${freeMB}MB), running emergency npx cache cleanup`);
+        cleanNpxCacheIfNeeded();
+        const freeAfter = getFreeDiskMB();
+        if (freeAfter !== -1 && freeAfter < MIN_DISK_MB) {
+          throw new Error(
+            `Cannot spawn "${serverId}": disk critically low (${freeAfter}MB free, need ${MIN_DISK_MB}MB). ` +
+            `Clear space on the runtime server or use an HTTP-transport MCP server.`
+          );
+        }
+      }
+    }
+
     console.log(`[MCP Runtime] Spawning server: ${serverId} (transport: ${config.transport})`);
 
     let transport: Transport;
@@ -205,7 +335,9 @@ export class McpRuntime {
 
       return sessionId;
     } catch (error) {
-      console.error(`[MCP Runtime] Failed to spawn ${serverId}:`, error);
+      // Classify the error for actionable diagnostics
+      const diagnosis = classifySpawnError(error, serverId);
+      console.error(`[MCP Runtime] Failed to spawn ${serverId}: ${diagnosis}`);
 
       // Record failure for backoff
       const now = new Date();
@@ -232,7 +364,9 @@ export class McpRuntime {
       } catch {
         // Ignore cleanup errors
       }
-      throw error;
+
+      // Throw the classified error instead of the raw MCP error
+      throw new Error(diagnosis);
     }
   }
 
@@ -285,12 +419,22 @@ export class McpRuntime {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    const transportType = session.transportType;
+    const serverId = session.serverId;
+
     try {
       await session.client.close();
       this.sessions.delete(sessionId);
-      console.log(`[MCP Runtime] Session terminated: ${sessionId}`);
+      console.log(`[MCP Runtime] Session terminated: ${sessionId} (${serverId})`);
     } catch (error) {
       console.error(`[MCP Runtime] Error terminating session ${sessionId}:`, error);
+      this.sessions.delete(sessionId); // Remove from map even on error
+    }
+
+    // Auto-clean npx cache after npx session closes to prevent disk fill
+    if (transportType === "npx") {
+      // Run cleanup asynchronously to not block the termination
+      setImmediate(() => cleanNpxCacheIfNeeded());
     }
   }
 
