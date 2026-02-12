@@ -24,6 +24,33 @@ import { existsSync, readdirSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
+export type McpRuntimeErrorCode =
+  | "MCP_CONFIG_NOT_FOUND"
+  | "MCP_SPAWN_TIMEOUT"
+  | "MCP_SPAWN_FAILED"
+  | "MCP_SESSION_NOT_FOUND"
+  | "MCP_SESSION_INVALID"
+  | "MCP_TOOL_FAILED"
+  | "MCP_RUNTIME_UNAVAILABLE";
+
+export class McpRuntimeError extends Error {
+  code: McpRuntimeErrorCode;
+  retryable: boolean;
+  statusCode: number;
+
+  constructor(code: McpRuntimeErrorCode, message: string, retryable: boolean, statusCode = 500) {
+    super(message);
+    this.name = "McpRuntimeError";
+    this.code = code;
+    this.retryable = retryable;
+    this.statusCode = statusCode;
+  }
+}
+
+function isMcpRuntimeError(error: unknown): error is McpRuntimeError {
+  return error instanceof McpRuntimeError;
+}
+
 // Spawn timeout to prevent hanging on failed MCP servers
 const SPAWN_TIMEOUT_MS = 20000;  // 20s - NPX packages need time to download on cold start
 
@@ -118,31 +145,65 @@ function cleanNpxCacheIfNeeded(): void {
 /**
  * Classify spawn errors for actionable diagnostics.
  */
-function classifySpawnError(error: unknown, serverId: string): string {
+function classifySpawnError(error: unknown, serverId: string): McpRuntimeError {
+  if (isMcpRuntimeError(error)) {
+    return error;
+  }
+
   const msg = error instanceof Error ? error.message : String(error);
   const stack = error instanceof Error ? error.stack || "" : "";
   const combined = `${msg} ${stack}`;
 
   if (combined.includes("ENOSPC")) {
-    return `Server "${serverId}" failed: disk full (ENOSPC). The runtime server has no disk space for package installation.`;
+    return new McpRuntimeError(
+      "MCP_SPAWN_FAILED",
+      `Server "${serverId}" failed: disk full (ENOSPC). The runtime server has no disk space for package installation.`,
+      true,
+      503
+    );
   }
   if (combined.includes("E404") || combined.includes("404 Not Found")) {
-    return `Server "${serverId}" failed: npm package not found (404). The package name may be incorrect or the server has been removed from the npm registry.`;
+    return new McpRuntimeError(
+      "MCP_CONFIG_NOT_FOUND",
+      `Server "${serverId}" failed: npm package not found (404). The package name may be incorrect or the server has been removed from the npm registry.`,
+      false,
+      404
+    );
   }
   if (combined.includes("environment variable required") || combined.includes("env") && combined.includes("required")) {
     // Extract the env var name if possible
     const envMatch = combined.match(/([A-Z_]+)\s+environment variable required/i);
     const envVar = envMatch ? envMatch[1] : "unknown";
-    return `Server "${serverId}" requires credentials: ${envVar}. Add your API key via the Backpack credentials to use this server.`;
+    return new McpRuntimeError(
+      "MCP_CONFIG_NOT_FOUND",
+      `Server "${serverId}" requires credentials: ${envVar}. Add your API key via the Backpack credentials to use this server.`,
+      false,
+      401
+    );
   }
   if (combined.includes("Connection closed") || combined.includes("-32000")) {
-    return `Server "${serverId}" crashed on startup (connection closed). Check server logs or required environment variables.`;
+    return new McpRuntimeError(
+      "MCP_SPAWN_FAILED",
+      `Server "${serverId}" crashed on startup (connection closed). Check server logs or required environment variables.`,
+      true,
+      503
+    );
   }
   if (combined.includes("Request timed out") || combined.includes("-32001")) {
-    return `Server "${serverId}" timed out during initialization. The server may be overloaded or require more time to start.`;
+    return new McpRuntimeError(
+      "MCP_SPAWN_TIMEOUT",
+      `Server "${serverId}" timed out during initialization. The server may be overloaded or require more time to start.`,
+      true,
+      504
+    );
   }
 
-  return `Server "${serverId}" spawn failed: ${msg}`;
+  return new McpRuntimeError(
+    "MCP_SPAWN_FAILED",
+    `Server "${serverId}" spawn failed: ${msg}`,
+    true,
+    503
+  );
 }
 
 export interface McpRuntimeConfig {
@@ -228,12 +289,22 @@ export class McpRuntime {
     const failure = this.failures.get(serverId);
     if (failure && failure.backoffUntil && failure.backoffUntil > new Date()) {
       const remainingMs = failure.backoffUntil.getTime() - Date.now();
-      throw new Error(`Server ${serverId} temporarily unavailable (${failure.count} failures, retry in ${Math.ceil(remainingMs / 1000)}s)`);
+      throw new McpRuntimeError(
+        "MCP_RUNTIME_UNAVAILABLE",
+        `Server ${serverId} temporarily unavailable (${failure.count} failures, retry in ${Math.ceil(remainingMs / 1000)}s)`,
+        true,
+        503
+      );
     }
 
     // Check session limit
     if (this.sessions.size >= this.config.maxSessions!) {
-      throw new Error(`Session limit reached (${this.config.maxSessions})`);
+      throw new McpRuntimeError(
+        "MCP_RUNTIME_UNAVAILABLE",
+        `Session limit reached (${this.config.maxSessions})`,
+        true,
+        503
+      );
     }
 
     // Disk space pre-check for transports that write to disk (npx, stdio)
@@ -245,9 +316,12 @@ export class McpRuntime {
         cleanNpxCacheIfNeeded();
         const freeAfter = getFreeDiskMB();
         if (freeAfter !== -1 && freeAfter < MIN_DISK_MB) {
-          throw new Error(
+          throw new McpRuntimeError(
+            "MCP_SPAWN_FAILED",
             `Cannot spawn "${serverId}": disk critically low (${freeAfter}MB free, need ${MIN_DISK_MB}MB). ` +
-            `Clear space on the runtime server or use an HTTP-transport MCP server.`
+            `Clear space on the runtime server or use an HTTP-transport MCP server.`,
+            true,
+            503
           );
         }
       }
@@ -261,7 +335,7 @@ export class McpRuntime {
     // Create appropriate transport based on config
     if (config.transport === "http") {
       if (!config.remoteUrl) {
-        throw new Error("remoteUrl required for HTTP transport");
+        throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", "remoteUrl required for HTTP transport", false, 400);
       }
       transport = new HttpSseClientTransport({
         baseUrl: config.remoteUrl,
@@ -270,13 +344,13 @@ export class McpRuntime {
       transportType = "http";
     } else if (config.transport === "docker") {
       if (!config.image) {
-        throw new Error("image required for Docker transport");
+        throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", "image required for Docker transport", false, 400);
       }
       transport = new DockerClientTransport({ image: config.image });
       transportType = "docker";
     } else if (config.transport === "npx") {
       if (!config.package) {
-        throw new Error("package required for npx transport");
+        throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", "package required for npx transport", false, 400);
       }
       transport = new NpxClientTransport({
         package: config.package,
@@ -286,7 +360,7 @@ export class McpRuntime {
     } else {
       // stdio transport
       if (!config.command || !config.args) {
-        throw new Error("command and args required for stdio transport");
+        throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", "command and args required for stdio transport", false, 400);
       }
       transport = new StdioClientTransport({
         command: config.command,
@@ -337,7 +411,7 @@ export class McpRuntime {
     } catch (error) {
       // Classify the error for actionable diagnostics
       const diagnosis = classifySpawnError(error, serverId);
-      console.error(`[MCP Runtime] Failed to spawn ${serverId}: ${diagnosis}`);
+      console.error(`[MCP Runtime] Failed to spawn ${serverId}: ${diagnosis.message}`);
 
       // Record failure for backoff
       const now = new Date();
@@ -366,7 +440,7 @@ export class McpRuntime {
       }
 
       // Throw the classified error instead of the raw MCP error
-      throw new Error(diagnosis);
+      throw diagnosis;
     }
   }
 
@@ -375,10 +449,32 @@ export class McpRuntime {
    */
   getSessionTools(sessionId: string): any[] {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (!session) {
+      throw new McpRuntimeError("MCP_SESSION_NOT_FOUND", `Session not found: ${sessionId}`, true, 404);
+    }
 
     session.lastUsedAt = new Date();
     return session.tools;
+  }
+
+  /**
+   * Verify that a session is still responsive.
+   */
+  async isSessionAlive(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+
+    try {
+      await withTimeout(
+        session.client.listTools(),
+        5000,
+        `Session liveness check timed out for ${session.serverId}`
+      );
+      session.lastUsedAt = new Date();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -386,20 +482,31 @@ export class McpRuntime {
    */
   async executeTool(sessionId: string, toolName: string, args: Record<string, unknown>): Promise<any> {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (!session) {
+      throw new McpRuntimeError("MCP_SESSION_NOT_FOUND", `Session not found: ${sessionId}`, true, 404);
+    }
 
     session.lastUsedAt = new Date();
 
     console.log(`[MCP Runtime] Executing ${toolName} on session ${sessionId}`);
 
-    const result = await session.client.callTool({
-      name: toolName,
-      arguments: args,
-    });
+    let result;
+    try {
+      result = await session.client.callTool({
+        name: toolName,
+        arguments: args,
+      });
+    } catch (error) {
+      const classified = classifySpawnError(error, session.serverId);
+      if (classified.code === "MCP_SPAWN_TIMEOUT" || classified.code === "MCP_SPAWN_FAILED") {
+        throw new McpRuntimeError("MCP_SESSION_INVALID", classified.message, true, classified.statusCode);
+      }
+      throw classified;
+    }
 
     if (result.isError) {
       const errorMsg = (result.content as any)[0]?.text || 'Tool execution failed';
-      throw new Error(errorMsg);
+      throw new McpRuntimeError("MCP_TOOL_FAILED", errorMsg, true, 500);
     }
 
     // Try to parse as JSON, fallback to text
@@ -568,6 +675,7 @@ export class McpRuntime {
 
 // Session cache to avoid re-spawning servers
 const serverSessions = new Map<string, { sessionId: string; runtime: McpRuntime; createdAt: Date }>();
+const spawnLocks = new Map<string, Promise<string>>();
 const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
 
 // Singleton runtime for on-demand spawning
@@ -582,6 +690,59 @@ async function getSharedRuntime(): Promise<McpRuntime> {
     await sharedRuntime.initialize();
   }
   return sharedRuntime;
+}
+
+async function withSpawnLock(serverId: string, fn: () => Promise<string>): Promise<string> {
+  const existing = spawnLocks.get(serverId);
+  if (existing) {
+    return existing;
+  }
+
+  const spawned = (async () => {
+    try {
+      return await fn();
+    } finally {
+      spawnLocks.delete(serverId);
+    }
+  })();
+
+  spawnLocks.set(serverId, spawned);
+  return spawned;
+}
+
+async function spawnSession(
+  runtime: McpRuntime,
+  serverId: string,
+  config: ServerSpawnConfig
+): Promise<string> {
+  return withSpawnLock(serverId, async () => {
+    let sessionId: string;
+    try {
+      sessionId = await withTimeout(
+        runtime.spawnServer(serverId, config),
+        SPAWN_TIMEOUT_MS,
+        `MCP server "${serverId}" spawn timed out after ${SPAWN_TIMEOUT_MS / 1000}s`
+      );
+    } catch (error) {
+      if (isMcpRuntimeError(error)) {
+        throw error;
+      }
+      throw new McpRuntimeError(
+        "MCP_SPAWN_TIMEOUT",
+        `MCP server "${serverId}" spawn timed out after ${SPAWN_TIMEOUT_MS / 1000}s`,
+        true,
+        504
+      );
+    }
+
+    serverSessions.set(serverId, {
+      sessionId,
+      runtime,
+      createdAt: new Date(),
+    });
+
+    return sessionId;
+  });
 }
 
 /**
@@ -601,8 +762,8 @@ export async function getServerTools(serverId: string): Promise<{
   if (cached) {
     const age = Date.now() - cached.createdAt.getTime();
     if (age < SESSION_TTL) {
-      // Session still valid, use it
-      try {
+      const alive = await cached.runtime.isSessionAlive(cached.sessionId);
+      if (alive) {
         const tools = cached.runtime.getSessionTools(cached.sessionId);
         console.log(`[mcp] Using cached session for ${serverId}: ${cached.sessionId}`);
         return {
@@ -612,10 +773,14 @@ export async function getServerTools(serverId: string): Promise<{
           toolCount: tools.length,
           tools,
         };
-      } catch (error) {
-        // Session no longer valid, remove from cache
-        console.log(`[mcp] Cached session ${cached.sessionId} for ${serverId} is invalid, re-spawning`);
-        serverSessions.delete(serverId);
+      }
+
+      console.log(`[mcp] Cached session ${cached.sessionId} for ${serverId} is stale, terminating and re-spawning`);
+      serverSessions.delete(serverId);
+      try {
+        await cached.runtime.terminateSession(cached.sessionId);
+      } catch {
+        // Ignore cleanup errors
       }
     } else {
       // Session expired, clean up
@@ -632,22 +797,11 @@ export async function getServerTools(serverId: string): Promise<{
   // No valid cached session, spawn new server
   const config = await getMcpServerConfig(serverId);
   if (!config) {
-    throw new Error(`Unknown MCP server: ${serverId}`);
+    throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", `Unknown MCP server: ${serverId}`, false, 404);
   }
 
   console.log(`[mcp] Spawning new session for ${serverId}: ${config.command} ${config.args?.join(' ') || ''}`);
-  const sessionId = await withTimeout(
-    runtime.spawnServer(serverId, config),
-    SPAWN_TIMEOUT_MS,
-    `MCP server "${serverId}" spawn timed out after ${SPAWN_TIMEOUT_MS / 1000}s`
-  );
-
-  // Cache the session
-  serverSessions.set(serverId, {
-    sessionId,
-    runtime,
-    createdAt: new Date(),
-  });
+  const sessionId = await spawnSession(runtime, serverId, config);
 
   const tools = runtime.getSessionTools(sessionId);
 
@@ -670,24 +824,33 @@ export async function executeServerTool(
 ): Promise<any> {
   const runtime = await getSharedRuntime();
 
-  // Check for cached session
+  // Check for cached session with explicit liveness check
   let sessionId: string | null = null;
   const cached = serverSessions.get(serverId);
 
   if (cached) {
     const age = Date.now() - cached.createdAt.getTime();
     if (age < SESSION_TTL) {
-      try {
-        // Verify session is still valid
-        cached.runtime.getSessionTools(cached.sessionId);
+      const alive = await cached.runtime.isSessionAlive(cached.sessionId);
+      if (alive) {
         sessionId = cached.sessionId;
         console.log(`[mcp] Using cached session for ${serverId}: ${cached.sessionId}`);
-      } catch (error) {
-        console.log(`[mcp] Cached session invalid, will spawn new one`);
+      } else {
+        console.log(`[mcp] Cached session stale for ${serverId}, terminating and respawning`);
         serverSessions.delete(serverId);
+        try {
+          await cached.runtime.terminateSession(cached.sessionId);
+        } catch {
+          // ignore cleanup errors
+        }
       }
     } else {
       serverSessions.delete(serverId);
+      try {
+        await cached.runtime.terminateSession(cached.sessionId);
+      } catch {
+        // ignore cleanup errors
+      }
     }
   }
 
@@ -695,25 +858,46 @@ export async function executeServerTool(
   if (!sessionId) {
     const config = await getMcpServerConfig(serverId);
     if (!config) {
-      throw new Error(`Unknown MCP server: ${serverId}`);
+      throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", `Unknown MCP server: ${serverId}`, false, 404);
     }
 
     console.log(`[mcp] Spawning session for tool execution on ${serverId}`);
-    sessionId = await runtime.spawnServer(serverId, config);
-    serverSessions.set(serverId, {
-      sessionId,
-      runtime,
-      createdAt: new Date(),
-    });
+    sessionId = await spawnSession(runtime, serverId, config);
   }
 
-  // Execute tool
-  return await runtime.executeTool(sessionId, toolName, args);
+  // Execute tool; if stale session slips through, respawn once and retry.
+  try {
+    return await runtime.executeTool(sessionId, toolName, args);
+  } catch (error) {
+    const classified = classifySpawnError(error, serverId);
+    if (classified.code !== "MCP_SESSION_INVALID" && classified.code !== "MCP_SESSION_NOT_FOUND") {
+      throw classified;
+    }
+
+    const config = await getMcpServerConfig(serverId);
+    if (!config) {
+      throw new McpRuntimeError("MCP_CONFIG_NOT_FOUND", `Unknown MCP server: ${serverId}`, false, 404);
+    }
+
+    console.log(`[mcp] Session invalid for ${serverId}, respawning once and retrying ${toolName}`);
+    const stale = serverSessions.get(serverId);
+    if (stale) {
+      serverSessions.delete(serverId);
+      try {
+        await stale.runtime.terminateSession(stale.sessionId);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+
+    const respawnedSessionId = await spawnSession(runtime, serverId, config);
+    return await runtime.executeTool(respawnedSessionId, toolName, args);
+  }
 }
 
 /**
  * Get MCP server configuration from Connector Service
- * The connector's resolveServerByFlexibleId handles all flexible matching
+ * Connector enforces strict resolution on spawn path (no partial execution matches).
  */
 async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig | null> {
   const CONNECTOR_URL = process.env.CONNECTOR_URL || "http://localhost:4001";
@@ -734,11 +918,22 @@ async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig |
       return null;
     }
 
-    console.warn(`[mcp] ✗ Error fetching "${serverId}": ${response.status}`);
-    return null;
+    throw new McpRuntimeError(
+      "MCP_RUNTIME_UNAVAILABLE",
+      `Connector returned ${response.status} while resolving "${serverId}"`,
+      true,
+      response.status
+    );
   } catch (error) {
+    if (isMcpRuntimeError(error)) {
+      throw error;
+    }
     console.error(`[mcp] ✗ Error fetching "${serverId}":`, error);
-    return null;
+    throw new McpRuntimeError(
+      "MCP_RUNTIME_UNAVAILABLE",
+      `Connector request failed for "${serverId}"`,
+      true,
+      503
+    );
   }
 }
-

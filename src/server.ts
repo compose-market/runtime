@@ -21,7 +21,7 @@ import {
   getWalletAddress,
   getPluginIds,
 } from "./runtimes/goat.js";
-import { McpRuntime, getServerTools, executeServerTool } from "./runtimes/mcp.js";
+import { McpRuntime, getServerTools, executeServerTool, McpRuntimeError } from "./runtimes/mcp.js";
 
 const app = express();
 
@@ -68,6 +68,27 @@ function asyncHandler(
   return (req: Request, res: Response, next: NextFunction) => {
     fn(req, res, next).catch(next);
   };
+}
+
+function sendRuntimeError(res: Response, error: unknown, fallback: string): void {
+  if (error instanceof McpRuntimeError) {
+    res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+      },
+    });
+    return;
+  }
+
+  res.status(500).json({
+    error: {
+      code: "UNKNOWN",
+      message: error instanceof Error ? error.message : fallback,
+      retryable: false,
+    },
+  });
 }
 
 // ============================================================================
@@ -305,10 +326,7 @@ app.post("/mcp/spawn", asyncHandler(async (req: Request, res: Response) => {
     console.log(`[mcp] Spawned server ${serverId} via /mcp/spawn`);
     res.json(result);
   } catch (error) {
-    res.status(500).json({
-      error: `Failed to spawn ${serverId}`,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendRuntimeError(res, error, `Failed to spawn ${serverId}`);
   }
 }));
 
@@ -323,10 +341,7 @@ app.get("/mcp/servers/:serverId/tools", asyncHandler(async (req: Request, res: R
     const result = await getServerTools(serverId);
     res.json(result);
   } catch (error) {
-    res.status(500).json({
-      error: `Failed to get tools for ${serverId}`,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendRuntimeError(res, error, `Failed to get tools for ${serverId}`);
   }
 }));
 
@@ -374,10 +389,7 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
       result,
     });
   } catch (error) {
-    res.status(500).json({
-      error: `Failed to execute tool ${toolName} on ${serverId}`,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendRuntimeError(res, error, `Failed to execute tool ${toolName} on ${serverId}`);
   }
 }));
 
@@ -438,10 +450,7 @@ app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) =>
 
     res.json(resultData);
   } catch (error) {
-    res.status(500).json({
-      error: 'Tool execution failed',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    sendRuntimeError(res, error, "Tool execution failed");
   }
 }));
 
