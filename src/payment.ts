@@ -236,7 +236,10 @@ if (!SERVER_WALLET_ADDRESS) {
 }
 
 // Internal secret for Manowar nested calls
-const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
+const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET;
+if (!MANOWAR_INTERNAL_SECRET) {
+  throw new Error("MANOWAR_INTERNAL_SECRET is required");
+}
 
 // Server-side ThirdWeb client
 const serverClient = THIRDWEB_SECRET_KEY

@@ -7,26 +7,33 @@
  */
 import "dotenv/config";
 import express, { type Request, type Response, type NextFunction } from "express";
-import cors from "cors";
+import cors, { type CorsOptions } from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
+import type { Server as HttpServer } from "http";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 import {
-  executeGoatTool,
   getRuntimeStatus,
   listPlugins,
-  getPlugin,
   getPluginTools,
   listAllTools,
   getTool,
   hasTool,
   getWalletAddress,
   getPluginIds,
+  executeGoatTool,
 } from "./runtimes/goat.js";
-import { McpRuntime, getServerTools, executeServerTool, McpRuntimeError } from "./runtimes/mcp.js";
+import {
+  McpRuntime,
+  McpRuntimeError,
+  executeServerTool,
+  getServerTools,
+} from "./runtimes/mcp.js";
 
 const app = express();
 
 // CORS Configuration
-app.use(cors({
+const corsOptions: CorsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (origin.startsWith("http://localhost:")) return callback(null, true);
@@ -48,16 +55,24 @@ app.use(cors({
     "x-session-budget-remaining",
     "x-manowar-internal",
     "x-chain-id",
+    "x-compose-run-id",
+    "x-idempotency-key",
+    "x-tool-price",
     "access-control-expose-headers"
   ],
   exposedHeaders: ["*", "PAYMENT-RESPONSE", "payment-response", "x-session-id"]
-}));
+};
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
 // Request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.path}`);
+  const composeRunId = req.headers["x-compose-run-id"];
+  const idempotencyKey = req.headers["x-idempotency-key"];
+  console.log(
+    `[${timestamp}] ${req.method} ${req.path} run=${String(composeRunId || "-")} idem=${String(idempotencyKey || "-")}`,
+  );
   next();
 });
 
@@ -110,6 +125,9 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
     stats: {
       goatPlugins: goatStatus.plugins.length,
       goatTools: goatStatus.totalTools,
+    },
+    orchestration: {
+      durabilityBoundary: "manowar",
     }
   });
 }));
@@ -321,7 +339,6 @@ app.post("/mcp/spawn", asyncHandler(async (req: Request, res: Response) => {
   }
 
   try {
-    // getServerTools handles spawning on-demand and caching logic
     const result = await getServerTools(serverId);
     console.log(`[mcp] Spawned server ${serverId} via /mcp/spawn`);
     res.json(result);
@@ -470,11 +487,24 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // Server Startup
 // ============================================================================
 
-const PORT = process.env.MCP_PORT || process.env.PORT || 4003;
+export async function startRuntimeServer(port?: number): Promise<HttpServer> {
+  const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
+  const server = app.listen(resolvedPort, () => {
+    console.log(`[mcp] Server listening on port ${resolvedPort}`);
+    console.log(`[mcp] Runtime Service (GOAT + MCP Tools)`);
+  });
+  return server;
+}
 
-app.listen(PORT, () => {
-  console.log(`[mcp] Server listening on port ${PORT}`);
-  console.log(`[mcp] Runtime Service (GOAT + MCP Tools)`);
-});
+const isMainModule = process.argv[1]
+  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
+
+if (isMainModule) {
+  startRuntimeServer().catch((error) => {
+    console.error("[mcp] Failed to start server:", error);
+    process.exit(1);
+  });
+}
 
 export default app;
