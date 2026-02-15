@@ -10,11 +10,20 @@ import cors from "cors";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 import agentRoutes from "./agent-routes.js";
 import {
-    executeWithOrchestrator,
     MANOWAR_PRICES,
     type Workflow,
     type PaymentContext,
 } from "./manowar/index.js";
+import {
+    cancelManowarRun,
+    createComposeRunId,
+    executeManowarRunWithFallback,
+    getManowarRunState,
+    sanitizeExecutorOptions,
+    signalStepApproval,
+    startManowarRun,
+    TemporalRunNotFoundError,
+} from "./temporal/service.js";
 import {
     parseTriggerFromNL,
     retrieveTriggers,
@@ -23,6 +32,9 @@ import {
     registerTrigger,
     unregisterTrigger,
 } from "./manowar/triggers.js";
+import { getTemporalWorkerPollers, startManowarTemporalWorkers } from "./temporal/worker.js";
+import { isTemporalConfigured } from "./temporal/client.js";
+import { executeWithOrchestrator } from "./manowar/orchestrator.js";
 import {
     registerManowar,
     getManowar,
@@ -33,14 +45,21 @@ import {
 import type { WorkflowStep, TriggerDefinition } from "./manowar/types.js";
 
 const app = express();
-const cancellationTokens = new Map<string, { cancelled: boolean }>();
+const activeRunIds = new Map<string, string>();
+const SSE_HEARTBEAT_INTERVAL_MS = 10000;
+const SSE_POLL_INTERVAL_MS = 1000;
+const SSE_STATE_MISS_LIMIT = 8;
+const SSE_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+let temporalWorkerState: "starting" | "ready" | "error" = "starting";
+let temporalWorkerError: string | undefined;
+const ALLOW_DIRECT_EXECUTION_FALLBACK = process.env.TEMPORAL_ALLOW_DIRECT_FALLBACK === "true";
 
 function buildWorkflowFromManowar(manowar: {
     walletAddress: string;
     title?: string;
     description?: string;
     agentWalletAddresses?: string[];
-}) : Workflow {
+}): Workflow {
     const steps: WorkflowStep[] = [];
     for (const agentWallet of (manowar.agentWalletAddresses || [])) {
         const agent = resolveAgent(agentWallet);
@@ -91,6 +110,9 @@ app.use(cors({
         "x-session-budget-remaining",
         "x-manowar-internal",
         "x-chain-id",
+        "x-compose-run-id",
+        "x-idempotency-key",
+        "x-tool-price",
         "access-control-expose-headers"
     ],
     exposedHeaders: [
@@ -99,20 +121,27 @@ app.use(cors({
         "payment-response",            // x402 V2 response header (lowercase)
         "X-Transaction-Hash",          // Cronos settlement response
         "X-PAYMENT-RESPONSE",          // Cronos payment response
-        "x-session-id"
-    ]
+        "x-session-id",
+        "x-compose-key-budget-limit",
+        "x-compose-key-budget-used",
+        "x-compose-key-budget-remaining",
+    ],
 }));
 app.use(express.json({ limit: '10mb' }));
-
-// Mount agent routes
-app.use("/agent", agentRoutes);
 
 // Request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] ${req.method} ${req.path}`);
+    const composeRunId = req.headers["x-compose-run-id"];
+    const idempotencyKey = req.headers["x-idempotency-key"];
+    console.log(
+        `[${timestamp}] ${req.method} ${req.path} run=${String(composeRunId || "-")} idem=${String(idempotencyKey || "-")}`,
+    );
     next();
 });
+
+// Mount agent routes
+app.use("/agent", agentRoutes);
 
 // Error handling wrapper
 function asyncHandler(
@@ -136,11 +165,20 @@ function getParam(value: string | string[] | undefined): string {
 // ============================================================================
 
 app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
+    const pollers = getTemporalWorkerPollers();
+    const pollerTotal = Object.values(pollers).reduce((sum, count) => sum + count, 0);
     res.json({
         status: "ok",
         timestamp: new Date().toISOString(),
         service: "manowar-orchestration",
         version: "0.1.0",
+        temporal: {
+            state: temporalWorkerState,
+            error: temporalWorkerError,
+            fallbackMode: temporalFallbackMode,
+            pollers,
+            pollerTotal,
+        },
     });
 }));
 
@@ -172,6 +210,9 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         res.status(paymentResult.status).json(paymentResult.responseBody);
         return;
     }
+    Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+    });
 
     // Parse manowar identifier - must be wallet address
     const walletAddress = String(payload.walletAddress || payload.manowarWallet || payload.id);
@@ -226,11 +267,31 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         ? payload.input
         : payload.input?.message || payload.message || "Execute workflow";
 
-    const result = await executeWithOrchestrator(workflow, userMessage, {
-        payment: paymentContext,
-        coordinatorModel: manowar.coordinatorModel,
-        manowarCardUri: manowar.manowarCardUri,
-    });
+    if (!isTemporalReady() && !ALLOW_DIRECT_EXECUTION_FALLBACK) {
+        res.status(503).json({
+            error: "Temporal is not ready and direct fallback is disabled",
+            temporal: {
+                state: temporalWorkerState,
+                pollers: getTemporalWorkerPollers(),
+            },
+        });
+        return;
+    }
+
+    const runId = createComposeRunId();
+    // Use executeManowarRunWithFallback for automatic circuit breaker protection
+    // Falls back to direct execution if Temporal is unavailable
+    const result = await executeManowarRunWithFallback(
+        manowar.walletAddress,
+        workflow,
+        userMessage,
+        sanitizeExecutorOptions({
+            payment: paymentContext,
+            coordinatorModel: manowar.coordinatorModel,
+            manowarCardUri: manowar.manowarCardUri,
+        }),
+        runId,
+    );
 
     // Mark as executed
     markManowarExecuted(manowar.walletAddress);
@@ -346,22 +407,8 @@ app.post("/api/manowar/:walletAddress/triggers", asyncHandler(async (req: Reques
     trigger.memoryId = memoryId || trigger.memoryId;
 
     if (trigger.enabled && trigger.cronExpression) {
-        registerTrigger(trigger, async (t) => {
-            const manowar = getManowar(t.manowarWallet);
-            if (!manowar) return;
-            const workflow = buildWorkflowFromManowar(manowar);
-            await executeWithOrchestrator(workflow, (t.inputTemplate as any)?.message || t.nlDescription || "Scheduled run", {
-                payment: {
-                    paymentData: null,
-                    sessionActive: false,
-                    sessionBudgetRemaining: 0,
-                    resourceUrlBase: "",
-                },
-                coordinatorModel: manowar.coordinatorModel,
-                manowarCardUri: manowar.manowarCardUri,
-                triggerId: t.id,
-                synthesizeFinal: true,
-            });
+        await registerTrigger(trigger, async () => {
+            return;
         });
     }
 
@@ -387,25 +434,11 @@ app.put("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async (r
     updated.memoryId = memoryId || updated.memoryId;
 
     if (updated.enabled && updated.cronExpression) {
-        registerTrigger(updated, async (t) => {
-            const manowar = getManowar(t.manowarWallet);
-            if (!manowar) return;
-            const workflow = buildWorkflowFromManowar(manowar);
-            await executeWithOrchestrator(workflow, (t.inputTemplate as any)?.message || t.nlDescription || "Scheduled run", {
-                payment: {
-                    paymentData: null,
-                    sessionActive: false,
-                    sessionBudgetRemaining: 0,
-                    resourceUrlBase: "",
-                },
-                coordinatorModel: manowar.coordinatorModel,
-                manowarCardUri: manowar.manowarCardUri,
-                triggerId: t.id,
-                synthesizeFinal: true,
-            });
+        await registerTrigger(updated, async () => {
+            return;
         });
     } else {
-        unregisterTrigger(triggerId);
+        await unregisterTrigger(triggerId, manowarWallet);
     }
 
     res.json(updated);
@@ -416,7 +449,6 @@ app.delete("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async
     const triggerId = getParam(req.params.triggerId);
     const userId = req.headers["x-session-user-address"] as string | undefined;
     const ok = await deleteTriggerFromMemory(triggerId, manowarWallet, userId);
-    unregisterTrigger(triggerId);
     res.json({ success: ok });
 }));
 
@@ -424,7 +456,7 @@ app.delete("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async
 // Manowar Chat (x402 Payable, Streaming)
 // ============================================================================
 
-app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: Response) => {
+const manowarChatHandler = asyncHandler(async (req: Request, res: Response) => {
     const identifier = getParam(req.params.walletAddress);
 
     // x402 Payment Verification (includes chainId from X-CHAIN-ID header)
@@ -449,6 +481,9 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
         res.status(paymentResult.status).json(paymentResult.responseBody);
         return;
     }
+    Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+    });
 
     // Resolve manowar from in-memory registry - wallet address only
     const manowar = getManowar(identifier);
@@ -463,11 +498,12 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
     console.log(`[manowar] Built ${workflow.steps.length} agent steps from wallets: [${manowar.agentWalletAddresses?.join(", ") || "none"}]`);
 
     // Parse request - handle both legacy (image/audio) and new (attachment) formats
-    const { message, threadId, image, audio, attachment, continuous } = req.body;
+    const { message, threadId, image, audio, attachment, continuous, composeRunId, lastEventIndex: requestedLastEventIndex } = req.body;
     if (!message) {
         res.status(400).json({ error: "message is required" });
         return;
     }
+    const cancellationKey = `${manowar.walletAddress}:${threadId || "default"}`;
 
     // Prepare payment context
     const paymentContext: PaymentContext = {
@@ -488,29 +524,160 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
     if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.flushHeaders();
-
-    // Send initial SSE event
-    res.write(`event: start\ndata: ${JSON.stringify({ runId: `run-${Date.now()}`, message: "Starting workflow..." })}\n\n`);
-
-    const cancellationKey = `${manowar.walletAddress}:${threadId || "default"}`;
-    const cancellationToken = { cancelled: false };
-    cancellationTokens.set(cancellationKey, cancellationToken);
-
-    // Execute workflow with SSE progress callback
-    const result = await executeWithOrchestrator(workflow, message, {
-        payment: paymentContext,
-        coordinatorModel: manowar.coordinatorModel,
-        manowarCardUri: manowar.manowarCardUri,
-        continuous: Boolean(continuous),
-        maxLoopIterations: Boolean(continuous) ? 5 : undefined,
-        shouldCancel: () => cancellationToken.cancelled,
-        onProgress: (event: any) => {
-            // Send SSE event for each progress update
-            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
-        },
+    let clientDisconnected = false;
+    const heartbeat = setInterval(() => {
+        if (!res.writableEnded) {
+            res.write(": ping\n\n");
+        }
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    res.on("close", () => {
+        clientDisconnected = true;
+        clearInterval(heartbeat);
     });
 
-    cancellationTokens.delete(cancellationKey);
+    const runId = typeof composeRunId === "string" && composeRunId.length > 0 ? composeRunId : createComposeRunId();
+    res.setHeader("x-compose-run-id", runId);
+    res.write(`event: start\ndata: ${JSON.stringify({ runId, message: "Starting workflow..." })}\n\n`);
+
+    activeRunIds.set(cancellationKey, runId);
+
+    let result: any;
+
+    if (isTemporalReady()) {
+        // Use Temporal workflow execution with polling for SSE
+        const handle = await startManowarRun(
+            manowar.walletAddress,
+            workflow,
+            message,
+            sanitizeExecutorOptions({
+                payment: paymentContext,
+                coordinatorModel: manowar.coordinatorModel,
+                manowarCardUri: manowar.manowarCardUri,
+                continuous: Boolean(continuous),
+                maxLoopIterations: Boolean(continuous) ? 5 : undefined,
+            }),
+            runId,
+        );
+
+        let lastEventIndex = typeof requestedLastEventIndex === "number" && Number.isFinite(requestedLastEventIndex)
+            ? Math.max(0, requestedLastEventIndex)
+            : 0;
+        let latestState = await getManowarRunState(manowar.walletAddress, runId);
+        let missingStateCount = latestState ? 0 : 1;
+        const pollStartedAt = Date.now();
+        let pollFailed = false;
+
+        while (true) {
+            if (clientDisconnected) {
+                return;
+            }
+            latestState = await getManowarRunState(manowar.walletAddress, runId);
+            if (!latestState) {
+                missingStateCount += 1;
+                const pollTimedOut = Date.now() - pollStartedAt >= SSE_POLL_TIMEOUT_MS;
+                if (missingStateCount >= SSE_STATE_MISS_LIMIT || pollTimedOut) {
+                    pollFailed = true;
+                    const reason = pollTimedOut
+                        ? "Run state polling timed out"
+                        : "Run state unavailable";
+                    res.write(`event: error\ndata: ${JSON.stringify({ runId, error: reason })}\n\n`);
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, SSE_POLL_INTERVAL_MS));
+                continue;
+            }
+
+            missingStateCount = 0;
+            if (latestState?.events?.length) {
+                while (lastEventIndex < latestState.events.length) {
+                    const event = latestState.events[lastEventIndex];
+                    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+                    lastEventIndex++;
+                }
+            }
+
+            const status = latestState?.status;
+            if (status === "success" || status === "error" || status === "cancelled") {
+                break;
+            }
+            if (Date.now() - pollStartedAt >= SSE_POLL_TIMEOUT_MS) {
+                pollFailed = true;
+                res.write(`event: error\ndata: ${JSON.stringify({ runId, error: "Run state polling timed out" })}\n\n`);
+                break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, SSE_POLL_INTERVAL_MS));
+        }
+
+        if (pollFailed) {
+            result = {
+                success: false,
+                result: "",
+                stepResults: [],
+                totalTokensUsed: 0,
+                error: latestState?.error || "Workflow state became unavailable",
+            };
+        } else {
+            try {
+                result = await handle.result();
+            } catch (error) {
+                if (clientDisconnected) {
+                    return;
+                }
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                result = {
+                    success: false,
+                    result: "",
+                    stepResults: [],
+                    totalTokensUsed: 0,
+                    error: latestState?.error || errorMessage,
+                };
+            }
+        }
+    } else {
+        if (!ALLOW_DIRECT_EXECUTION_FALLBACK) {
+            res.write(`event: error\ndata: ${JSON.stringify({ runId, error: "Temporal is unavailable and direct fallback is disabled" })}\n\n`);
+            res.write("event: done\ndata: {}\n\n");
+            clearInterval(heartbeat);
+            res.end();
+            return;
+        }
+
+        // Fallback to direct orchestrator execution with SSE callbacks
+        console.log(`[manowar/chat] Using direct execution (Temporal unavailable or in fallback mode)`);
+
+        try {
+            result = await executeWithOrchestrator(workflow, message, {
+                payment: paymentContext,
+                coordinatorModel: manowar.coordinatorModel,
+                manowarCardUri: manowar.manowarCardUri,
+                continuous: Boolean(continuous),
+                maxLoopIterations: Boolean(continuous) ? 5 : undefined,
+                runId,
+                shouldCancel: () => {
+                    // Check cancellation via activeRunIds (consistent with stop endpoint)
+                    return !activeRunIds.has(cancellationKey);
+                },
+                onProgress: (event: any) => {
+                    // Send SSE event for each progress update
+                    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+                },
+            });
+        } catch (error) {
+            if (clientDisconnected) {
+                return;
+            }
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            result = {
+                success: false,
+                result: "",
+                stepResults: [],
+                totalTokensUsed: 0,
+                error: errorMessage,
+            };
+        }
+    }
+
+    activeRunIds.delete(cancellationKey);
 
     // Mark as executed
     markManowarExecuted(manowar.walletAddress);
@@ -528,27 +695,79 @@ app.post("/manowar/:walletAddress/chat", asyncHandler(async (req: Request, res: 
     };
     res.write(`event: result\ndata: ${JSON.stringify(finalData)}\n\n`);
     res.write(`event: done\ndata: {}\n\n`);
+    clearInterval(heartbeat);
     res.end();
-}));
+});
+
+app.post("/manowar/:walletAddress/chat", manowarChatHandler);
 
 // Stop a running workflow (best-effort, cancels between steps)
 app.post("/manowar/:walletAddress/stop", asyncHandler(async (req: Request, res: Response) => {
     const walletAddress = getParam(req.params.walletAddress);
-    const { threadId } = req.body || {};
+    const { threadId, runId: requestedRunId } = req.body || {};
     const cancellationKey = `${walletAddress}:${threadId || "default"}`;
-    const token = cancellationTokens.get(cancellationKey);
-    if (token) {
-        token.cancelled = true;
-        res.json({ success: true });
+    const runId = typeof requestedRunId === "string" && requestedRunId.length > 0
+        ? requestedRunId
+        : activeRunIds.get(cancellationKey);
+    if (!runId) {
+        res.status(404).json({ success: false, error: "No active run found" });
         return;
     }
-    res.status(404).json({ success: false, error: "No active run found" });
+
+    try {
+        await cancelManowarRun(walletAddress, runId);
+        res.json({ success: true, runId });
+        return;
+    } catch (error) {
+        if (error instanceof TemporalRunNotFoundError) {
+            res.status(404).json({ success: false, error: error.message });
+            return;
+        }
+        throw error;
+    }
+}));
+
+app.get("/manowar/:walletAddress/runs/:runId/state", asyncHandler(async (req: Request, res: Response) => {
+    const walletAddress = getParam(req.params.walletAddress);
+    const runId = getParam(req.params.runId);
+    const state = await getManowarRunState(walletAddress, runId);
+    if (!state) {
+        res.status(404).json({ success: false, error: "Run not found" });
+        return;
+    }
+    res.json(state);
+}));
+
+app.post("/manowar/:walletAddress/runs/:runId/approval", asyncHandler(async (req: Request, res: Response) => {
+    const walletAddress = getParam(req.params.walletAddress);
+    const runId = getParam(req.params.runId);
+    const { stepKey, status, approver, reason } = req.body || {};
+
+    if (!stepKey || typeof stepKey !== "string") {
+        res.status(400).json({ success: false, error: "stepKey is required" });
+        return;
+    }
+    if (status !== "approved" && status !== "rejected") {
+        res.status(400).json({ success: false, error: "status must be 'approved' or 'rejected'" });
+        return;
+    }
+
+    try {
+        await signalStepApproval(walletAddress, runId, stepKey, status, approver, reason);
+        res.json({ success: true });
+    } catch (error) {
+        if (error instanceof TemporalRunNotFoundError) {
+            res.status(404).json({ success: false, error: error.message });
+            return;
+        }
+        throw error;
+    }
 }));
 
 // Alias /run to /chat to match ManowarManifestSchema endpoint definition
 app.post("/manowar/:id/run", (req, res, next) => {
-    req.url = req.url.replace("/run", "/chat");
-    app._router.handle(req, res, next);
+    (req.params as Record<string, string>).walletAddress = getParam(req.params.id);
+    return manowarChatHandler(req, res, next);
 });
 
 // ============================================================================
@@ -576,13 +795,83 @@ app.get("/frameworks", (_req: Request, res: Response) => {
 // Error Handling
 // ============================================================================
 
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error("[error]", err);
-    res.status(500).json({
-        error: err.message || "Internal server error",
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+    const origin = req.headers.origin;
+    if (origin) {
+        res.header("Access-Control-Allow-Origin", origin);
+        res.header("Access-Control-Allow-Credentials", "true");
+    }
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Headers", [
+        "Content-Type",
+        "Authorization",
+        "PAYMENT-SIGNATURE",
+        "payment-signature",
+        "X-PAYMENT",
+        "x-payment",
+        "X-CHAIN-ID",
+        "x-session-user-address",
+        "x-session-active",
+        "x-session-budget-remaining",
+        "x-manowar-internal",
+        "x-chain-id",
+        "x-compose-run-id",
+        "x-idempotency-key",
+        "x-tool-price",
+        "access-control-expose-headers",
+    ].join(", "));
+    res.header("Access-Control-Expose-Headers", [
+        "PAYMENT-RESPONSE",
+        "payment-response",
+        "X-Transaction-Hash",
+        "X-PAYMENT-RESPONSE",
+        "x-session-id",
+        "x-compose-key-budget-limit",
+        "x-compose-key-budget-used",
+        "x-compose-key-budget-remaining",
+    ].join(", "));
+
+    console.error(`[Server Error] ${req.method} ${req.path}:`, err.message);
+    console.error(err.stack);
+
+    let statusCode = 500;
+    let errorMessage = err.message || "Internal server error";
+
+    if (err.message.includes("timeout") || err.message.includes("ECONNRESET")) {
+        statusCode = 504;
+        errorMessage = "Request timed out. The run may still be processing. Check the run state endpoint.";
+    } else if (err.message.includes("Recursion limit")) {
+        statusCode = 508;
+        errorMessage = "Agent reached maximum reasoning depth.";
+    } else if (err.message.includes("not found") || err.message.includes("404")) {
+        statusCode = 404;
+    } else if (err.message.includes("payment") || err.message.includes("402")) {
+        statusCode = 402;
+    }
+
+    res.status(statusCode).json({
+        error: true,
+        status: statusCode,
+        message: errorMessage,
+        path: req.path,
         timestamp: new Date().toISOString(),
+        runId: req.headers["x-compose-run-id"] || undefined,
     });
 });
+
+// ============================================================================
+// Temporal Integration Helpers
+// ============================================================================
+
+let temporalFallbackMode = false;
+
+function isTemporalReady(): boolean {
+    if (temporalWorkerState !== "ready" || temporalFallbackMode) {
+        return false;
+    }
+    const pollers = getTemporalWorkerPollers();
+    return Object.values(pollers).every((count) => count > 0);
+}
 
 // ============================================================================
 // Server Startup
@@ -593,6 +882,40 @@ const PORT = process.env.PORT || 4003;
 app.listen(PORT, () => {
     console.log(`[manowar] Server listening on port ${PORT}`);
     console.log(`[manowar] Agent Orchestration & Workflow Execution`);
+
+    // Check if Temporal is configured
+    if (!isTemporalConfigured()) {
+        console.log(`[manowar] Temporal not configured`);
+        temporalWorkerState = "error";
+        temporalFallbackMode = ALLOW_DIRECT_EXECUTION_FALLBACK;
+        temporalWorkerError = ALLOW_DIRECT_EXECUTION_FALLBACK
+            ? "Temporal not configured - using direct execution fallback mode"
+            : "Temporal not configured - fallback disabled";
+        if (!ALLOW_DIRECT_EXECUTION_FALLBACK) {
+            console.error("[manowar] Temporal is mandatory and fallback is disabled.");
+        }
+        return;
+    }
+
+    // Start Temporal workers non-blocking
+    console.log(`[manowar] Starting Temporal workers...`);
+    void startManowarTemporalWorkers()
+        .then(() => {
+            temporalWorkerState = "ready";
+            temporalWorkerError = undefined;
+            console.log(`[manowar] Temporal workers ready`);
+        })
+        .catch((error) => {
+            temporalWorkerState = "error";
+            temporalWorkerError = error instanceof Error ? error.message : String(error);
+            temporalFallbackMode = ALLOW_DIRECT_EXECUTION_FALLBACK;
+            if (ALLOW_DIRECT_EXECUTION_FALLBACK) {
+                console.error("[manowar] Failed to start Temporal workers, falling back to direct execution:", error);
+                console.log(`[manowar] Server continues in fallback mode - workflows will use direct execution`);
+            } else {
+                console.error("[manowar] Failed to start Temporal workers and fallback is disabled:", error);
+            }
+        });
 });
 
 export default app;

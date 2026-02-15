@@ -8,20 +8,26 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import {
-    registerAgent,
+    ensureAgentRuntimeReady,
+    getAgentRuntimeWarmupError,
+    isAgentRuntimeWarming,
     resolveAgent,
     resolveAgentInstance,
     listRegisteredAgents,
     markAgentExecuted,
+    registerAgentWithWarmup,
     uploadAgentKnowledge,
     listAgentKnowledgeKeys,
     uploadBase64ToPinata,
 } from "./frameworks/runtime.js";
-import { executeAgent, streamAgent } from "./frameworks/langchain.js";
 import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
+import { streamAgent } from "./frameworks/langchain.js";
+import { createComposeRunId, executeAgentRunWithFallback, getAgentRunState } from "./temporal/service.js";
 
 const router = Router();
+const JSON_KEEPALIVE_INTERVAL_MS = 5000; // 5 seconds - keeps proxies alive, prevents 504s
+const AGENT_WARMUP_TIMEOUT_MS = 12000;
 
 // =============================================================================
 // Middleware
@@ -44,6 +50,27 @@ function asyncHandler(
 function getParam(value: string | string[] | undefined): string {
     if (Array.isArray(value)) return value[0] || "";
     return value || "";
+}
+
+function safeStringify(value: unknown): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return JSON.stringify({ error: "Failed to serialize response" });
+    }
+}
+
+async function warmAgentRuntimeOrTimeout(walletAddress: string): Promise<boolean> {
+    const timeout = new Promise<null>((resolve) => {
+        setTimeout(() => resolve(null), AGENT_WARMUP_TIMEOUT_MS);
+    });
+
+    try {
+        const result = await Promise.race([ensureAgentRuntimeReady(walletAddress), timeout]);
+        return Boolean(result);
+    } catch {
+        return false;
+    }
 }
 
 // =============================================================================
@@ -80,6 +107,7 @@ const RegisterAgentSchema = z.object({
 const ChatSchema = z.object({
     message: z.string().min(1, "message is required"),
     threadId: z.string().optional(),
+    composeRunId: z.string().optional(),
     manowarWallet: z.string().optional(), // Wallet address of the orchestrating Manowar (if any)
     // New attachment format (Pinata URL)
     attachment: z.object({
@@ -120,41 +148,30 @@ router.post(
 
         const params = parseResult.data;
 
-        try {
-            // The walletAddress is derived from dnaHash and must match frontend derivation.
-            const agent = await registerAgent({
-                walletAddress: params.walletAddress, // From IPFS metadata
-                walletTimestamp: params.walletTimestamp, // Optional - for signing capability
-                dnaHash: params.dnaHash,
-                name: params.name,
-                description: params.description,
-                agentCardUri: params.agentCardUri,
-                creator: params.creator,
-                model: params.model,
-                plugins: params.plugins.map(p => typeof p === "string" ? p : p.registryId),
-                systemPrompt: params.systemPrompt,
-            });
+        const registration = await registerAgentWithWarmup({
+            walletAddress: params.walletAddress,
+            walletTimestamp: params.walletTimestamp,
+            dnaHash: params.dnaHash,
+            name: params.name,
+            description: params.description,
+            agentCardUri: params.agentCardUri,
+            creator: params.creator,
+            model: params.model,
+            plugins: params.plugins.map((p) => (typeof p === "string" ? p : p.registryId)),
+            systemPrompt: params.systemPrompt,
+        });
 
-            res.status(201).json({
-                success: true,
-                agent: {
-                    name: agent.name,
-                    walletAddress: agent.walletAddress,
-                    dnaHash: agent.dnaHash,
-                    apiUrl: `/agent/${agent.walletAddress}/chat`,
-                },
-            });
-        } catch (err) {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            // 409 Conflict = agent already registered (which is fine)
-            // 500 = other errors
-            if (errorMsg.includes("already registered")) {
-                res.status(409).json({ error: errorMsg });
-            } else {
-                console.error(`[agent-routes] Registration failed:`, errorMsg);
-                res.status(500).json({ error: errorMsg });
-            }
-        }
+        res.status(registration.status === "ready" ? 201 : 202).json({
+            success: true,
+            status: registration.status,
+            warmupError: registration.warmupError,
+            agent: {
+                name: registration.agent.name,
+                walletAddress: registration.agent.walletAddress,
+                dnaHash: registration.agent.dnaHash,
+                apiUrl: `/agent/${registration.agent.walletAddress}/chat`,
+            },
+        });
     })
 );
 
@@ -330,6 +347,9 @@ router.post(
             res.status(paymentResult.status).json(paymentResult.responseBody);
             return;
         }
+        Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+            res.setHeader(key, value);
+        });
         console.log(`[x402] Payment verified for agent ${identifier}`);
 
         // Validate agent exists
@@ -394,13 +414,33 @@ router.post(
             return;
         }
 
-        // For chat/text models, use LangChain
-        const instance = resolveAgentInstance(identifier);
+        // For chat/text models, use Temporal-backed execution with runtime warmup fallback.
+        let instance = resolveAgentInstance(identifier);
         if (!instance) {
-            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
-            return;
+            const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
+            if (!ready) {
+                res.status(503).json({
+                    success: false,
+                    code: "AGENT_WARMING",
+                    status: "warming",
+                    error: "Agent runtime is warming up. Retry shortly.",
+                    retryAfterMs: AGENT_WARMUP_TIMEOUT_MS,
+                    walletAddress: agent.walletAddress,
+                    warmupError: getAgentRuntimeWarmupError(agent.walletAddress),
+                });
+                return;
+            }
+            instance = resolveAgentInstance(identifier);
+            if (!instance) {
+                res.status(503).json({
+                    code: "AGENT_RUNTIME_UNAVAILABLE",
+                    error: `Agent ${identifier} runtime unavailable after warmup`,
+                    status: isAgentRuntimeWarming(agent.walletAddress) ? "warming" : "error",
+                    warmupError: getAgentRuntimeWarmupError(agent.walletAddress),
+                });
+                return;
+            }
         }
-
 
         // Extract user address from session/payment headers
         // x-session-user-address is populated by the Thirdweb client wrapper
@@ -409,31 +449,45 @@ router.post(
         // Extract session headers for tool execution
         const sessionActive = req.headers["x-session-active"] === "true";
         const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
+        const composeRunId = parseResult.data.composeRunId || createComposeRunId();
+        res.setHeader("x-compose-run-id", composeRunId);
 
-        // Execute agent (non-streaming to avoid ChatMessageChunk checkpoint corruption)
-        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarWallet || 'none'}, Session: ${sessionActive}]`);
+        try {
+            console.log(`[agent] Executing ${agent.name} (${identifier}) run=${composeRunId}: "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarWallet || 'none'}, Session: ${sessionActive}]`);
 
-        const result = await executeAgent(instance.id, message, {
-            threadId,
-            userId,
-            manowarWallet,
-            attachment,  // Pass attachment for vision models
-            sessionContext: {
-                sessionActive,
-                sessionBudgetRemaining,
-                grantedPermissions: grantedPermissions || []
-            }
-        });
+            const result = await executeAgentRunWithFallback({
+                composeRunId,
+                agentWallet: agent.walletAddress,
+                message,
+                options: {
+                    threadId,
+                    userId,
+                    manowarWallet,
+                    attachment,
+                    sessionContext: {
+                        sessionActive,
+                        sessionBudgetRemaining,
+                        grantedPermissions: grantedPermissions || [],
+                    },
+                },
+            });
 
-        markAgentExecuted(identifier);
+            markAgentExecuted(identifier);
 
-        res.json({
-            walletAddress: agent.walletAddress,
-            name: agent.name,
-            ...result,
-        });
-    })
-);
+            res.json({
+                walletAddress: agent.walletAddress,
+                name: agent.name,
+                runId: composeRunId,
+                ...result,
+            });
+        } catch (error) {
+            console.error(`[agent] Execution failed:`, error);
+            res.status(500).json({
+                error: error instanceof Error ? error.message : String(error),
+                runId: composeRunId,
+            });
+        }
+    }));
 
 /**
  * POST /agent/:id/stream
@@ -467,6 +521,9 @@ router.post(
             res.status(paymentResult.status).json(paymentResult.responseBody);
             return;
         }
+        Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+            res.setHeader(key, value);
+        });
 
         // Validate agent
         const agent = resolveAgent(identifier);
@@ -475,10 +532,27 @@ router.post(
             return;
         }
 
-        const instance = resolveAgentInstance(identifier);
+        let instance = resolveAgentInstance(identifier);
         if (!instance) {
-            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
-            return;
+            const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
+            if (!ready) {
+                res.status(503).json({
+                    code: "AGENT_WARMING",
+                    error: "Agent runtime is warming up. Retry shortly.",
+                    retryAfterMs: AGENT_WARMUP_TIMEOUT_MS,
+                    warmupError: getAgentRuntimeWarmupError(agent.walletAddress),
+                });
+                return;
+            }
+            instance = resolveAgentInstance(identifier);
+            if (!instance) {
+                res.status(503).json({
+                    code: "AGENT_RUNTIME_UNAVAILABLE",
+                    error: `Agent ${identifier} runtime unavailable after warmup`,
+                    warmupError: getAgentRuntimeWarmupError(agent.walletAddress),
+                });
+                return;
+            }
         }
 
         const parseResult = ChatSchema.safeParse(req.body);
@@ -490,39 +564,54 @@ router.post(
             return;
         }
 
-        const { message, threadId, manowarWallet, grantedPermissions } = parseResult.data;
+        const { message, threadId, composeRunId: requestedRunId, manowarWallet, grantedPermissions } = parseResult.data;
+        const composeRunId = requestedRunId || createComposeRunId();
+        res.setHeader("x-compose-run-id", composeRunId);
 
         // Extract user address and session context (like /chat)
         const userId = req.headers["x-session-user-address"] as string | undefined;
         const sessionActive = req.headers["x-session-active"] === "true";
         const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
 
-        // Set up SSE
+        // Set up SSE with optimized headers for long-running connections
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
+        res.setHeader("Keep-Alive", "timeout=120"); // Tell proxies to wait 120s
+        res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering for real-time streaming
+        res.setHeader("X-Content-Type-Options", "nosniff"); // Prevent MIME sniffing
+        
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                res.write(": ping\n\n");
+            }
+        }, JSON_KEEPALIVE_INTERVAL_MS);
+        res.on("close", () => clearInterval(heartbeat));
 
         console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}]`);
 
         try {
+            // Stream agent responses directly (real-time streaming)
             for await (const event of streamAgent(instance.id, message, {
                 threadId,
                 userId,
                 manowarWallet,
+                composeRunId,
                 sessionContext: {
                     sessionActive,
                     sessionBudgetRemaining,
                     grantedPermissions: grantedPermissions || []
                 }
             })) {
-                res.write(`data: ${JSON.stringify(event)}\n\n`);
+                res.write(`data: ${safeStringify(event)}\n\n`);
             }
-            res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+            res.write(`data: ${safeStringify({ type: "done" })}\n\n`);
         } catch (err) {
-            res.write(`data: ${JSON.stringify({ type: "error", content: String(err) })}\n\n`);
+            res.write(`data: ${safeStringify({ type: "error", content: String(err) })}\n\n`);
         }
 
         markAgentExecuted(identifier);
+        clearInterval(heartbeat);
         res.end();
     })
 );
@@ -566,6 +655,9 @@ router.post(
             res.status(paymentResult.status).json(paymentResult.responseBody);
             return;
         }
+        Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+            res.setHeader(key, value);
+        });
         console.log(`[x402] Payment verified for multimodal agent ${identifier}`);
 
         // Validate agent exists
@@ -620,6 +712,33 @@ router.post(
             ...result,
         });
     })
+);
+
+/**
+ * GET /agent/:walletAddress/runs/:runId/state?threadId=<threadId>
+ * Query durable state for a specific agent run for frontend reattach/resume flows.
+ */
+router.get(
+    "/:walletAddress/runs/:runId/state",
+    asyncHandler(async (req: Request, res: Response) => {
+        const agentWallet = getParam(req.params.walletAddress);
+        const runId = getParam(req.params.runId);
+        const threadIdRaw = req.query.threadId;
+        const threadId = Array.isArray(threadIdRaw) ? threadIdRaw[0] : threadIdRaw;
+
+        if (!threadId) {
+            res.status(400).json({ error: "threadId query parameter is required" });
+            return;
+        }
+
+        const state = await getAgentRunState(agentWallet, String(threadId), runId);
+        if (!state) {
+            res.status(404).json({ error: "Run not found" });
+            return;
+        }
+
+        res.json(state);
+    }),
 );
 
 export default router;
