@@ -2,9 +2,7 @@
  * MCP Runtime - On-Demand Server Spawning
  * 
  * Spawns individual MCP servers on-demand with multi-transport support:
- * - stdio: Traditional npm/npx packages (St
-
-dioClientTransport)
+ * - stdio: Traditional npm/npx packages (StdioClientTransport)
  * - http: Remote SSE/Streamable HTTP servers (HttpSseClientTransport)
  * - docker: Containerized servers (DockerClientTransport)
  * 
@@ -935,5 +933,29 @@ async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig |
       true,
       503
     );
+  }
+}
+
+/**
+ * Test helper: reset singleton/shared session state between test cases.
+ */
+export async function __resetMcpRuntimeForTests(): Promise<void> {
+  for (const [, cached] of serverSessions) {
+    try {
+      await cached.runtime.terminateSession(cached.sessionId);
+    } catch {
+      // Ignore cleanup errors in test reset path
+    }
+  }
+  serverSessions.clear();
+  spawnLocks.clear();
+
+  if (sharedRuntime) {
+    try {
+      await sharedRuntime.cleanup();
+    } catch {
+      // Ignore cleanup errors in test reset path
+    }
+    sharedRuntime = null;
   }
 }
