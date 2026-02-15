@@ -21,6 +21,7 @@ import path from "path";
 import { createAgentGraph } from "../agent/graph.js";
 import { createAgentTools, createMem0Tools } from "../agent/tools.js";
 import { Mem0CallbackHandler } from "../agent/callbacks.js";
+import { runWithAgentExecutionContext } from "../agent/context.js";
 
 // =============================================================================
 // Helpers
@@ -318,6 +319,7 @@ export interface ExecuteOptions {
     sessionBudgetRemaining: number;
     grantedPermissions?: string[];
   };
+  composeRunId?: string; // Optional: for Temporal workflow correlation
 }
 
 
@@ -348,7 +350,13 @@ export async function executeAgent(
     }
 
     // Setup Callbacks (Mem0) with full identity context
-    const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userId, manowarWallet);
+    const mem0Handler = new Mem0CallbackHandler(
+      agentWallet,
+      threadId,
+      userId,
+      manowarWallet,
+      opts.composeRunId,
+    );
 
     // Create message - use multipart content if attachment is provided (for vision/audio models)
     let humanMessage: HumanMessage;
@@ -381,15 +389,39 @@ export async function executeAgent(
     }
 
     const input = { messages: [humanMessage] };
+    
+    // Dynamic recursion limit from environment (default: 100, max: 500)
+    // Allows agents freedom to operate without arbitrary constraints
+    const maxRecursionLimit = Math.min(
+      parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10),
+      500 // Hard ceiling for safety
+    );
+    
     const config = {
-      configurable: { thread_id: threadId },
+      configurable: { 
+        thread_id: threadId,
+        recursionDepth: 0, // Track depth for smart stop logic
+        maxRecursionDepth: maxRecursionLimit,
+        startTime: Date.now(), // Track execution time
+      },
       callbacks: [mem0Handler],
-      recursionLimit: 50, // Increase from default 25 for multi-tool tasks
+      recursionLimit: maxRecursionLimit,
     };
 
     // Invoke
     console.log(`[LangChain] Invoking agent ${agentWallet} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarWallet || 'none'})...`);
-    const result = await agent.executor.invoke(input, config);
+    const result = await runWithAgentExecutionContext(
+      {
+        composeRunId: opts.composeRunId,
+        threadId,
+        agentWallet,
+        userId,
+        manowarWallet,
+      },
+      async () => {
+        return await agent.executor.invoke(input, config);
+      },
+    );
 
     // Parse Result
     const messages = result.messages || [];
@@ -482,7 +514,13 @@ export async function* streamAgent(
   }
 
   // Setup Callbacks (Mem0) with full identity context
-  const mem0Handler = new Mem0CallbackHandler(agentWallet, tId, userId, manowarWallet);
+  const mem0Handler = new Mem0CallbackHandler(
+    agentWallet,
+    tId,
+    userId,
+    manowarWallet,
+    opts.composeRunId,
+  );
 
   // Create message - use multipart content if attachment is provided
   let humanMessage: HumanMessage;
@@ -513,10 +551,22 @@ export async function* streamAgent(
   }
 
   const input = { messages: [humanMessage] };
+  
+  // Dynamic recursion limit from environment (default: 100, max: 500)
+  const maxRecursionLimit = Math.min(
+    parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10),
+    500
+  );
+  
   const config = {
-    configurable: { thread_id: tId },
+    configurable: { 
+      thread_id: tId,
+      recursionDepth: 0,
+      maxRecursionDepth: maxRecursionLimit,
+      startTime: Date.now(),
+    },
     callbacks: [mem0Handler],
-    recursionLimit: 50,
+    recursionLimit: maxRecursionLimit,
     version: "v2" as const // Use v2 streaming (streamEvents)
   };
 
@@ -529,7 +579,18 @@ export async function* streamAgent(
 
   try {
     // Use streamEvents to get fine-gained events (tokens, tool start/end)
-    const eventStream = await agent.executor.streamEvents(input, config);
+    const eventStream = await runWithAgentExecutionContext(
+      {
+        composeRunId: opts.composeRunId,
+        threadId: tId,
+        agentWallet,
+        userId,
+        manowarWallet,
+      },
+      async () => {
+        return await agent.executor.streamEvents(input, config);
+      },
+    );
 
     for await (const event of eventStream) {
       const eventType = event.event;

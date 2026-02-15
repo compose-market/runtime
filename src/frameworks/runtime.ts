@@ -10,7 +10,7 @@
  * - Uses wallet address as primary identifier
  * - Persists knowledge to Pinata IPFS
  */
-import { createAgent, type AgentInstance } from "./langchain.js";
+import { createAgent, type AgentConfig, type AgentInstance } from "./langchain.js";
 import { deriveAgentWallet, type AgentWallet } from "../agent-wallet.js";
 
 // =============================================================================
@@ -287,144 +287,254 @@ const registeredManowars = new Map<string, RegisteredManowar>();
 // Agent Registration
 // =============================================================================
 
-/**
- * Register a new agent from on-chain mint
- * walletAddress uses the IPFS metadata as the single source of truth
- */
-export async function registerAgent(params: RegisterAgentParams): Promise<RegisteredAgent> {
-    const agentId = params.agentId ? BigInt(params.agentId) : BigInt(0);
+const agentRuntimeWarmups = new Map<string, Promise<AgentInstance>>();
+const agentRuntimeWarmupErrors = new Map<string, string>();
+const agentRuntimeConfigs = new Map<string, AgentConfig>();
 
-    const walletAddress = params.walletAddress;
-    if (!walletAddress || !walletAddress.startsWith("0x") || walletAddress.length !== 42) {
-        throw new Error(`Invalid walletAddress: ${walletAddress}. Must be provided from IPFS metadata.`);
+export interface RegisterAgentOptions {
+    waitForRuntime?: boolean;
+}
+
+export interface RegisterAgentWarmupResult {
+    agent: RegisteredAgent;
+    status: "ready" | "warming";
+    warmupError?: string;
+}
+
+function isValidWalletAddress(walletAddress: string): boolean {
+    return walletAddress.startsWith("0x") && walletAddress.length === 42;
+}
+
+async function validateAgentCardUri(agentCardUri: string, walletAddress: string): Promise<void> {
+    if (!agentCardUri || !agentCardUri.startsWith("ipfs://")) {
+        return;
     }
 
-    // Validate agentCardUri is resolvable and matches provided data
-    if (params.agentCardUri && params.agentCardUri.startsWith("ipfs://")) {
-        const cid = params.agentCardUri.replace("ipfs://", "");
-        // Validate CID format - proper IPFS CIDs start with 'Qm' (v0) or 'bafy/bafk' (v1)
-        if (!cid.startsWith("Qm") && !cid.startsWith("baf")) {
-            throw new Error(`Invalid agentCardUri CID format: ${cid}. Must be a valid IPFS CID.`);
+    const cid = agentCardUri.replace("ipfs://", "");
+    if (!cid.startsWith("Qm") && !cid.startsWith("baf")) {
+        console.warn(`[runtime] Invalid agentCardUri CID format: ${cid}. Continuing registration.`);
+        return;
+    }
+
+    try {
+        const metadata = await fetchFromPinata<{
+            walletAddress?: string;
+            name?: string;
+            model?: string;
+        }>(cid);
+
+        if (!metadata) {
+            console.warn(`[runtime] Could not fetch agentCardUri metadata from IPFS: ${agentCardUri}. Continuing registration.`);
+            return;
         }
 
-        try {
-            const metadata = await fetchFromPinata<{
-                walletAddress?: string;
-                name?: string;
-                model?: string;
-            }>(cid);
-
-            if (!metadata) {
-                throw new Error(`Failed to fetch agentCardUri metadata from IPFS: ${params.agentCardUri}`);
-            }
-
-            // Verify wallet address from IPFS matches provided wallet address
-            if (metadata.walletAddress &&
-                metadata.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
-                throw new Error(
-                    `Wallet address mismatch! IPFS metadata has ${metadata.walletAddress} ` +
-                    `but registration provided ${walletAddress}. Registration rejected.`
-                );
-            }
-
-            console.log(`[runtime] ✅ agentCardUri validated: ${params.agentCardUri}`);
-        } catch (err) {
-            if (err instanceof Error && err.message.includes("mismatch")) {
-                throw err; // Re-throw validation errors
-            }
-            console.warn(`[runtime] ⚠️ Could not validate agentCardUri: ${err}`);
-            // Continue with registration - IPFS may be temporarily unavailable
+        if (metadata.walletAddress && metadata.walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+            throw new Error(
+                `Wallet address mismatch! IPFS metadata has ${metadata.walletAddress} but registration provided ${walletAddress}. Registration rejected.`,
+            );
         }
-    }
-
-    // Check if already registered by wallet address
-    if (registeredAgents.has(walletAddress)) {
-        throw new Error(`Agent with wallet ${walletAddress} is already registered`);
-    }
-
-    // Wallet derivation is OPTIONAL - only needed if agent will sign transactions
-    // For chat functionality, no wallet is required
-    let wallet: AgentWallet | undefined;
-
-    if (params.walletTimestamp) {
-        try {
-            // Derive wallet credentials from dnaHash + timestamp for agent to sign transactions
-            wallet = deriveAgentWallet(params.dnaHash, params.walletTimestamp);
-
-            // Verify the derived wallet matches the provided walletAddress
-            if (wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
-                console.warn(`[runtime] Wallet mismatch! Provided: ${walletAddress}, Derived: ${wallet.address}`);
-                console.warn(`[runtime] Agent will work without signing capability.`);
-                wallet = undefined; // Don't use mismatched wallet
-            } else {
-                console.log(`[runtime] Wallet derived and verified: ${wallet.address}`);
-            }
-        } catch (err) {
-            console.warn(`[runtime] Wallet derivation failed:`, err);
-            console.warn(`[runtime] Agent will work without signing capability.`);
+        console.log(`[runtime] agentCardUri validated: ${agentCardUri}`);
+    } catch (err) {
+        if (err instanceof Error && err.message.includes("mismatch")) {
+            throw err;
         }
-    } else {
-        console.log(`[runtime] No walletTimestamp provided - agent will work without signing capability`);
+        console.warn(`[runtime] Could not validate agentCardUri: ${err}. Continuing registration.`);
+    }
+}
+
+function deriveSigningWallet(params: RegisterAgentParams, walletAddress: string): AgentWallet | undefined {
+    if (!params.walletTimestamp) {
+        return undefined;
     }
 
-    // Build tool-aware system prompt
-    const pluginNames = (params.plugins || []).map(p => {
-        // Normalize plugin ID to human-readable name
-        let name = p.replace(/^goat[-:]/, "").replace(/-/g, " ");
-        return name.charAt(0).toUpperCase() + name.slice(1);
+    try {
+        const wallet = deriveAgentWallet(params.dnaHash, params.walletTimestamp);
+        if (wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
+            console.warn(`[runtime] Wallet mismatch! Provided: ${walletAddress}, Derived: ${wallet.address}. Signing disabled.`);
+            return undefined;
+        }
+        return wallet;
+    } catch (err) {
+        console.warn("[runtime] Wallet derivation failed, signing disabled:", err);
+        return undefined;
+    }
+}
+
+function buildEnhancedPrompt(name: string, description: string, plugins: string[], systemPrompt?: string): string {
+    const pluginNames = plugins.map((pluginId) => {
+        const normalized = pluginId.replace(/^goat[-:]/, "").replace(/-/g, " ");
+        return normalized.charAt(0).toUpperCase() + normalized.slice(1);
     });
 
     const toolInstructions = pluginNames.length > 0
         ? `\n\nYou have access to the following tools: ${pluginNames.join(", ")}. When a user asks a question that can be answered using one of these tools (e.g., current prices, market data, on-chain actions), you MUST use the appropriate tool to answer. Do not say you cannot access real-time information - you CAN via your tools.`
         : "";
 
-    const basePrompt = params.systemPrompt || `You are ${params.name}. ${params.description}`;
-    const enhancedPrompt = `${basePrompt}${toolInstructions}`;
+    const basePrompt = systemPrompt || `You are ${name}. ${description}`;
+    return `${basePrompt}${toolInstructions}`;
+}
 
-    // Create LangChain runtime instance with selected plugins
-    // Wallet is optional - chat works without it
-    // Model comes from blockchain metadata
+function buildRuntimeConfig(
+    walletAddress: string,
+    wallet: AgentWallet | undefined,
+    params: RegisterAgentParams,
+): AgentConfig {
     if (!params.model) {
         throw new Error(`Model is required for agent ${params.name}`);
     }
 
-    const config = {
+    const plugins = params.plugins || [];
+    return {
         name: params.name,
-        agentWallet: walletAddress, // Wallet address is the ONLY identifier
-        wallet, // May be undefined - that's OK for chat
+        agentWallet: walletAddress,
+        wallet,
         model: params.model,
-        plugins: params.plugins || [],
-        systemPrompt: enhancedPrompt,
+        plugins,
+        systemPrompt: buildEnhancedPrompt(params.name, params.description, plugins, params.systemPrompt),
         memory: true,
     };
+}
 
-    const instance = await createAgent(config);
-    agentInstances.set(walletAddress, instance);
+function buildRuntimeConfigFromRegistered(agent: RegisteredAgent): AgentConfig {
+    return {
+        name: agent.name,
+        agentWallet: agent.walletAddress,
+        model: agent.model,
+        plugins: agent.plugins || [],
+        systemPrompt: buildEnhancedPrompt(agent.name, agent.description, agent.plugins || [], agent.systemPrompt),
+        memory: true,
+    };
+}
+
+async function ensureAgentRuntimeInternal(walletAddress: string, incomingConfig?: AgentConfig): Promise<AgentInstance> {
+    const existing = agentInstances.get(walletAddress);
+    if (existing) {
+        return existing;
+    }
+
+    const inFlight = agentRuntimeWarmups.get(walletAddress);
+    if (inFlight) {
+        return inFlight;
+    }
+
+    const config =
+        incomingConfig ||
+        agentRuntimeConfigs.get(walletAddress) ||
+        (registeredAgents.get(walletAddress) ? buildRuntimeConfigFromRegistered(registeredAgents.get(walletAddress)!) : undefined);
+
+    if (!config) {
+        throw new Error(`No runtime configuration available for agent ${walletAddress}`);
+    }
+
+    agentRuntimeConfigs.set(walletAddress, config);
+
+    const warmupPromise = (async () => {
+        try {
+            const instance = await createAgent(config);
+            agentInstances.set(walletAddress, instance);
+            const registered = registeredAgents.get(walletAddress);
+            if (registered) {
+                registered.instanceId = instance.id;
+            }
+            agentRuntimeWarmupErrors.delete(walletAddress);
+            return instance;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            agentRuntimeWarmupErrors.set(walletAddress, message);
+            throw error;
+        } finally {
+            agentRuntimeWarmups.delete(walletAddress);
+        }
+    })();
+
+    agentRuntimeWarmups.set(walletAddress, warmupPromise);
+    void warmupPromise.catch(() => {
+        // Suppress unhandled rejections for fire-and-forget warmups.
+    });
+    return warmupPromise;
+}
+
+export function isAgentRuntimeWarming(walletAddress: string): boolean {
+    return agentRuntimeWarmups.has(walletAddress);
+}
+
+export function getAgentRuntimeWarmupError(walletAddress: string): string | undefined {
+    return agentRuntimeWarmupErrors.get(walletAddress);
+}
+
+export async function ensureAgentRuntimeReady(walletAddress: string): Promise<AgentInstance> {
+    return ensureAgentRuntimeInternal(walletAddress);
+}
+
+/**
+ * Register a new agent from on-chain mint
+ * walletAddress uses the IPFS metadata as the single source of truth
+ */
+export async function registerAgent(
+    params: RegisterAgentParams,
+    options: RegisterAgentOptions = {},
+): Promise<RegisteredAgent> {
+    const waitForRuntime = options.waitForRuntime !== false;
+    const agentId = params.agentId ? BigInt(params.agentId) : BigInt(0);
+
+    const walletAddress = params.walletAddress;
+    if (!walletAddress || !isValidWalletAddress(walletAddress)) {
+        throw new Error(`Invalid walletAddress: ${walletAddress}. Must be provided from IPFS metadata.`);
+    }
+
+    await validateAgentCardUri(params.agentCardUri, walletAddress);
+
+    const existing = registeredAgents.get(walletAddress);
+    if (existing) {
+        if (waitForRuntime && !agentInstances.has(walletAddress)) {
+            await ensureAgentRuntimeInternal(walletAddress);
+        }
+        return existing;
+    }
+
+    const wallet = deriveSigningWallet(params, walletAddress);
+    const runtimeConfig = buildRuntimeConfig(walletAddress, wallet, params);
+    agentRuntimeConfigs.set(walletAddress, runtimeConfig);
 
     const registered: RegisteredAgent = {
         agentId,
         dnaHash: params.dnaHash,
-        instanceId: instance.id,
+        instanceId: walletAddress,
         name: params.name,
         description: params.description,
         agentCardUri: params.agentCardUri,
         creator: params.creator,
-        model: config.model,
-        plugins: config.plugins,
+        model: runtimeConfig.model || params.model || "unknown",
+        plugins: runtimeConfig.plugins || [],
         systemPrompt: params.systemPrompt,
-        walletAddress, // From params (IPFS metadata), not derived
+        walletAddress,
         createdAt: new Date(),
     };
 
     registeredAgents.set(walletAddress, registered);
     agentIdToWallet.set(agentId.toString(), walletAddress);
 
-    console.log(`[runtime] Registered agent: ${params.name}`);
-    console.log(`[runtime]   Wallet: ${walletAddress}`);
-    console.log(`[runtime]   Has signing key: ${Boolean(wallet)}`);
-    console.log(`[runtime]   Plugins: ${config.plugins.join(", ") || "none"}`);
+    const warmupPromise = ensureAgentRuntimeInternal(walletAddress, runtimeConfig);
+    if (waitForRuntime) {
+        await warmupPromise;
+    }
 
-    return registered;
+    const readyInstance = agentInstances.get(walletAddress);
+    if (readyInstance) {
+        registered.instanceId = readyInstance.id;
+    }
+
+    return registeredAgents.get(walletAddress)!;
+}
+
+export async function registerAgentWithWarmup(params: RegisterAgentParams): Promise<RegisterAgentWarmupResult> {
+    const agent = await registerAgent(params, { waitForRuntime: false });
+    const ready = Boolean(agentInstances.get(agent.walletAddress));
+    return {
+        agent,
+        status: ready ? "ready" : "warming",
+        warmupError: getAgentRuntimeWarmupError(agent.walletAddress),
+    };
 }
 
 // =============================================================================
@@ -538,6 +648,9 @@ export function unregisterAgent(identifier: string): boolean {
     if (!agent) return false;
 
     agentInstances.delete(agent.walletAddress);
+    agentRuntimeWarmups.delete(agent.walletAddress);
+    agentRuntimeWarmupErrors.delete(agent.walletAddress);
+    agentRuntimeConfigs.delete(agent.walletAddress);
     agentIdToWallet.delete(agent.agentId.toString());
     knowledgeCache.delete(agent.walletAddress);
     return registeredAgents.delete(agent.walletAddress);
