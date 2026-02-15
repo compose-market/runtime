@@ -30,6 +30,8 @@ export interface DelegationResult {
     /** Output/completion tokens (from agent response) */
     outputTokens?: number;
     error?: string;
+    retryable?: boolean;
+    failureCategory?: "timeout" | "rate_limit" | "transport" | "server" | "client" | "unknown";
     timing: {
         startedAt: number;
         completedAt: number;
@@ -44,6 +46,10 @@ export interface DelegationOptions {
     paymentData?: string;
     /** Internal secret for bypassing payment */
     internalSecret?: string;
+    /** Correlation run ID for end-to-end observability */
+    composeRunId?: string;
+    /** Idempotency key to deduplicate retries */
+    idempotencyKey?: string;
 }
 
 // =============================================================================
@@ -58,6 +64,26 @@ const DEFAULT_TIMEOUT = 120000; // 2 minutes
 // Internal secret for agent-to-agent calls (bypasses payment)
 const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || `manowar-internal-${Date.now()}`;
 
+function classifyFailure(status?: number, error?: string): { retryable: boolean; failureCategory: DelegationResult["failureCategory"] } {
+    const message = (error || "").toLowerCase();
+    if (message.includes("timeout") || message.includes("aborted")) {
+        return { retryable: true, failureCategory: "timeout" };
+    }
+    if (status === 429) {
+        return { retryable: true, failureCategory: "rate_limit" };
+    }
+    if (status && [500, 502, 503, 504].includes(status)) {
+        return { retryable: true, failureCategory: "server" };
+    }
+    if (status && status >= 400 && status < 500) {
+        return { retryable: false, failureCategory: "client" };
+    }
+    if (message.includes("econnreset") || message.includes("enotfound") || message.includes("network")) {
+        return { retryable: true, failureCategory: "transport" };
+    }
+    return { retryable: false, failureCategory: "unknown" };
+}
+
 // =============================================================================
 // Core Delegation
 // =============================================================================
@@ -71,7 +97,16 @@ export async function callAgent(
     agentWallet: string,
     message: string,
     options: DelegationOptions = {}
-): Promise<{ success: boolean; output: string; tokensUsed?: number; inputTokens?: number; outputTokens?: number; error?: string }> {
+): Promise<{
+    success: boolean;
+    output: string;
+    tokensUsed?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    error?: string;
+    retryable?: boolean;
+    failureCategory?: DelegationResult["failureCategory"];
+}> {
     const startedAt = Date.now();
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
@@ -86,6 +121,9 @@ export async function callAgent(
                 ...(options.paymentData && { "PAYMENT-SIGNATURE": options.paymentData }),
                 // Use internal secret to bypass payment for orchestrator-initiated calls
                 "x-manowar-internal": options.internalSecret || MANOWAR_INTERNAL_SECRET,
+                // Session context for proper authentication and budget tracking
+                "x-session-active": "true",
+                "x-session-budget-remaining": "1000000",
             },
             body: JSON.stringify({ message }),
             signal: controller.signal,
@@ -95,10 +133,13 @@ export async function callAgent(
 
         if (!response.ok) {
             const errorText = await response.text().catch(() => "Unknown error");
+            const failure = classifyFailure(response.status, errorText);
             return {
                 success: false,
                 output: "",
                 error: `Agent returned ${response.status}: ${errorText}`,
+                retryable: failure.retryable,
+                failureCategory: failure.failureCategory,
             };
         }
 

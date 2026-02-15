@@ -85,12 +85,13 @@ export function isLangSmithAvailable(): boolean {
  * Create a new tracked run
  */
 export function createRun(params: {
+    runId?: string;
     workflowId: string;
     manowarWallet?: string;
     input: Record<string, unknown>;
     triggeredBy?: TrackedRun["triggeredBy"];
 }): TrackedRun {
-    const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const runId = params.runId || `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const run: TrackedRun = {
         runId,

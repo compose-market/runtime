@@ -463,6 +463,46 @@ export interface SSEProgressEvent {
     };
 }
 
+export type StepApprovalStatus = "approved" | "rejected";
+
+export interface StepApprovalRequest {
+    runId: string;
+    workflowId: string;
+    walletAddress: string;
+    stepNumber: number;
+    stepKey: string;
+    agentName: string;
+    agentWallet?: string;
+    task: string;
+    expectedOutput: string;
+    priority: "critical" | "high" | "medium" | "low";
+    riskReason: string;
+    requestedAt: number;
+}
+
+export interface StepApprovalDecision {
+    status: StepApprovalStatus;
+    approver?: string;
+    reason?: string;
+    decidedAt: number;
+}
+
+export interface ExecutionRunStateProjection {
+    runId: string;
+    workflowId: string;
+    walletAddress: string;
+    status: "pending" | "running" | "continuous" | "blocked_approval" | "success" | "error" | "cancelled";
+    startedAt: number;
+    updatedAt: number;
+    progress: number;
+    message?: string;
+    currentStep?: number;
+    totalSteps?: number;
+    error?: string;
+    output?: string;
+    pendingApprovalStepKey?: string;
+}
+
 export interface ExecutorOptions {
     /** Payment context for x402 */
     payment: PaymentContext;
@@ -504,6 +544,12 @@ export interface ExecutorOptions {
     loopDelayMs?: number;
     /** Cancellation check for long-running workflows */
     shouldCancel?: () => boolean;
+    /** Optional externally supplied run ID (used by Temporal routing) */
+    runId?: string;
+    /** Optional step approval callback for risky steps */
+    requestStepApproval?: (request: StepApprovalRequest) => Promise<StepApprovalDecision>;
+    /** Optional callback for projected run state updates */
+    onRunStateUpdate?: (state: ExecutionRunStateProjection) => void;
 }
 
 // =============================================================================

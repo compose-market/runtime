@@ -11,8 +11,14 @@
  * a streamlined execution flow.
  */
 
-import type { Workflow, ExecutorOptions, SSEProgressEvent } from "./types.js";
-import { TaskPlanner, type StepReflection } from "./planner.js";
+import type {
+    Workflow,
+    ExecutorOptions,
+    SSEProgressEvent,
+    ExecutionRunStateProjection,
+    StepApprovalRequest,
+} from "./types.js";
+import { TaskPlanner, type StepReflection, type PlanStep } from "./planner.js";
 import { fetchManowarCard, buildSystemPromptFromCard, normalizeManowarCard, assertManowarCard, type ManowarCard } from "./registry.js";
 import { delegatePlanStep } from "./delegation.js";
 import { getRelevantContext, recordConversationTurn } from "./embeddings.js";
@@ -96,6 +102,61 @@ export class ManowarOrchestrator {
         if (!isAgenticCoordinatorModel(coordinatorModel)) {
             console.warn(`[orchestrator] Model "${coordinatorModel}" is not in the approved agentic coordinator list. Performance may vary.`);
         }
+    }
+
+    private emitRunState(
+        options: Partial<ExecutorOptions>,
+        current: ExecutionRunStateProjection,
+        updates: Partial<ExecutionRunStateProjection>
+    ): ExecutionRunStateProjection {
+        const next: ExecutionRunStateProjection = {
+            ...current,
+            ...updates,
+            updatedAt: Date.now(),
+        };
+        options.onRunStateUpdate?.(next);
+        return next;
+    }
+
+    private isHighRiskStep(step: PlanStep): { requiresApproval: boolean; reason: string } {
+        const text = `${step.task} ${step.expectedOutput}`.toLowerCase();
+        const highRiskPatterns = [
+            /transfer/,
+            /payment/,
+            /pay\b/,
+            /swap/,
+            /sell/,
+            /buy/,
+            /approve/,
+            /mint/,
+            /burn/,
+            /bridge/,
+            /send/,
+            /write/,
+            /on[-\s]?chain/,
+            /transaction/,
+            /withdraw/,
+            /deposit/,
+            /webhook/,
+            /delete/,
+            /remove/,
+            /revoke/,
+        ];
+
+        const matched = highRiskPatterns.find((pattern) => pattern.test(text));
+        if (matched) {
+            return {
+                requiresApproval: true,
+                reason: `High-risk task keyword matched: ${matched.source}`,
+            };
+        }
+        if (step.priority === "critical") {
+            return {
+                requiresApproval: true,
+                reason: "Critical priority step",
+            };
+        }
+        return { requiresApproval: false, reason: "" };
     }
 
     /**
@@ -208,10 +269,20 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
             throw new Error("[Orchestrator] manowarCard.walletAddress is required - ensure manowarCardUri is provided");
         }
         const walletAddress = this.manowarCard.walletAddress;
+        const workflowId = this.workflow.id;
+        if (!workflowId) {
+            throw new Error("[Orchestrator] workflow.id is required");
+        }
+        // Validate that workflow ID contains the wallet address (allows unique IDs per run)
+        const expectedPrefix = `manowar-${walletAddress}`;
+        if (!workflowId.startsWith(expectedPrefix)) {
+            throw new Error(`[Orchestrator] workflow.id mismatch: expected to start with ${expectedPrefix}, got ${workflowId}`);
+        }
 
         // Create tracked run via run-tracker (replaces inline runId generation)
         const trackedRun = createRun({
-            workflowId: this.workflow.id || "manowar-workflow",
+            runId: options.runId,
+            workflowId,
             manowarWallet: walletAddress,
             input: { request: userRequest },
             triggeredBy: {
@@ -223,6 +294,18 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
 
         // Mark run as started
         startRun(runId);
+
+        let runState: ExecutionRunStateProjection = {
+            runId,
+            workflowId,
+            walletAddress,
+            status: "running",
+            startedAt: Date.now(),
+            updatedAt: Date.now(),
+            progress: 0,
+            message: "Starting manowar execution",
+        };
+        runState = this.emitRunState(options, runState, {});
 
         // Create LangSmith token tracker for this run (contextManager implements TokenLedgerInterface)
         this.tokenTracker = new LangSmithTokenTracker(walletAddress, runId, this.contextManager);
@@ -244,6 +327,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
         });
 
         this.emitProgress("start", { runId, message: "Starting manowar execution" });
+        runState = this.emitRunState(options, runState, {
+            status: "running",
+            progress: 2,
+            message: "Initialized orchestrator and planner",
+        });
 
         const runSystemPrompt = `${this.systemPrompt}\n\n## USER_MESSAGE\n${userRequest}`;
 
@@ -268,6 +356,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
         try {
             // 1. Create execution plan(s)
             this.emitProgress("progress", { progress: 10, message: "Creating execution plan" });
+            runState = this.emitRunState(options, runState, {
+                status: "running",
+                progress: 10,
+                message: "Creating execution plan",
+            });
 
             // Build edges context for planner if available
             const edgesContext = this.manowarCard?.edges?.length
@@ -339,6 +432,73 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                         totalSteps: plan.steps.length,
                         message: `Executing step ${nextStep.stepNumber}: ${nextStep.task}`,
                     });
+                    runState = this.emitRunState(options, runState, {
+                        status: "running",
+                        currentStep: nextStep.stepNumber,
+                        totalSteps: plan.steps.length,
+                        progress: Math.min(95, Math.round(stepProgress)),
+                        message: `Executing step ${nextStep.stepNumber}: ${nextStep.agentName}`,
+                    });
+
+                    const approvalRisk = this.isHighRiskStep(nextStep);
+                    if (options.requestStepApproval && approvalRisk.requiresApproval) {
+                        const stepKey = `${runId}:${nextStep.stepNumber}:${nextStep.agentName}`;
+                        const approvalRequest: StepApprovalRequest = {
+                            runId,
+                            workflowId,
+                            walletAddress,
+                            stepNumber: nextStep.stepNumber,
+                            stepKey,
+                            agentName: nextStep.agentName,
+                            agentWallet: nextStep.agentWallet,
+                            task: nextStep.task,
+                            expectedOutput: nextStep.expectedOutput,
+                            priority: nextStep.priority,
+                            riskReason: approvalRisk.reason,
+                            requestedAt: Date.now(),
+                        };
+
+                        this.emitProgress("progress", {
+                            progress: Math.min(95, Math.round(stepProgress)),
+                            message: `Waiting approval for risky step ${nextStep.stepNumber}`,
+                        });
+                        runState = this.emitRunState(options, runState, {
+                            status: "blocked_approval",
+                            pendingApprovalStepKey: stepKey,
+                            message: `Waiting approval for step ${nextStep.stepNumber}`,
+                        });
+
+                        const decision = await options.requestStepApproval(approvalRequest);
+                        if (decision.status === "rejected") {
+                            const rejectionOutput = `Step ${nextStep.stepNumber} rejected by approver${decision.reason ? `: ${decision.reason}` : ""}`;
+                            stepResults.push({
+                                stepNumber: nextStep.stepNumber,
+                                agentName: nextStep.agentName,
+                                success: false,
+                                output: rejectionOutput,
+                            });
+                            recordError(runId, nextStep.agentName, nextStep.stepNumber, rejectionOutput);
+                            runState = this.emitRunState(options, runState, {
+                                status: "error",
+                                error: rejectionOutput,
+                                message: rejectionOutput,
+                                pendingApprovalStepKey: undefined,
+                            });
+                            return {
+                                stepResults,
+                                reflections,
+                                planTokensUsed,
+                                needsReplan: false,
+                                previousOutputs,
+                            };
+                        }
+
+                        runState = this.emitRunState(options, runState, {
+                            status: "running",
+                            pendingApprovalStepKey: undefined,
+                            message: `Approval granted for step ${nextStep.stepNumber}`,
+                        });
+                    }
 
                     const relevantContext = await getRelevantContext(
                         walletAddress,
@@ -383,7 +543,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                         {
                             priorOutputs: previousOutputs.map(p => `${p.agentName}: ${p.summary}`),
                             relevantContext: relevantContext || undefined,
-                        }
+                        },
+                        {
+                            composeRunId: runId,
+                            idempotencyKey: `${runId}:${nextStep.stepNumber}:${nextStep.agentName}`,
+                        },
                     );
 
                     stepResults.push({
@@ -559,6 +723,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                         progress: stepProgress,
                         message: `Completed step ${executedCount}/${plan.steps.length}`,
                     });
+                    runState = this.emitRunState(options, runState, {
+                        status: "running",
+                        progress: Math.min(98, Math.round(stepProgress)),
+                        message: `Completed step ${executedCount}/${plan.steps.length}`,
+                    });
 
                     if (!result.success) {
                         recordError(runId, nextStep.agentName, nextStep.stepNumber, result.error || "Step failed");
@@ -621,6 +790,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                     );
 
                     if (!plan || plan.steps.length === 0) {
+                        runState = this.emitRunState(options, runState, {
+                            status: "error",
+                            error: "Failed to create execution plan",
+                            message: "Failed to create execution plan",
+                        });
                         return {
                             success: false,
                             result: "",
@@ -633,12 +807,18 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                     const validationIssues = planner.getPlanValidationIssues(plan);
                     if (validationIssues.length > 0) {
                         if (!replanOnFailure) {
+                            const validationError = `Plan validation failed: ${validationIssues.map(i => i.message).join("; ")}`;
+                            runState = this.emitRunState(options, runState, {
+                                status: "error",
+                                error: validationError,
+                                message: validationError,
+                            });
                             return {
                                 success: false,
                                 result: "",
                                 stepResults: [],
                                 totalTokensUsed: 0,
-                                error: `Plan validation failed: ${validationIssues.map(i => i.message).join("; ")}`,
+                                error: validationError,
                             };
                         }
                         console.warn(`[orchestrator] Plan validation failed, replanning (${validationIssues.length} issues)`);
@@ -781,6 +961,12 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
 
             this.emitProgress("result", { output: finalResult });
             this.emitProgress("done", { message: "Workflow completed successfully" });
+            runState = this.emitRunState(options, runState, {
+                status: "success",
+                progress: 100,
+                message: "Workflow completed successfully",
+                output: finalResult,
+            });
 
             return {
                 success: true,
@@ -798,6 +984,11 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
 
             this.emitProgress("error", { error: errorMessage });
             this.emitProgress("done", { message: "Workflow failed" });
+            runState = this.emitRunState(options, runState, {
+                status: "error",
+                error: errorMessage,
+                message: "Workflow failed",
+            });
 
             return {
                 success: false,

@@ -1,12 +1,8 @@
 /**
  * Trigger Management Service
  * 
- * Handles NL-to-cron parsing, trigger storage via Redis,
- * and cron scheduling for autonomous workflow execution.
- * 
- * Redis Key Patterns (isolated from session/key storage):
- * - manowar:trigger:{wallet}:{triggerId} - Individual trigger hash
- * - manowar:triggers:{wallet} - Set of trigger IDs for a manowar
+ * Handles NL-to-cron parsing, trigger persistence via Temporal Schedules,
+ * and schedule lifecycle for autonomous workflow execution.
  */
 
 import {
@@ -14,29 +10,105 @@ import {
     TriggerType,
 } from "./types.js";
 import {
-    redisHGetAll,
-    redisHSet,
-    redisSAdd,
-    redisSMembers,
-    redisSRem,
-    redisDel,
-} from "../../../lambda/shared/config/redis.js";
+    deleteTriggerSchedule,
+    getTriggerSchedule,
+    listTriggerSchedules,
+    upsertTriggerSchedule,
+    type TriggerScheduleSnapshot,
+} from "../temporal/service.js";
+import { getTemporalClient } from "../temporal/client.js";
 
-const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || process.env.API_URL || "https://api.compose.market";
+let activeTriggerCount = 0;
 
 // =============================================================================
-// Redis Key Patterns (isolated namespace - doesn't conflict with session/keys)
+// Trigger Helpers
 // =============================================================================
 
-const TRIGGER_PREFIX = "manowar:trigger:";
-const TRIGGER_SET_PREFIX = "manowar:triggers:";
-
-function getTriggerKey(wallet: string, triggerId: string): string {
-    return `${TRIGGER_PREFIX}${wallet.toLowerCase()}:${triggerId}`;
+function normalizeTrigger(trigger: TriggerDefinition): TriggerDefinition {
+    const now = Date.now();
+    return {
+        ...trigger,
+        manowarWallet: trigger.manowarWallet,
+        timezone: trigger.timezone || "UTC",
+        createdAt: trigger.createdAt || now,
+        updatedAt: trigger.updatedAt || now,
+    };
 }
 
-function getTriggerSetKey(wallet: string): string {
-    return `${TRIGGER_SET_PREFIX}${wallet.toLowerCase()}`;
+function parseTriggerFromSchedule(
+    snapshot: TriggerScheduleSnapshot,
+    wallet: string,
+): TriggerDefinition {
+    const prefix = `manowar-trigger-${wallet}-`;
+    const fallbackId = snapshot.scheduleId.startsWith(prefix)
+        ? snapshot.scheduleId.slice(prefix.length)
+        : snapshot.scheduleId;
+    const memoTrigger = snapshot.memo?.trigger;
+
+    if (!memoTrigger || typeof memoTrigger !== "object") {
+        return {
+            id: fallbackId,
+            manowarWallet: wallet,
+            name: fallbackId || "Trigger",
+            type: "cron",
+            nlDescription: "",
+            timezone: "UTC",
+            enabled: !snapshot.paused,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+        };
+    }
+
+    const fromMemo = memoTrigger as Partial<TriggerDefinition>;
+    return {
+        id: fromMemo.id || fallbackId,
+        manowarWallet: fromMemo.manowarWallet || wallet,
+        name: fromMemo.name || "Trigger",
+        type: (fromMemo.type as TriggerType) || "cron",
+        nlDescription: fromMemo.nlDescription || "",
+        cronExpression: fromMemo.cronExpression,
+        cronReadable: fromMemo.cronReadable,
+        timezone: fromMemo.timezone || "UTC",
+        enabled: typeof fromMemo.enabled === "boolean" ? fromMemo.enabled : !snapshot.paused,
+        recurrence: fromMemo.recurrence,
+        webhookUrl: fromMemo.webhookUrl,
+        eventPattern: fromMemo.eventPattern,
+        inputTemplate: fromMemo.inputTemplate,
+        lastRun: fromMemo.lastRun,
+        nextRun: fromMemo.nextRun,
+        createdAt: typeof fromMemo.createdAt === "number" ? fromMemo.createdAt : Date.now(),
+        updatedAt: typeof fromMemo.updatedAt === "number" ? fromMemo.updatedAt : Date.now(),
+        memoryId: fromMemo.memoryId,
+    };
+}
+
+async function resolveWalletForTriggerId(triggerId: string): Promise<string | null> {
+    const client = await getTemporalClient();
+    const suffix = `-${triggerId}`;
+    for await (const schedule of client.schedule.list()) {
+        const scheduleId = schedule.scheduleId;
+        if (!scheduleId.startsWith("manowar-trigger-") || !scheduleId.endsWith(suffix)) {
+            continue;
+        }
+        const withoutPrefix = scheduleId.slice("manowar-trigger-".length);
+        const wallet = withoutPrefix.slice(0, withoutPrefix.length - suffix.length);
+        if (wallet) {
+            return wallet;
+        }
+    }
+    return null;
+}
+
+async function refreshActiveTriggerCount(): Promise<void> {
+    const client = await getTemporalClient();
+    let count = 0;
+    for await (const schedule of client.schedule.list()) {
+        if (schedule.scheduleId.startsWith("manowar-trigger-") && !schedule.state.paused) {
+            count += 1;
+        }
+    }
+    activeTriggerCount = count;
 }
 
 // =============================================================================
@@ -194,101 +266,57 @@ export async function parseTriggerFromNL(
 }
 
 // =============================================================================
-// Trigger Store (Redis - isolated from session/key storage)
+// Trigger Store (Temporal Schedule Backing)
 // =============================================================================
 
 /**
- * Store a trigger definition in Redis
- * 
- * Keys created:
- * - manowar:trigger:{wallet}:{id} (hash with all trigger fields)
- * - manowar:triggers:{wallet} (set containing trigger IDs)
+ * Store or update a trigger definition in Temporal Schedule metadata.
  */
 export async function storeTrigger(
     trigger: TriggerDefinition,
     _userId?: string
 ): Promise<string | null> {
     try {
-        const wallet = trigger.manowarWallet.toLowerCase();
-        const key = getTriggerKey(wallet, trigger.id);
+        const normalized = normalizeTrigger(trigger);
+        if (!normalized.cronExpression) {
+            console.warn(`[triggers] Skipping trigger ${normalized.id}: cronExpression is required for Temporal schedules`);
+            return null;
+        }
 
-        // Store trigger as hash fields
-        await redisHSet(key, {
-            id: trigger.id,
-            name: trigger.name,
-            type: trigger.type,
-            manowarWallet: wallet,
-            nlDescription: trigger.nlDescription || "",
-            cronExpression: trigger.cronExpression || "",
-            cronReadable: trigger.cronReadable || "",
-            enabled: String(trigger.enabled),
-            timezone: trigger.timezone || "UTC",
-            inputTemplate: JSON.stringify(trigger.inputTemplate || {}),
-            createdAt: String(trigger.createdAt || Date.now()),
-            updatedAt: String(trigger.updatedAt || Date.now()),
-        });
-
-        // Add to the manowar's trigger set for fast listing
-        await redisSAdd(getTriggerSetKey(wallet), trigger.id);
-
-        console.log(`[triggers] Stored trigger ${trigger.id} for ${wallet} in Redis`);
-        return trigger.id;
+        await upsertTriggerSchedule(normalized);
+        await refreshActiveTriggerCount();
+        console.log(`[triggers] Stored trigger ${normalized.id} for ${normalized.manowarWallet} in Temporal schedule`);
+        return normalized.id;
     } catch (error) {
-        console.error("[triggers] Redis storage error:", error);
+        console.error("[triggers] Temporal store error:", error);
         return null;
     }
 }
 
 /**
- * Retrieve all triggers for a Manowar from Redis
- * Deterministic retrieval - no vector search needed
+ * Retrieve all triggers for a Manowar from Temporal schedules.
  */
 export async function retrieveTriggers(
     manowarWallet: string,
     _userId?: string
 ): Promise<TriggerDefinition[]> {
     try {
-        const wallet = manowarWallet.toLowerCase();
-        const triggerIds = await redisSMembers(getTriggerSetKey(wallet));
+        const wallet = manowarWallet;
+        const schedules = await listTriggerSchedules(wallet);
+        const triggers = schedules.map((snapshot) => parseTriggerFromSchedule(snapshot, wallet));
 
-        if (!triggerIds || triggerIds.length === 0) {
-            return [];
-        }
-
-        const triggers: TriggerDefinition[] = [];
-        for (const triggerId of triggerIds) {
-            const data = await redisHGetAll(getTriggerKey(wallet, triggerId));
-            if (data && Object.keys(data).length > 0) {
-                triggers.push({
-                    id: data.id || triggerId,
-                    name: data.name || "Unnamed Trigger",
-                    type: data.type as TriggerType,
-                    manowarWallet: data.manowarWallet || wallet,
-                    nlDescription: data.nlDescription || "",
-                    cronExpression: data.cronExpression || undefined,
-                    cronReadable: data.cronReadable || undefined,
-                    enabled: data.enabled === "true",
-                    timezone: data.timezone || "UTC",
-                    inputTemplate: data.inputTemplate ? JSON.parse(data.inputTemplate) : undefined,
-                    createdAt: parseInt(data.createdAt, 10) || Date.now(),
-                    updatedAt: parseInt(data.updatedAt, 10) || Date.now(),
-                });
-            }
-        }
-
-        // Sort by creation date, newest first
         triggers.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-
-        console.log(`[triggers] Retrieved ${triggers.length} triggers for ${wallet} from Redis`);
+        await refreshActiveTriggerCount();
+        console.log(`[triggers] Retrieved ${triggers.length} triggers for ${wallet} from Temporal schedules`);
         return triggers;
     } catch (error) {
-        console.error("[triggers] Redis retrieval error:", error);
+        console.error("[triggers] Temporal retrieval error:", error);
         return [];
     }
 }
 
 /**
- * Delete a trigger from Redis
+ * Delete a trigger schedule from Temporal.
  */
 export async function deleteTriggerFromMemory(
     triggerId: string,
@@ -296,27 +324,19 @@ export async function deleteTriggerFromMemory(
     _userId?: string
 ): Promise<boolean> {
     try {
-        const wallet = manowarWallet.toLowerCase();
-
-        // Remove from the trigger set
-        await redisSRem(getTriggerSetKey(wallet), triggerId);
-
-        // Delete the trigger hash
-        const deleted = await redisDel(getTriggerKey(wallet, triggerId));
-
-        // Also unregister from scheduler if active
-        unregisterTrigger(triggerId);
-
-        console.log(`[triggers] Deleted trigger ${triggerId} for ${wallet} from Redis`);
-        return deleted;
+        const wallet = manowarWallet;
+        await deleteTriggerSchedule(wallet, triggerId);
+        await refreshActiveTriggerCount();
+        console.log(`[triggers] Deleted trigger ${triggerId} for ${wallet} from Temporal schedules`);
+        return true;
     } catch (error) {
-        console.error("[triggers] Redis delete error:", error);
+        console.error("[triggers] Temporal delete error:", error);
         return false;
     }
 }
 
 /**
- * Update a trigger's enabled status in Redis
+ * Update a trigger's enabled status via Temporal schedule state.
  */
 export async function updateTriggerEnabled(
     triggerId: string,
@@ -324,61 +344,49 @@ export async function updateTriggerEnabled(
     enabled: boolean
 ): Promise<boolean> {
     try {
-        const wallet = manowarWallet.toLowerCase();
-        const key = getTriggerKey(wallet, triggerId);
+        const existing = await getTriggerById(triggerId, manowarWallet);
+        if (!existing || !existing.cronExpression) {
+            return false;
+        }
 
-        await redisHSet(key, "enabled", String(enabled));
-        await redisHSet(key, "updatedAt", String(Date.now()));
-
-        console.log(`[triggers] Updated trigger ${triggerId} enabled=${enabled}`);
+        const updated = normalizeTrigger({
+            ...existing,
+            enabled,
+            updatedAt: Date.now(),
+        });
+        await upsertTriggerSchedule(updated);
+        await refreshActiveTriggerCount();
+        console.log(`[triggers] Updated trigger ${triggerId} enabled=${enabled} in Temporal`);
         return true;
     } catch (error) {
-        console.error("[triggers] Redis update error:", error);
+        console.error("[triggers] Temporal update error:", error);
         return false;
     }
 }
 
 /**
- * Get a single trigger by ID from Redis
+ * Get a single trigger by ID from Temporal schedule metadata.
  */
 export async function getTriggerById(
     triggerId: string,
     manowarWallet: string
 ): Promise<TriggerDefinition | null> {
     try {
-        const wallet = manowarWallet.toLowerCase();
-        const data = await redisHGetAll(getTriggerKey(wallet, triggerId));
-
-        if (!data || Object.keys(data).length === 0) {
+        const wallet = manowarWallet;
+        const schedule = await getTriggerSchedule(wallet, triggerId);
+        if (!schedule) {
             return null;
         }
-
-        return {
-            id: data.id || triggerId,
-            name: data.name || "Unnamed Trigger",
-            type: data.type as TriggerType,
-            manowarWallet: data.manowarWallet || wallet,
-            nlDescription: data.nlDescription || "",
-            cronExpression: data.cronExpression || undefined,
-            cronReadable: data.cronReadable || undefined,
-            enabled: data.enabled === "true",
-            timezone: data.timezone || "UTC",
-            inputTemplate: data.inputTemplate ? JSON.parse(data.inputTemplate) : undefined,
-            createdAt: parseInt(data.createdAt, 10) || Date.now(),
-            updatedAt: parseInt(data.updatedAt, 10) || Date.now(),
-        };
+        return parseTriggerFromSchedule(schedule, wallet);
     } catch (error) {
-        console.error("[triggers] Redis get error:", error);
+        console.error("[triggers] Temporal get error:", error);
         return null;
     }
 }
 
 // =============================================================================
-// Cron Scheduler (in-memory for now)
+// Cron Scheduler (Temporal Schedules)
 // =============================================================================
-
-// Store active cron jobs
-const activeJobs = new Map<string, NodeJS.Timeout>();
 
 /**
  * Calculate next run time from cron expression
@@ -404,65 +412,62 @@ export function getNextRunTime(cronExpression: string, timezone?: string): numbe
 /**
  * Register a trigger to run on schedule
  */
-export function registerTrigger(
+export async function registerTrigger(
     trigger: TriggerDefinition,
-    executor: (trigger: TriggerDefinition) => Promise<void>
-): void {
-    if (!trigger.enabled || !trigger.cronExpression) return;
+    _executor: (trigger: TriggerDefinition) => Promise<void>
+): Promise<void> {
+    const normalized = normalizeTrigger(trigger);
+    if (!normalized.enabled || !normalized.cronExpression) {
+        return;
+    }
 
-    // Cancel existing job if any
-    unregisterTrigger(trigger.id);
-
-    // Calculate interval from cron (simplified)
-    let intervalMs: number;
-    const cron = trigger.cronExpression;
-
-    if (cron === "* * * * *") intervalMs = 60000;
-    else if (cron.startsWith("*/5")) intervalMs = 5 * 60000;
-    else if (cron.startsWith("*/10")) intervalMs = 10 * 60000;
-    else if (cron.startsWith("*/15")) intervalMs = 15 * 60000;
-    else if (cron.startsWith("*/30")) intervalMs = 30 * 60000;
-    else if (cron.startsWith("0 *")) intervalMs = 60 * 60000;
-    else if (cron.startsWith("0 */2")) intervalMs = 2 * 60 * 60000;
-    else if (cron.startsWith("0 */4")) intervalMs = 4 * 60 * 60000;
-    else if (cron.startsWith("0 */6")) intervalMs = 6 * 60 * 60000;
-    else if (cron.startsWith("0 */12")) intervalMs = 12 * 60 * 60000;
-    else intervalMs = 24 * 60 * 60000; // Default to daily
-
-    console.log(`[triggers] Registering trigger ${trigger.id} with interval ${intervalMs}ms`);
-
-    const job = setInterval(async () => {
-        console.log(`[triggers] Executing trigger ${trigger.id}`);
-        try {
-            await executor(trigger);
-        } catch (error) {
-            console.error(`[triggers] Trigger ${trigger.id} failed:`, error);
-        }
-    }, intervalMs);
-
-    activeJobs.set(trigger.id, job);
+    await unregisterTrigger(normalized.id, normalized.manowarWallet).catch(() => undefined);
+    await upsertTriggerSchedule(normalized);
+    await refreshActiveTriggerCount();
+    console.log(`[triggers] Temporal schedule upserted for trigger ${normalized.id}`);
 }
 
 /**
  * Unregister a trigger
  */
-export function unregisterTrigger(triggerId: string): void {
-    const job = activeJobs.get(triggerId);
-    if (job) {
-        clearInterval(job);
-        activeJobs.delete(triggerId);
-        console.log(`[triggers] Unregistered trigger ${triggerId}`);
+export async function unregisterTrigger(triggerId: string, manowarWallet?: string): Promise<void> {
+    const wallet = manowarWallet || await resolveWalletForTriggerId(triggerId) || "";
+    if (!wallet) {
+        throw new Error(`Missing manowar wallet for trigger ${triggerId}`);
     }
+    await deleteTriggerSchedule(wallet, triggerId);
+    await refreshActiveTriggerCount();
+    console.log(`[triggers] Unregistered trigger ${triggerId}`);
 }
 
 /**
  * Unregister all triggers
  */
-export function unregisterAllTriggers(): void {
-    for (const [id, job] of activeJobs) {
-        clearInterval(job);
+export async function unregisterAllTriggers(): Promise<void> {
+    const client = await getTemporalClient();
+    for await (const schedule of client.schedule.list()) {
+        if (!schedule.scheduleId.startsWith("manowar-trigger-")) {
+            continue;
+        }
+        const memo = schedule.memo as Record<string, unknown> | undefined;
+        const walletFromMemo = typeof memo?.manowarWallet === "string" ? memo.manowarWallet : null;
+        const triggerIdFromMemo = typeof memo?.triggerId === "string" ? memo.triggerId : null;
+        const identifier = schedule.scheduleId.slice("manowar-trigger-".length);
+        const separator = identifier.indexOf("-");
+        const walletFromId = separator > 0 ? identifier.slice(0, separator) : null;
+        const triggerIdFromId = separator > 0 ? identifier.slice(separator + 1) : null;
+        const wallet = walletFromMemo || walletFromId;
+        const triggerId = triggerIdFromMemo || triggerIdFromId;
+        if (!wallet || !triggerId) {
+            continue;
+        }
+        try {
+            await deleteTriggerSchedule(wallet, triggerId);
+        } catch (error) {
+            console.warn(`[triggers] Failed to delete schedule ${triggerId}:`, error);
+        }
     }
-    activeJobs.clear();
+    await refreshActiveTriggerCount();
     console.log("[triggers] Unregistered all triggers");
 }
 
@@ -470,26 +475,26 @@ export function unregisterAllTriggers(): void {
  * Get active trigger count
  */
 export function getActiveTriggerCount(): number {
-    return activeJobs.size;
+    return activeTriggerCount;
 }
 
 /**
  * Initialize triggers from Redis on server startup
  * 
  * Call this when the server starts to reload all persisted triggers
- * and re-register them with the in-memory scheduler.
+ * and rebuild active trigger indexes in memory.
  * 
  * @param manowarWallets - List of manowar wallet addresses to load triggers for
- * @param executor - Function to execute when a trigger fires
+ * @param executor - Unused; kept for API compatibility.
  * @returns Number of triggers registered
  */
 export async function initTriggersFromRedis(
     manowarWallets: string[],
-    executor: (trigger: TriggerDefinition) => Promise<void>
+    _executor: (trigger: TriggerDefinition) => Promise<void>
 ): Promise<number> {
     let totalRegistered = 0;
 
-    console.log(`[triggers] Initializing triggers from Redis for ${manowarWallets.length} manowars...`);
+    console.log(`[triggers] Initializing triggers from Temporal schedules for ${manowarWallets.length} manowars...`);
 
     for (const wallet of manowarWallets) {
         try {
@@ -497,7 +502,6 @@ export async function initTriggersFromRedis(
 
             for (const trigger of triggers) {
                 if (trigger.enabled && trigger.cronExpression) {
-                    registerTrigger(trigger, executor);
                     totalRegistered++;
                 }
             }
@@ -510,6 +514,7 @@ export async function initTriggersFromRedis(
         }
     }
 
+    await refreshActiveTriggerCount();
     console.log(`[triggers] Initialization complete: ${totalRegistered} triggers registered`);
     return totalRegistered;
 }

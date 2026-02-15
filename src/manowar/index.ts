@@ -101,11 +101,15 @@ export {
     storeTrigger,
     retrieveTriggers,
     deleteTriggerFromMemory,
+    getTriggerById,
+    updateTriggerEnabled,
     registerTrigger,
     unregisterTrigger,
     unregisterAllTriggers,
     getActiveTriggerCount,
     getNextRunTime,
+    initTriggersFromRedis,
+    initTriggersForManowar,
 } from "./triggers.js";
 
 // Agentic models
@@ -179,3 +183,12 @@ export {
     type Checkpoint,
     type CheckpointSummary,
 } from "./checkpoint.js";
+
+// AlwaysOnAgent - Continuous agent execution
+export {
+    AlwaysOnAgent,
+    runContinuousAgent,
+    type AlwaysOnAgentConfig,
+    type AgentState,
+    type AgentIterationResult,
+} from "../agent/always-on.js";
