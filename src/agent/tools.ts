@@ -8,9 +8,76 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { ComposeTool } from "../types.js";
 import type { AgentWallet } from "../agent-wallet.js";
+import { createHash } from "crypto";
+import { getAgentExecutionContext } from "./context.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 const RUNTIME_SERVICE_URL = process.env.RUNTIME_SERVICE_URL || "https://runtime.compose.market";
+
+interface ToolExecutionContext {
+    getComposeRunId?: () => string | undefined;
+    getThreadId?: () => string | undefined;
+}
+
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const TOOL_RETRY_MAX_ATTEMPTS = 3;
+const TOOL_RETRY_INITIAL_MS = 300;
+const TOOL_RETRY_MAX_MS = 2000;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeBackoffDelayMs(attempt: number): number {
+    const exponential = Math.min(
+        TOOL_RETRY_MAX_MS,
+        TOOL_RETRY_INITIAL_MS * Math.pow(2, Math.max(0, attempt - 1)),
+    );
+    const jitter = Math.floor(Math.random() * 200);
+    return exponential + jitter;
+}
+
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= TOOL_RETRY_MAX_ATTEMPTS; attempt += 1) {
+        try {
+            const response = await fetch(url, init);
+            if (!RETRYABLE_STATUSES.has(response.status) || attempt === TOOL_RETRY_MAX_ATTEMPTS) {
+                return response;
+            }
+        } catch (error) {
+            lastError = error;
+            if (attempt === TOOL_RETRY_MAX_ATTEMPTS) {
+                throw error;
+            }
+        }
+        await sleep(computeBackoffDelayMs(attempt));
+    }
+
+    throw (lastError instanceof Error ? lastError : new Error("Tool request failed after retries"));
+}
+
+function buildCorrelationHeaders(
+    context: ToolExecutionContext | undefined,
+    scope: string,
+    payload?: unknown,
+): Record<string, string> {
+    const currentContext = getAgentExecutionContext();
+    const composeRunId = context?.getComposeRunId?.() || currentContext?.composeRunId;
+    if (!composeRunId) {
+        return {};
+    }
+
+    const serialized = JSON.stringify(payload ?? {});
+    const hash = createHash("sha256").update(serialized).digest("hex").slice(0, 20);
+    const threadId = context?.getThreadId?.() || currentContext?.threadId || "thread";
+
+    return {
+        "x-compose-run-id": composeRunId,
+        "x-idempotency-key": `${composeRunId}:${threadId}:${scope}:${hash}`,
+    };
+}
 
 // =============================================================================
 // Failed Tool Tracking
@@ -52,6 +119,25 @@ function isToolFailed(toolKey: string): { failed: boolean; reason?: string } {
         return { failed: true, reason: entry.reason };
     }
     return { failed: false };
+}
+
+function clearToolFailure(toolKey: string): void {
+    if (failedTools.has(toolKey)) {
+        failedTools.delete(toolKey);
+    }
+}
+
+function isRetryableToolFailure(status: number, errorText: string): boolean {
+    if (RETRYABLE_STATUSES.has(status)) {
+        return true;
+    }
+    const normalized = errorText.toLowerCase();
+    return (
+        normalized.includes("temporarily unavailable") ||
+        normalized.includes("timeout") ||
+        normalized.includes("network") ||
+        normalized.includes("spawn")
+    );
 }
 
 // =============================================================================
@@ -156,6 +242,27 @@ function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> 
     return z.object(shape);
 }
 
+function sanitizeToolName(name: string): string {
+    const sanitized = name.replace(/[^a-zA-Z0-9_]/g, "_");
+    return sanitized.length > 0 ? sanitized : "tool";
+}
+
+function reserveToolName(baseName: string, usedNames: Set<string>): string {
+    const candidate = sanitizeToolName(baseName);
+    if (!usedNames.has(candidate)) {
+        usedNames.add(candidate);
+        return candidate;
+    }
+
+    let suffix = 2;
+    while (usedNames.has(`${candidate}_${suffix}`)) {
+        suffix += 1;
+    }
+    const unique = `${candidate}_${suffix}`;
+    usedNames.add(unique);
+    return unique;
+}
+
 // =============================================================================
 // Tool Creation from MCP Service
 // =============================================================================
@@ -166,16 +273,19 @@ function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> 
  * @param pluginIds Plugin IDs to load (e.g. ["goat:coingecko", "mcp:github"])
  * @param agentWallet Agent wallet context
  * @param sessionContext Session context for payment headers
+ * @param executionContext Optional run context for correlation headers
  * @returns Array of LangChain DynamicStructuredTool instances
  */
 export async function createAgentTools(
     pluginIds: string[],
     agentWallet?: AgentWallet,
-    sessionContext?: { sessionActive: boolean; sessionBudgetRemaining: number }
+    sessionContext?: { sessionActive: boolean; sessionBudgetRemaining: number },
+    executionContext?: ToolExecutionContext,
 ): Promise<DynamicStructuredTool[]> {
     if (!pluginIds || pluginIds.length === 0) return [];
 
     const tools: DynamicStructuredTool[] = [];
+    const usedToolNames = new Set<string>();
 
     for (const pluginId of pluginIds) {
         try {
@@ -201,8 +311,15 @@ export async function createAgentTools(
             console.log(`[createAgentTools] Normalized "${pluginId}" → source="${source}", id="${id}"`);
 
             if (source === "goat") {
-                // Fetch GOAT plugin tools from MCP server
-                const response = await fetch(`${RUNTIME_SERVICE_URL}/goat/plugins/${id}`);
+                const response = await fetchWithRetry(
+                    `${RUNTIME_SERVICE_URL}/goat/plugins/${id}`,
+                    {
+                        method: "GET",
+                        headers: {
+                            ...buildCorrelationHeaders(executionContext, `goat:plugin:${id}`),
+                        },
+                    },
+                );
                 if (!response.ok) {
                     console.warn(`[createAgentTools] GOAT plugin ${id} not found`);
                     continue;
@@ -213,8 +330,9 @@ export async function createAgentTools(
 
                 // Create a LangChain tool for each GOAT tool
                 for (const toolDef of pluginTools) {
+                    const toolName = reserveToolName(toolDef.name, usedToolNames);
                     const tool = new DynamicStructuredTool({
-                        name: toolDef.name,
+                        name: toolName,
                         description: toolDef.description || `Execute ${toolDef.name}`,
                         schema: toolDef.parameters ? createZodSchema(toolDef.parameters) : z.object({}),
                         func: async (args: Record<string, unknown>) => {
@@ -235,8 +353,16 @@ export async function createAgentTools(
 
                             // Phase 1: Add pricing metadata for usage tracking
                             headers["x-tool-price"] = "1000"; // $0.001 default
+                            Object.assign(
+                                headers,
+                                buildCorrelationHeaders(
+                                    executionContext,
+                                    `goat:tool:${id}:${toolDef.name}`,
+                                    args,
+                                ),
+                            );
 
-                            const execResponse = await fetch(
+                            const execResponse = await fetchWithRetry(
                                 `${RUNTIME_SERVICE_URL}/goat/plugins/${id}/tools/${toolDef.name}`,
                                 {
                                     method: "POST",
@@ -247,7 +373,9 @@ export async function createAgentTools(
 
                             if (!execResponse.ok) {
                                 const error = await execResponse.text();
-                                throw new Error(`Tool execution failed: ${error}`);
+                                throw new Error(
+                                    `GOAT tool "${toolDef.name}" failed (${execResponse.status}): ${error || "unknown error"}`,
+                                );
                             }
 
                             const result = await execResponse.json();
@@ -267,9 +395,13 @@ export async function createAgentTools(
 
                 let response: Response;
                 try {
-                    response = await fetch(`${RUNTIME_SERVICE_URL}/mcp/servers/${id}/tools`, {
-                        signal: controller.signal
-                    });
+                    response = await fetchWithRetry(
+                        `${RUNTIME_SERVICE_URL}/mcp/servers/${id}/tools`,
+                        {
+                            signal: controller.signal,
+                            headers: buildCorrelationHeaders(executionContext, `mcp:tools:${id}`),
+                        },
+                    );
                 } catch (err: any) {
                     if (err.name === 'AbortError') {
                         console.warn(`[createAgentTools] ✗ MCP server "${id}" timed out after 10s, skipping`);
@@ -314,16 +446,12 @@ export async function createAgentTools(
                     func: async (input: { tool: string; args: Record<string, unknown> }) => {
                         const toolKey = `${id}:${input.tool}`;
 
-                        // Check if this tool is marked as failed - don't waste cycles retrying
+                        // Check if this tool is marked as failed - avoid repeated failing calls
                         const failCheck = isToolFailed(toolKey);
                         if (failCheck.failed) {
-                            return JSON.stringify({
-                                error: true,
-                                status: "TOOL_UNAVAILABLE",
-                                message: `Tool "${input.tool}" is temporarily unavailable: ${failCheck.reason}`,
-                                retryable: false,
-                                suggestion: "Use an alternative approach or inform the user this capability is unavailable."
-                            });
+                            throw new Error(
+                                `Tool "${input.tool}" is temporarily unavailable: ${failCheck.reason || "recent failures"}`,
+                            );
                         }
 
                         // Route to MCP service for actual tool execution
@@ -343,11 +471,19 @@ export async function createAgentTools(
 
                         // Phase 1: Add pricing metadata for usage tracking
                         headers["x-tool-price"] = "1000"; // $0.001 default
+                        Object.assign(
+                            headers,
+                            buildCorrelationHeaders(
+                                executionContext,
+                                `mcp:tool:${id}:${input.tool}`,
+                                input.args,
+                            ),
+                        );
 
                         console.log(`[MCP Executor] ${mcpExecutorName} -> ${input.tool}(${JSON.stringify(input.args)})`);
 
                         try {
-                            const execResponse = await fetch(
+                            const execResponse = await fetchWithRetry(
                                 `${RUNTIME_SERVICE_URL}/mcp/servers/${id}/tools/${input.tool}`,
                                 {
                                     method: "POST",
@@ -358,37 +494,23 @@ export async function createAgentTools(
 
                             if (!execResponse.ok) {
                                 const error = await execResponse.text();
-
-                                if (error.includes("temporarily unavailable") ||
-                                    error.includes("spawn") ||
-                                    error.includes("Failed to get tools") ||
-                                    execResponse.status === 503) {
-                                    markToolFailed(toolKey, "server unavailable");
-                                    return JSON.stringify({
-                                        error: true,
-                                        status: "SERVER_UNAVAILABLE",
-                                        message: `Tool "${input.tool}" failed: MCP server unavailable`,
-                                        retryable: false,
-                                        suggestion: "Do NOT retry this tool. Use alternative tools or inform the user."
-                                    });
+                                if (isRetryableToolFailure(execResponse.status, error)) {
+                                    markToolFailed(toolKey, error || `status ${execResponse.status}`);
                                 }
-
-                                // For other errors (bad input), don't mark as failed
-                                return `Tool "${input.tool}" failed: ${error}. Check arguments and try again.`;
+                                throw new Error(
+                                    `MCP tool "${input.tool}" failed (${execResponse.status}): ${error || "unknown error"}`,
+                                );
                             }
 
+                            clearToolFailure(toolKey);
                             const result = await execResponse.json();
                             return JSON.stringify(result.result);
                         } catch (err: any) {
-                            // Network/timeout errors - mark as failed
-                            markToolFailed(toolKey, err.message || "network error");
-                            return JSON.stringify({
-                                error: true,
-                                status: "NETWORK_ERROR",
-                                message: `Tool "${input.tool}" failed: ${err.message || "network error"}`,
-                                retryable: false,
-                                suggestion: "Do NOT retry. Use alternative approach or inform the user."
-                            });
+                            const errorMessage = err instanceof Error ? err.message : String(err);
+                            if (isRetryableToolFailure(503, errorMessage)) {
+                                markToolFailed(toolKey, errorMessage);
+                            }
+                            throw new Error(`MCP tool "${input.tool}" failed: ${errorMessage}`);
                         }
                     },
                 });
@@ -468,8 +590,10 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
         description: "Search your long-term memory/knowledge base for past interactions or learned facts. Uses graph memory for better relation-based retrieval.",
         schema: z.object({ query: z.string().describe("Search query") }),
         func: async ({ query }: { query: string }) => {
+            const context = getAgentExecutionContext();
             const filters: Record<string, unknown> = {};
             if (manowarWallet) filters.manowar_wallet = manowarWallet;
+            if (context?.composeRunId) filters.compose_run_id = context.composeRunId;
 
             // Use graph-enabled search with reranking
             const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
@@ -482,6 +606,7 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
                     query,
                     agent_id: agentId,
                     user_id: userId,
+                    run_id: context?.threadId,
                     limit: 8,
                     enable_graph: true, // Enable graph memory for relations
                     rerank: true, // Enable reranking for relevance
@@ -501,6 +626,7 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
         description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
         schema: z.object({ content: z.string().describe("Fact to remember") }),
         func: async ({ content }: { content: string }) => {
+            const context = getAgentExecutionContext();
             const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
                 method: "POST",
                 headers: {
@@ -511,10 +637,12 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
                     messages: [{ role: "user", content }],
                     agent_id: agentId,
                     user_id: userId,
+                    run_id: context?.threadId,
                     enable_graph: true, // Enable graph extraction
                     metadata: {
                         type: "explicit_save",
-                        manowar_wallet: manowarWallet
+                        manowar_wallet: manowarWallet,
+                        compose_run_id: context?.composeRunId,
                     }
                 }),
             });

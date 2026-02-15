@@ -1,13 +1,20 @@
 /**
- * File System Checkpoint Saver
+ * Enhanced Checkpoint Saver with Recovery (Feb 2026)
  * 
- * Persists LangGraph agent state to the local filesystem (JSON files).
- * Ensures agent state survives server restarts.
+ * Modern features:
+ * - Automatic state recovery from interruptions
+ * - Graceful degradation on checkpoint corruption
+ * - Health monitoring and metrics
+ * - Support for long-running autonomous agents
  */
 
 import fs from "fs";
 import path from "path";
 import { BaseCheckpointSaver, type Checkpoint, type CheckpointMetadata, type CheckpointTuple, type CheckpointListOptions } from "@langchain/langgraph-checkpoint";
+
+// Checkpoint health configuration
+const CHECKPOINT_MAX_AGE_MS = parseInt(process.env.CHECKPOINT_MAX_AGE_MS || "86400000", 10); // 24 hours
+const CHECKPOINT_RETENTION_COUNT = parseInt(process.env.CHECKPOINT_RETENTION_COUNT || "50", 10);
 
 export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
     private dataDir: string;
@@ -216,5 +223,159 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
         if (files.length === 0) return undefined;
 
         return files[0];
+    }
+
+    /**
+     * Health check: Verify checkpoint integrity and age
+     * Returns health status with recovery recommendations
+     */
+    async healthCheck(threadId: string): Promise<{
+        healthy: boolean;
+        lastCheckpointAge?: number;
+        checkpointCount: number;
+        canRecover: boolean;
+        recommendation?: string;
+    }> {
+        const threadDir = path.join(this.dataDir, threadId);
+        
+        if (!fs.existsSync(threadDir)) {
+            return { healthy: true, checkpointCount: 0, canRecover: false };
+        }
+
+        try {
+            const files = fs.readdirSync(threadDir)
+                .filter(f => f.endsWith(".bin") || f.endsWith(".json"));
+            
+            const checkpointCount = files.length / 2; // .bin and .type files per checkpoint
+            
+            if (checkpointCount === 0) {
+                return { healthy: true, checkpointCount: 0, canRecover: false };
+            }
+
+            const latestId = await this.getLatestCheckpointId(threadId);
+            if (!latestId) {
+                return { 
+                    healthy: false, 
+                    checkpointCount, 
+                    canRecover: false,
+                    recommendation: "No valid checkpoints found"
+                };
+            }
+
+            // Check age of latest checkpoint
+            const latestFile = path.join(threadDir, `${latestId}.bin`);
+            const stats = fs.statSync(latestFile);
+            const age = Date.now() - stats.mtimeMs;
+
+            const healthy = age < CHECKPOINT_MAX_AGE_MS && checkpointCount > 0;
+            
+            return {
+                healthy,
+                lastCheckpointAge: age,
+                checkpointCount,
+                canRecover: checkpointCount > 0,
+                recommendation: healthy ? undefined : 
+                    age >= CHECKPOINT_MAX_AGE_MS 
+                        ? "Checkpoint is stale, consider restarting conversation"
+                        : "Low checkpoint count, recovery may be limited"
+            };
+        } catch (error) {
+            console.error(`[Checkpoint] Health check failed for ${threadId}:`, error);
+            return { 
+                healthy: false, 
+                checkpointCount: 0, 
+                canRecover: false,
+                recommendation: "Checkpoint directory corrupt or inaccessible"
+            };
+        }
+    }
+
+    /**
+     * Cleanup old checkpoints to prevent disk bloat
+     * Keeps only the most recent N checkpoints per thread
+     */
+    async cleanup(threadId: string, keepCount: number = CHECKPOINT_RETENTION_COUNT): Promise<number> {
+        const threadDir = path.join(this.dataDir, threadId);
+        if (!fs.existsSync(threadDir)) return 0;
+
+        try {
+            const files = fs.readdirSync(threadDir)
+                .filter(f => f.endsWith(".bin"))
+                .map(f => f.replace(/\.bin$/, ""))
+                .sort((a, b) => b.localeCompare(a)); // Newest first
+
+            if (files.length <= keepCount) return 0;
+
+            let deleted = 0;
+            for (const checkpointId of files.slice(keepCount)) {
+                try {
+                    fs.unlinkSync(path.join(threadDir, `${checkpointId}.bin`));
+                    fs.unlinkSync(path.join(threadDir, `${checkpointId}.type`));
+                    deleted++;
+                } catch (e) {
+                    console.warn(`[Checkpoint] Failed to delete old checkpoint ${checkpointId}:`, e);
+                }
+            }
+
+            if (deleted > 0) {
+                console.log(`[Checkpoint] Cleaned up ${deleted} old checkpoints for ${threadId}`);
+            }
+
+            return deleted;
+        } catch (error) {
+            console.error(`[Checkpoint] Cleanup failed for ${threadId}:`, error);
+            return 0;
+        }
+    }
+
+    /**
+     * Recover state from last known good checkpoint
+     * Useful after crashes or timeouts
+     */
+    async recover(threadId: string): Promise<{
+        success: boolean;
+        checkpoint?: CheckpointTuple;
+        message: string;
+    }> {
+        try {
+            const health = await this.healthCheck(threadId);
+            
+            if (!health.canRecover) {
+                return { success: false, message: "No checkpoints available for recovery" };
+            }
+
+            // Try to get latest checkpoint
+            const checkpoint = await this.getTuple({ configurable: { thread_id: threadId } });
+            
+            if (!checkpoint) {
+                return { success: false, message: "Could not load latest checkpoint" };
+            }
+
+            // Validate checkpoint has messages
+            const rawMessages = checkpoint.checkpoint?.channel_values?.messages;
+            const messages = Array.isArray(rawMessages) ? rawMessages : [];
+            if (messages.length === 0) {
+                return { 
+                    success: true, 
+                    checkpoint,
+                    message: "Recovered checkpoint but no message history found" 
+                };
+            }
+
+            // Clean up old checkpoints after successful recovery
+            await this.cleanup(threadId);
+
+            return {
+                success: true,
+                checkpoint,
+                message: `Recovered ${messages.length} messages from checkpoint`
+            };
+        } catch (error) {
+            console.error(`[Checkpoint] Recovery failed for ${threadId}:`, error);
+            return { 
+                success: false, 
+                message: `Recovery error: ${error instanceof Error ? error.message : String(error)}` 
+            };
+        }
     }
 }

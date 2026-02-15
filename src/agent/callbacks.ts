@@ -9,7 +9,10 @@ import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
 import type { ChainValues } from "@langchain/core/utils/types";
 
-const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || process.env.API_URL;
+if (!LAMBDA_API_URL) {
+    throw new Error("LAMBDA_API_URL or API_URL is required");
+}
 
 // HTTP client for mem0 API
 async function addMemory(params: {
@@ -42,13 +45,15 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
     private threadId: string;
     private userId?: string;
     private manowarWallet?: string;
+    private composeRunId?: string;
 
-    constructor(agentWallet: string, threadId: string, userId?: string, manowarWallet?: string) {
+    constructor(agentWallet: string, threadId: string, userId?: string, manowarWallet?: string, composeRunId?: string) {
         super();
         this.agentWallet = agentWallet;
         this.threadId = threadId;
         this.userId = userId;
         this.manowarWallet = manowarWallet;
+        this.composeRunId = composeRunId;
     }
 
     /**
@@ -84,7 +89,8 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 type: "tool_execution",
                 tool: toolName,
                 run_id: runId,
-                manowar_wallet: this.manowarWallet
+                manowar_wallet: this.manowarWallet,
+                compose_run_id: this.composeRunId,
             }
         });
     }
@@ -117,7 +123,8 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                     metadata: {
                         type: "agent_response",
                         run_id: runId,
-                        manowar_wallet: this.manowarWallet
+                        manowar_wallet: this.manowarWallet,
+                        compose_run_id: this.composeRunId,
                     }
                 });
             }
@@ -151,11 +158,11 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                     run_id: this.threadId,
                     metadata: {
                         type: "user_message",
-                        manowar_wallet: this.manowarWallet
+                        manowar_wallet: this.manowarWallet,
+                        compose_run_id: this.composeRunId,
                     }
                 }).catch((err: Error) => console.error("[Mem0Handler] Background save failed:", err));
             }
         }
     }
 }
-
