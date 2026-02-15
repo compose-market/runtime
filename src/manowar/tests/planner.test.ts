@@ -1,6 +1,6 @@
 /**
  * Planner Tests
- * 
+ *
  * Unit tests for the TaskPlanner component of the Shadow Orchestra.
  * Tests plan creation, validation, reflection, and task prompt generation.
  */
@@ -9,40 +9,90 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { TaskPlanner, type ExecutionPlan, type PlanStep } from "../planner.js";
 import type { Workflow } from "../types.js";
 
-// Mock ChatOpenAI with a class-like constructor
-vi.mock("@langchain/openai", () => {
-    return {
-        ChatOpenAI: class MockChatOpenAI {
-            constructor() { }
-            async invoke() {
-                return {
-                    content: JSON.stringify({
-                        goal_understanding: "Test goal",
-                        steps: [
-                            {
-                                stepNumber: 1,
-                                agentName: "TestAgent",
-                                agentWallet: "0x0000000000000000000000000000000000000001",
-                                task: "Test task",
-                                expectedOutput: "Test output",
-                                dependsOn: [],
-                                estimatedTokens: 2000,
-                                priority: "high",
-                            },
-                        ],
-                        total_estimated_tokens: 2000,
-                    }),
-                };
-            }
-        },
-    };
+let plannerPayload: Record<string, unknown>;
+let reflectionPayload: Record<string, unknown>;
+let reviewerPayload: Record<string, unknown>;
+
+const mockModelInvoke = vi.fn(async (messages: Array<{ content?: unknown }>) => {
+    const systemPrompt = String(messages?.[0]?.content || "");
+
+    if (systemPrompt.includes("TASK PLANNER")) {
+        return { content: JSON.stringify(plannerPayload) };
+    }
+
+    if (systemPrompt.includes("STEP REFLECTOR")) {
+        return { content: JSON.stringify(reflectionPayload) };
+    }
+
+    if (systemPrompt.includes("WORKFLOW REVIEWER")) {
+        return { content: JSON.stringify(reviewerPayload) };
+    }
+
+    return { content: "{}" };
 });
+
+vi.mock("../../frameworks/langchain.js", () => ({
+    createModel: vi.fn(() => ({
+        invoke: mockModelInvoke,
+    })),
+}));
+
+vi.mock("../memory.js", () => ({
+    searchMemoryWithGraph: vi.fn(async () => ({ memories: [] })),
+    addMemoryWithGraph: vi.fn(async () => []),
+    getAgentReliability: vi.fn(async () => ({
+        avgQuality: 8.2,
+        successRate: 0.91,
+        totalRuns: 12,
+    })),
+}));
+
+vi.mock("../registry.js", () => ({
+    discoverAgentTools: vi.fn(async () => []),
+}));
+
+vi.mock("../langsmith.js", () => ({
+    isLangSmithEnabled: vi.fn(() => false),
+    getRelevantLearnings: vi.fn(async () => []),
+}));
 
 describe("TaskPlanner", () => {
     let planner: TaskPlanner;
     let mockWorkflow: Workflow;
 
     beforeEach(() => {
+        plannerPayload = {
+            goal_understanding: "Test goal",
+            steps: [
+                {
+                    stepNumber: 1,
+                    agentName: "TestAgent",
+                    agentWallet: "0x0000000000000000000000000000000000000001",
+                    task: "Test task",
+                    expectedOutput: "Test output",
+                    dependsOn: [],
+                    estimatedTokens: 2000,
+                    priority: "high",
+                },
+            ],
+            total_estimated_tokens: 2000,
+        };
+
+        reflectionPayload = {
+            success: true,
+            qualityScore: 8,
+            learnings: ["Good output"],
+            continueWithPlan: true,
+        };
+
+        reviewerPayload = {
+            hasPastExecutions: true,
+            pastQualityScore: 8.1,
+            suggestions: ["Use the reliable agent first"],
+            successPatterns: ["Atomic tasks"],
+            avoidPatterns: ["Ambiguous prompts"],
+        };
+
         mockWorkflow = {
             id: "test-workflow",
             name: "Test Workflow",
@@ -107,13 +157,53 @@ describe("TaskPlanner", () => {
         it("should validate agent names against workflow", async () => {
             const plan = await planner.createPlan("Test goal");
 
-            // Check that all steps reference valid agents
             for (const step of plan.steps) {
                 const validNames = mockWorkflow.steps
-                    .filter(s => s.type === "agent")
-                    .map(s => s.name);
+                    .filter((s) => s.type === "agent")
+                    .map((s) => s.name);
                 expect(validNames).toContain(step.agentName);
             }
+        });
+
+        it("should enforce workflow graph dependencies", async () => {
+            plannerPayload = {
+                goal_understanding: "Two-step goal",
+                steps: [
+                    {
+                        stepNumber: 1,
+                        agentName: "SecondAgent",
+                        agentWallet: "0x0000000000000000000000000000000000000002",
+                        task: "Summarize results",
+                        expectedOutput: "Summary",
+                        dependsOn: [],
+                        estimatedTokens: 1200,
+                        priority: "medium",
+                    },
+                    {
+                        stepNumber: 2,
+                        agentName: "TestAgent",
+                        agentWallet: "0x0000000000000000000000000000000000000001",
+                        task: "Analyze input",
+                        expectedOutput: "Analysis",
+                        dependsOn: [],
+                        estimatedTokens: 1800,
+                        priority: "high",
+                    },
+                ],
+                total_estimated_tokens: 3000,
+            };
+
+            planner.setWorkflowGraph({
+                steps: mockWorkflow.steps,
+                edges: [{ source: 0, target: 1 }],
+            });
+
+            const plan = await planner.createPlan("Respect graph ordering");
+
+            expect(plan.validated).toBe(true);
+            expect(plan.steps[0].agentName).toBe("TestAgent");
+            expect(plan.steps[1].agentName).toBe("SecondAgent");
+            expect(plan.steps[1].dependsOn).toContain(1);
         });
     });
 
@@ -126,14 +216,14 @@ describe("TaskPlanner", () => {
             expect(nextStep?.stepNumber).toBe(1);
 
             const afterFirstStep = planner.getNextStep([1]);
-            expect(afterFirstStep).toBeNull(); // Only one step in mock
+            expect(afterFirstStep).toBeNull();
         });
 
         it("should return null when all steps are completed", async () => {
             await planner.createPlan("Test goal");
 
             const plan = planner.getCurrentPlan();
-            const allSteps = plan?.steps.map(s => s.stepNumber) || [];
+            const allSteps = plan?.steps.map((s) => s.stepNumber) || [];
             const nextStep = planner.getNextStep(allSteps);
 
             expect(nextStep).toBeNull();
@@ -157,19 +247,44 @@ describe("TaskPlanner", () => {
         });
 
         it("should include context from previous steps", async () => {
+            plannerPayload = {
+                goal_understanding: "Two-step goal",
+                steps: [
+                    {
+                        stepNumber: 1,
+                        agentName: "TestAgent",
+                        agentWallet: "0x0000000000000000000000000000000000000001",
+                        task: "Analyze",
+                        expectedOutput: "Analysis",
+                        dependsOn: [],
+                        estimatedTokens: 1200,
+                        priority: "high",
+                    },
+                    {
+                        stepNumber: 2,
+                        agentName: "SecondAgent",
+                        agentWallet: "0x0000000000000000000000000000000000000002",
+                        task: "Summarize",
+                        expectedOutput: "Summary",
+                        dependsOn: [1],
+                        estimatedTokens: 1200,
+                        priority: "medium",
+                    },
+                ],
+                total_estimated_tokens: 2400,
+            };
+
             await planner.createPlan("Multi-step goal");
             const plan = planner.getCurrentPlan()!;
 
-            // Simulate first step having output
             const previousOutputs = new Map<number, string>();
             previousOutputs.set(1, "First step completed with results...");
 
-            // Check if plan has a step that depends on step 1
-            const dependentStep = plan.steps.find(s => s.dependsOn.includes(1));
-            if (dependentStep) {
-                const prompt = planner.generateTaskPrompt(dependentStep, previousOutputs);
-                expect(prompt).toContain("CONTEXT FROM PREVIOUS STEPS");
-            }
+            const dependentStep = plan.steps.find((s) => s.dependsOn.includes(1));
+            expect(dependentStep).toBeDefined();
+
+            const prompt = planner.generateTaskPrompt(dependentStep!, previousOutputs);
+            expect(prompt).toContain("CONTEXT FROM PREVIOUS STEPS");
         });
     });
 
@@ -180,7 +295,7 @@ describe("TaskPlanner", () => {
             const reflection = await planner.reflectOnStep(
                 1,
                 "Step completed successfully with output...",
-                1500
+                1500,
             );
 
             expect(reflection).toBeDefined();
@@ -192,9 +307,7 @@ describe("TaskPlanner", () => {
         });
 
         it("should throw error when no plan exists", async () => {
-            await expect(
-                planner.reflectOnStep(1, "output", 1000)
-            ).rejects.toThrow("No plan exists");
+            await expect(planner.reflectOnStep(1, "output", 1000)).rejects.toThrow("No plan exists");
         });
     });
 
