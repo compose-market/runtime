@@ -71,7 +71,6 @@ export async function startManowarTemporalWorkers(): Promise<void> {
 
     const connection = await NativeConnection.connect({
         address: normalizeAddress(endpoint),
-        tls: true,
         apiKey,
     });
     const namespace = getTemporalNamespace();

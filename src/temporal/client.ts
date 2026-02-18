@@ -41,7 +41,6 @@ export async function getTemporalConnection(): Promise<Connection> {
     cachedConnection = await Connection.connect({
         address: normalizeAddress(endpoint),
         apiKey,
-        tls: true,
     });
 
     return cachedConnection;
