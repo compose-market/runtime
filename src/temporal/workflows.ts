@@ -373,3 +373,18 @@ export { runStateQuery as getRunStateQuery, approvalDecisionQuery as getApproval
 export { agentRunStateQuery as getAgentRunStateQuery };
 export { reportProgressSignal, cancelExecutionSignal, setStepApprovalSignal };
 export { toStateProjection };
+
+export {
+    memoryConsolidationWorkflow,
+    patternExtractionWorkflow,
+    archiveCreationWorkflow,
+    decayUpdateWorkflow,
+    skillPromotionWorkflow,
+    memoryCleanupWorkflow,
+} from "./memory/workflows.js";
+
+export {
+    getMemoryWorkflowStateQuery,
+    pauseMemoryWorkflowSignal,
+    resumeMemoryWorkflowSignal,
+} from "./memory/workflows.js";

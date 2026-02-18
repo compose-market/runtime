@@ -92,3 +92,119 @@ export interface ManowarWorkflowResult extends OrchestratorResult {
     /** If true, indicates next continuous iteration was scheduled */
     continuousNextScheduled?: boolean;
 }
+
+export interface MemoryConsolidationInput {
+    agentWallets: string[];
+    options?: MemoryActivityOptions;
+    _iterationCount?: number;
+}
+
+export interface PatternExtractionInput {
+    agentWallet: string;
+    timeRange: { start: number; end: number };
+    options?: MemoryActivityOptions;
+}
+
+export interface ArchiveCreationInput {
+    agentWallet: string;
+    dateRange: { start: number; end: number };
+    options?: MemoryActivityOptions;
+}
+
+export interface DecayUpdateInput {
+    halfLifeDays?: number;
+    options?: MemoryActivityOptions;
+    _iterationCount?: number;
+}
+
+export interface SkillPromotionInput {
+    patternId: string;
+    skillName: string;
+    options?: MemoryActivityOptions;
+}
+
+export interface MemoryCleanupInput {
+    olderThanDays?: number;
+    options?: MemoryActivityOptions;
+    _iterationCount?: number;
+}
+
+export interface MemoryActivityOptions {
+    batchSize?: number;
+    confidenceThreshold?: number;
+    compress?: boolean;
+    syncToIpfs?: boolean;
+    dryRun?: boolean;
+}
+
+export interface MemoryWorkflowResult {
+    success: boolean;
+    processed: number;
+    errors?: string[];
+}
+
+export interface MemoryWorkflowState {
+    workflowId: string;
+    status: "running" | "completed" | "failed" | "paused";
+    startedAt: number;
+    updatedAt: number;
+    processed: number;
+    errors: string[];
+    paused: boolean;
+}
+
+export interface ConsolidationActivityResult {
+    success: boolean;
+    processed: number;
+    errors?: string[];
+}
+
+export interface PatternExtractionActivityResult {
+    success: boolean;
+    processed: number;
+    errors?: string[];
+}
+
+export interface ArchiveCreationActivityResult {
+    success: boolean;
+    processed: number;
+    archiveId?: string;
+    ipfsHash?: string;
+    errors?: string[];
+}
+
+export interface DecayUpdateActivityResult {
+    success: boolean;
+    processed: number;
+    errors?: string[];
+}
+
+export interface PatternValidationResult {
+    success: boolean;
+    data?: {
+        valid: boolean;
+        confidence: number;
+        occurrences: number;
+        successRate: number;
+        toolSequence: string[];
+    };
+    error?: string;
+}
+
+export interface SkillPromotionResult {
+    success: boolean;
+    skillId?: string;
+    error?: string;
+}
+
+export interface MemoryCleanupActivityResult {
+    success: boolean;
+    processed: number;
+    errors?: string[];
+}
+
+export interface SyncToPinataResult {
+    success: boolean;
+    ipfsHash?: string;
+    error?: string;
+}

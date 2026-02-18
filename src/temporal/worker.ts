@@ -2,7 +2,7 @@ import { NativeConnection, Worker } from "@temporalio/worker";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { AGENT_ACTIVITY_TASK_QUEUE, AGENT_TASK_QUEUE, MANOWAR_ACTIVITY_TASK_QUEUE, MANOWAR_TASK_QUEUE } from "./constants.js";
+import { AGENT_ACTIVITY_TASK_QUEUE, AGENT_TASK_QUEUE, MANOWAR_ACTIVITY_TASK_QUEUE, MANOWAR_TASK_QUEUE, MEMORY_ACTIVITY_TASK_QUEUE } from "./constants.js";
 import { getTemporalNamespace, isTemporalConfigured } from "./client.js";
 import { validateEncryptionSetup, getEncryptionStatus } from "./encryption.js";
 
@@ -12,6 +12,7 @@ const workerPollers: Record<string, number> = {
     [AGENT_TASK_QUEUE]: 0,
     [MANOWAR_ACTIVITY_TASK_QUEUE]: 0,
     [AGENT_ACTIVITY_TASK_QUEUE]: 0,
+    [MEMORY_ACTIVITY_TASK_QUEUE]: 0,
 };
 
 function resetWorkerPollers(): void {
@@ -35,7 +36,7 @@ function resolveWorkflowBundle(): { codePath: string } | undefined {
     // Production optimization: use pre-built workflow bundle if available
     const currentDir = path.dirname(fileURLToPath(import.meta.url));
     const bundlePath = path.join(currentDir, "..", "..", "dist", "workflow-bundle.js");
-    
+
     if (process.env.NODE_ENV === "production" && fs.existsSync(bundlePath)) {
         console.log(`[temporal/worker] Using pre-built workflow bundle: ${bundlePath}`);
         return { codePath: bundlePath };
@@ -77,8 +78,10 @@ export async function startManowarTemporalWorkers(): Promise<void> {
     const workflowsPath = resolveWorkflowsPath();
     const workflowBundle = resolveWorkflowBundle();
     const activities = await import("./activities.js");
+    const memoryActivities = await import("./memory/activities.js");
+    const allActivities = { ...activities, ...memoryActivities };
     resetWorkerPollers();
-    
+
     // Log encryption status (data converter integration ready for future SDK upgrade)
     console.log(getEncryptionStatus());
 
@@ -87,7 +90,7 @@ export async function startManowarTemporalWorkers(): Promise<void> {
     const workerConfig = {
         connection,
         namespace,
-        activities,
+        activities: allActivities,
         shutdownGraceTime: 30_000, // Allow 30s (in ms) for activities to complete gracefully
         shutdownForceTime: 60_000, // Force shutdown after 60s (in ms)
         maxConcurrentActivityTaskExecutions: 100,
@@ -119,6 +122,12 @@ export async function startManowarTemporalWorkers(): Promise<void> {
             identity: generateWorkerIdentity(AGENT_ACTIVITY_TASK_QUEUE),
             ...(workflowBundle ? { workflowBundle } : { workflowsPath }),
         }).then((worker) => ({ taskQueue: AGENT_ACTIVITY_TASK_QUEUE, worker })),
+        Worker.create({
+            ...workerConfig,
+            taskQueue: MEMORY_ACTIVITY_TASK_QUEUE,
+            identity: generateWorkerIdentity(MEMORY_ACTIVITY_TASK_QUEUE),
+            ...(workflowBundle ? { workflowBundle } : { workflowsPath }),
+        }).then((worker) => ({ taskQueue: MEMORY_ACTIVITY_TASK_QUEUE, worker })),
     ]);
 
     running = true;
@@ -135,6 +144,6 @@ export async function startManowarTemporalWorkers(): Promise<void> {
         `[temporal] Workers started with optimized config (heartbeat: 30s, maxRetries: 3, identity tracking enabled)`,
     );
     console.log(
-        `[temporal] Active queues: ${MANOWAR_TASK_QUEUE}, ${AGENT_TASK_QUEUE}, ${MANOWAR_ACTIVITY_TASK_QUEUE}, ${AGENT_ACTIVITY_TASK_QUEUE}`,
+        `[temporal] Active queues: ${MANOWAR_TASK_QUEUE}, ${AGENT_TASK_QUEUE}, ${MANOWAR_ACTIVITY_TASK_QUEUE}, ${AGENT_ACTIVITY_TASK_QUEUE}, ${MEMORY_ACTIVITY_TASK_QUEUE}`,
     );
 }

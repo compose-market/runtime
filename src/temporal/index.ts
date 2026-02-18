@@ -19,3 +19,37 @@ export {
     type CircuitBreakerState,
     type CircuitBreakerConfig,
 } from "./circuit-breaker.js";
+export {
+    memoryConsolidationWorkflow,
+    patternExtractionWorkflow,
+    archiveCreationWorkflow,
+    decayUpdateWorkflow,
+    skillPromotionWorkflow,
+    memoryCleanupWorkflow,
+    getMemoryWorkflowStateQuery,
+    pauseMemoryWorkflowSignal,
+    resumeMemoryWorkflowSignal,
+} from "./memory/workflows.js";
+export {
+    consolidateAgentMemories,
+    extractExecutionPatterns,
+    createMemoryArchive,
+    updateDecayScores,
+    validateExtractedPattern,
+    promotePatternToSkill,
+    cleanupExpiredMemories,
+    syncToPinata,
+} from "./memory/activities.js";
+export {
+    MEMORY_SCHEDULE_OVERLAP_POLICY,
+    MEMORY_DAILY_CONSOLIDATION_SCHEDULE_ID,
+    MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID,
+    MEMORY_HOURLY_DECAY_SCHEDULE_ID,
+    createMemorySchedules,
+    deleteMemorySchedules,
+    getMemoryScheduleStatus,
+    pauseMemorySchedule,
+    resumeMemorySchedule,
+    triggerMemorySchedule,
+    type MemoryScheduleStatus,
+} from "./memory/schedules.js";
