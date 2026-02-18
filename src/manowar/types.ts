@@ -189,7 +189,7 @@ export interface AgentCard {
     /** Model ID for inference (used to fetch contextWindow from API) */
     model: string;
     /** Agent runtime framework */
-    framework?: "eliza" | "langchain";
+    framework?: "eliza" | "langchain" | "openclaw";
     /** License price in USDC (6 decimals) */
     licensePrice: string;
     /** License supply cap (0 = infinite) */
@@ -530,6 +530,12 @@ export interface ExecutorOptions {
     manowarCardUri?: string;
     /** Attachment URL (image, document, etc.) to include in context */
     attachmentUrl?: string;
+    /** End-user identity for nested standalone-agent delegation */
+    userId?: string;
+    /** Conversation thread identifier propagated to delegated agents */
+    threadId?: string;
+    /** Orchestrating workflow wallet for delegated agent context */
+    manowarWallet?: string;
     /** Whether to synthesize final response using coordinator model */
     synthesizeFinal?: boolean;
     /** Allow replanning on invalid plans or failed steps */

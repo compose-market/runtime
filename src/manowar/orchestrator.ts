@@ -547,6 +547,9 @@ ${this.manowarCard?.agents?.map((agentCard: { name: string; model: string; plugi
                         {
                             composeRunId: runId,
                             idempotencyKey: `${runId}:${nextStep.stepNumber}:${nextStep.agentName}`,
+                            userId: options.userId,
+                            threadId: options.threadId,
+                            manowarWallet: walletAddress,
                         },
                     );
 

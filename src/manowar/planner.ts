@@ -1,7 +1,7 @@
 /**
  * Manowar Planner - Task Decomposition & Planning Node
  * 
- * Implements the Plan → Act → Reflect pattern for enterprise-grade orchestration.
+ * Implements the Plan → Act → Reflect pattern for Manowar orchestration.
  * 
  * Key Responsibilities:
  * - Decompose user goals into actionable steps

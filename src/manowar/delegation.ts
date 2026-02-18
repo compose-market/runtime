@@ -50,6 +50,14 @@ export interface DelegationOptions {
     composeRunId?: string;
     /** Idempotency key to deduplicate retries */
     idempotencyKey?: string;
+    /** End user wallet context for nested agent execution */
+    userId?: string;
+    /** Thread/session context from orchestrator request */
+    threadId?: string;
+    /** Workflow wallet */
+    manowarWallet?: string;
+    /** Browser/device permissions granted in parent session */
+    grantedPermissions?: string[];
 }
 
 // =============================================================================
@@ -124,8 +132,15 @@ export async function callAgent(
                 // Session context for proper authentication and budget tracking
                 "x-session-active": "true",
                 "x-session-budget-remaining": "1000000",
+                ...(options.userId ? { "x-session-user-address": options.userId } : {}),
             },
-            body: JSON.stringify({ message }),
+            body: JSON.stringify({
+                message,
+                threadId: options.threadId,
+                manowarWallet: options.manowarWallet,
+                grantedPermissions: options.grantedPermissions || [],
+                composeRunId: options.composeRunId,
+            }),
             signal: controller.signal,
         });
 
