@@ -111,6 +111,7 @@ interface AgentMetadata {
     plugins?: Array<{ registryId: string; name: string; origin: string }>;
     skills?: string[];
     model?: string;
+    framework?: "langchain" | "openclaw" | "eliza";
 }
 
 // =============================================================================
@@ -389,6 +390,7 @@ export async function buildManowarWorkflow(manowarId: number): Promise<{
                     agentCardUri: agentData.agentCardUri,
                     creator: "0x0000000000000000000000000000000000000000", // Unknown creator
                     model: metadata.model,
+                    framework: metadata.framework || "langchain",
                     plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
                     systemPrompt: (metadata as any).systemPrompt,
                 });

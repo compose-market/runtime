@@ -23,6 +23,7 @@ import {
 import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 import { streamAgent } from "./frameworks/langchain.js";
+import { executeOpenClawAgent, streamOpenClawAgent } from "./frameworks/openclaw.js";
 import { createComposeRunId, executeAgentRunWithFallback, getAgentRunState } from "./temporal/service.js";
 
 const router = Router();
@@ -90,6 +91,7 @@ const RegisterAgentSchema = z.object({
     agentCardUri: z.string().startsWith("ipfs://"),
     creator: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
     model: z.string().min(1, "model is required from on-chain metadata"),
+    framework: z.enum(["langchain", "openclaw", "eliza"]).default("langchain"),
     // Plugins can be simple strings (legacy) or full Plugin objects (schema compliant)
     plugins: z.array(
         z.union([
@@ -157,6 +159,7 @@ router.post(
             agentCardUri: params.agentCardUri,
             creator: params.creator,
             model: params.model,
+            framework: params.framework,
             plugins: params.plugins.map((p) => (typeof p === "string" ? p : p.registryId)),
             systemPrompt: params.systemPrompt,
         });
@@ -189,6 +192,7 @@ router.get("/list", (_req: Request, res: Response) => {
             description: a.description,
             walletAddress: a.walletAddress,
             model: a.model,
+            framework: a.framework || "langchain",
             plugins: a.plugins,
             createdAt: a.createdAt.toISOString(),
             lastExecutedAt: a.lastExecutedAt?.toISOString(),
@@ -223,6 +227,7 @@ router.get(
             walletAddress: agent.walletAddress,
             dnaHash: agent.dnaHash,
             model: agent.model,
+            framework: agent.framework || "langchain",
             plugins: agent.plugins,
             createdAt: agent.createdAt.toISOString(),
             lastExecutedAt: agent.lastExecutedAt?.toISOString(),
@@ -371,6 +376,9 @@ router.post(
         }
 
         const { message, threadId, manowarWallet, attachment, grantedPermissions } = parseResult.data;
+        const userId = req.headers["x-session-user-address"] as string | undefined;
+        const sessionActive = req.headers["x-session-active"] === "true";
+        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
 
         // Detect if this is a multimodal model
         const task = await detectModelTask(agent.model);
@@ -414,7 +422,51 @@ router.post(
             return;
         }
 
-        // For chat/text models, use Temporal-backed execution with runtime warmup fallback.
+        // For chat/text models, use framework-specific execution
+        const framework = agent.framework || "langchain";
+
+        // Route to OpenClaw runtime if framework is openclaw
+        if (framework === "openclaw") {
+            console.log(`[agent] Routing to OpenClaw runtime for ${agent.name}`);
+
+            try {
+                const result = await executeOpenClawAgent({
+                    agentWallet: agent.walletAddress,
+                    model: agent.model,
+                    message,
+                    userId,
+                    threadId,
+                    grantedPermissions: grantedPermissions || [],
+                });
+
+                markAgentExecuted(identifier);
+
+                res.json({
+                    walletAddress: agent.walletAddress,
+                    name: agent.name,
+                    framework: "openclaw",
+                    success: result.success,
+                    output: result.output,
+                    usage: result.usage,
+                    promptTokens: result.promptTokens,
+                    completionTokens: result.completionTokens,
+                    runtimeId: result.runtimeId,
+                    containerName: result.containerName,
+                    sessionKey: result.sessionKey,
+                    toolCalls: result.toolCalls,
+                });
+                return;
+            } catch (error) {
+                console.error(`[agent] OpenClaw execution failed:`, error);
+                res.status(500).json({
+                    error: error instanceof Error ? error.message : String(error),
+                    framework: "openclaw",
+                });
+                return;
+            }
+        }
+
+        // LangChain execution (default for langchain + eliza)
         let instance = resolveAgentInstance(identifier);
         if (!instance) {
             const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
@@ -442,13 +494,6 @@ router.post(
             }
         }
 
-        // Extract user address from session/payment headers
-        // x-session-user-address is populated by the Thirdweb client wrapper
-        const userId = req.headers["x-session-user-address"] as string | undefined;
-
-        // Extract session headers for tool execution
-        const sessionActive = req.headers["x-session-active"] === "true";
-        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
         const composeRunId = parseResult.data.composeRunId || createComposeRunId();
         res.setHeader("x-compose-run-id", composeRunId);
 
@@ -532,8 +577,27 @@ router.post(
             return;
         }
 
+        const parseResult = ChatSchema.safeParse(req.body);
+        if (!parseResult.success) {
+            res.status(400).json({
+                error: "Invalid request body",
+                details: parseResult.error.issues,
+            });
+            return;
+        }
+
+        const { message, threadId, composeRunId: requestedRunId, manowarWallet, grantedPermissions } = parseResult.data;
+        const composeRunId = requestedRunId || createComposeRunId();
+        res.setHeader("x-compose-run-id", composeRunId);
+
+        // Extract user address and session context (like /chat)
+        const userId = req.headers["x-session-user-address"] as string | undefined;
+        const sessionActive = req.headers["x-session-active"] === "true";
+        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
+        const framework = agent.framework || "langchain";
+
         let instance = resolveAgentInstance(identifier);
-        if (!instance) {
+        if (framework !== "openclaw" && !instance) {
             const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
             if (!ready) {
                 res.status(503).json({
@@ -555,24 +619,6 @@ router.post(
             }
         }
 
-        const parseResult = ChatSchema.safeParse(req.body);
-        if (!parseResult.success) {
-            res.status(400).json({
-                error: "Invalid request body",
-                details: parseResult.error.issues,
-            });
-            return;
-        }
-
-        const { message, threadId, composeRunId: requestedRunId, manowarWallet, grantedPermissions } = parseResult.data;
-        const composeRunId = requestedRunId || createComposeRunId();
-        res.setHeader("x-compose-run-id", composeRunId);
-
-        // Extract user address and session context (like /chat)
-        const userId = req.headers["x-session-user-address"] as string | undefined;
-        const sessionActive = req.headers["x-session-active"] === "true";
-        const sessionBudgetRemaining = parseInt(req.headers["x-session-budget-remaining"] as string || "0", 10);
-
         // Set up SSE with optimized headers for long-running connections
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
@@ -580,7 +626,7 @@ router.post(
         res.setHeader("Keep-Alive", "timeout=120"); // Tell proxies to wait 120s
         res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering for real-time streaming
         res.setHeader("X-Content-Type-Options", "nosniff"); // Prevent MIME sniffing
-        
+
         const heartbeat = setInterval(() => {
             if (!res.writableEnded) {
                 res.write(": ping\n\n");
@@ -591,19 +637,33 @@ router.post(
         console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}]`);
 
         try {
-            // Stream agent responses directly (real-time streaming)
-            for await (const event of streamAgent(instance.id, message, {
-                threadId,
-                userId,
-                manowarWallet,
-                composeRunId,
-                sessionContext: {
-                    sessionActive,
-                    sessionBudgetRemaining,
-                    grantedPermissions: grantedPermissions || []
+            if (framework === "openclaw") {
+                for await (const event of streamOpenClawAgent({
+                    agentWallet: agent.walletAddress,
+                    model: agent.model,
+                    message,
+                    userId,
+                    threadId,
+                    manowarWallet,
+                    grantedPermissions: grantedPermissions || [],
+                })) {
+                    res.write(`data: ${safeStringify(event)}\n\n`);
                 }
-            })) {
-                res.write(`data: ${safeStringify(event)}\n\n`);
+            } else {
+                // Stream agent responses directly (real-time streaming)
+                for await (const event of streamAgent(instance!.id, message, {
+                    threadId,
+                    userId,
+                    manowarWallet,
+                    composeRunId,
+                    sessionContext: {
+                        sessionActive,
+                        sessionBudgetRemaining,
+                        grantedPermissions: grantedPermissions || []
+                    }
+                })) {
+                    res.write(`data: ${safeStringify(event)}\n\n`);
+                }
             }
             res.write(`data: ${safeStringify({ type: "done" })}\n\n`);
         } catch (err) {
