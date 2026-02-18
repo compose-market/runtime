@@ -266,6 +266,12 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
     const userMessage = typeof payload.input === "string"
         ? payload.input
         : payload.input?.message || payload.message || "Execute workflow";
+    const requestedThreadId =
+        typeof payload.threadId === "string"
+            ? payload.threadId
+            : typeof payload.input?.threadId === "string"
+                ? payload.input.threadId
+                : undefined;
 
     if (!isTemporalReady() && !ALLOW_DIRECT_EXECUTION_FALLBACK) {
         res.status(503).json({
@@ -289,6 +295,9 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
             payment: paymentContext,
             coordinatorModel: manowar.coordinatorModel,
             manowarCardUri: manowar.manowarCardUri,
+            userId: req.headers["x-session-user-address"] as string | undefined,
+            threadId: requestedThreadId,
+            manowarWallet: manowar.walletAddress,
         }),
         runId,
     );
@@ -555,6 +564,9 @@ const manowarChatHandler = asyncHandler(async (req: Request, res: Response) => {
                 manowarCardUri: manowar.manowarCardUri,
                 continuous: Boolean(continuous),
                 maxLoopIterations: Boolean(continuous) ? 5 : undefined,
+                userId: req.headers["x-session-user-address"] as string | undefined,
+                threadId,
+                manowarWallet: manowar.walletAddress,
             }),
             runId,
         );
@@ -652,6 +664,9 @@ const manowarChatHandler = asyncHandler(async (req: Request, res: Response) => {
                 manowarCardUri: manowar.manowarCardUri,
                 continuous: Boolean(continuous),
                 maxLoopIterations: Boolean(continuous) ? 5 : undefined,
+                userId: req.headers["x-session-user-address"] as string | undefined,
+                threadId,
+                manowarWallet: manowar.walletAddress,
                 runId,
                 shouldCancel: () => {
                     // Check cancellation via activeRunIds (consistent with stop endpoint)
