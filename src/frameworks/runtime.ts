@@ -11,6 +11,7 @@
  * - Persists knowledge to Pinata IPFS
  */
 import { createAgent, type AgentConfig, type AgentInstance } from "./langchain.js";
+import { createOpenClawAgent } from "./openclaw.js";
 import { deriveAgentWallet, type AgentWallet } from "../agent-wallet.js";
 
 // =============================================================================
@@ -170,6 +171,8 @@ export interface RegisteredAgent {
     creator: string;
     /** LLM model to use */
     model: string;
+    /** Framework to use for execution */
+    framework: "langchain" | "openclaw" | "eliza";
     /** Plugin/capability IDs */
     plugins: string[];
     /** System prompt */
@@ -194,6 +197,7 @@ export interface RegisterAgentParams {
     agentCardUri: string;
     creator: string;
     model?: string;
+    framework?: "langchain" | "openclaw" | "eliza";
     plugins?: string[];
     systemPrompt?: string;
 }
@@ -430,7 +434,11 @@ async function ensureAgentRuntimeInternal(walletAddress: string, incomingConfig?
 
     const warmupPromise = (async () => {
         try {
-            const instance = await createAgent(config);
+            const framework = registeredAgents.get(walletAddress)?.framework || "langchain";
+            const instance =
+                framework === "openclaw"
+                    ? await createOpenClawAgent(config)
+                    : await createAgent(config);
             agentInstances.set(walletAddress, instance);
             const registered = registeredAgents.get(walletAddress);
             if (registered) {
@@ -496,6 +504,12 @@ export async function registerAgent(
     const runtimeConfig = buildRuntimeConfig(walletAddress, wallet, params);
     agentRuntimeConfigs.set(walletAddress, runtimeConfig);
 
+    const requestedFramework = (params.framework || (runtimeConfig as any)?.framework) as string | undefined;
+    const normalizedFramework: RegisteredAgent["framework"] =
+        requestedFramework === "openclaw" || requestedFramework === "eliza"
+            ? requestedFramework
+            : "langchain";
+
     const registered: RegisteredAgent = {
         agentId,
         dnaHash: params.dnaHash,
@@ -505,6 +519,7 @@ export async function registerAgent(
         agentCardUri: params.agentCardUri,
         creator: params.creator,
         model: runtimeConfig.model || params.model || "unknown",
+        framework: normalizedFramework,
         plugins: runtimeConfig.plugins || [],
         systemPrompt: params.systemPrompt,
         walletAddress,
@@ -514,14 +529,18 @@ export async function registerAgent(
     registeredAgents.set(walletAddress, registered);
     agentIdToWallet.set(agentId.toString(), walletAddress);
 
-    const warmupPromise = ensureAgentRuntimeInternal(walletAddress, runtimeConfig);
-    if (waitForRuntime) {
-        await warmupPromise;
-    }
+    if (normalizedFramework) {
+        const warmupPromise = ensureAgentRuntimeInternal(walletAddress, runtimeConfig);
+        if (waitForRuntime) {
+            await warmupPromise;
+        }
 
-    const readyInstance = agentInstances.get(walletAddress);
-    if (readyInstance) {
-        registered.instanceId = readyInstance.id;
+        const readyInstance = agentInstances.get(walletAddress);
+        if (readyInstance) {
+            registered.instanceId = readyInstance.id;
+        }
+    } else {
+        agentRuntimeWarmupErrors.delete(walletAddress);
     }
 
     return registeredAgents.get(walletAddress)!;
@@ -529,6 +548,12 @@ export async function registerAgent(
 
 export async function registerAgentWithWarmup(params: RegisterAgentParams): Promise<RegisterAgentWarmupResult> {
     const agent = await registerAgent(params, { waitForRuntime: false });
+    if (agent.framework === "openclaw") {
+        return {
+            agent,
+            status: "ready",
+        };
+    }
     const ready = Boolean(agentInstances.get(agent.walletAddress));
     return {
         agent,

@@ -389,16 +389,16 @@ export async function executeAgent(
     }
 
     const input = { messages: [humanMessage] };
-    
+
     // Dynamic recursion limit from environment (default: 100, max: 500)
     // Allows agents freedom to operate without arbitrary constraints
     const maxRecursionLimit = Math.min(
       parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10),
       500 // Hard ceiling for safety
     );
-    
+
     const config = {
-      configurable: { 
+      configurable: {
         thread_id: threadId,
         recursionDepth: 0, // Track depth for smart stop logic
         maxRecursionDepth: maxRecursionLimit,
@@ -551,15 +551,15 @@ export async function* streamAgent(
   }
 
   const input = { messages: [humanMessage] };
-  
+
   // Dynamic recursion limit from environment (default: 100, max: 500)
   const maxRecursionLimit = Math.min(
     parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10),
     500
   );
-  
+
   const config = {
-    configurable: { 
+    configurable: {
       thread_id: tId,
       recursionDepth: 0,
       maxRecursionDepth: maxRecursionLimit,

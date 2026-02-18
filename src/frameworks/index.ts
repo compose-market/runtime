@@ -4,14 +4,16 @@
  * Exports all framework runtimes:
  * - ElizaOS: Agent framework with plugins
  * - LangChain: LLM application framework with LangGraph
+ * - OpenClaw: Skills-based agent with infinite memory + Backpack
  * - Runtime: Unified agent/manowar registry (consolidated from agent-registry + manowar-registry)
  */
 
 export * as eliza from "./eliza.js";
 export * as langchain from "./langchain.js";
+export * as openclaw from "./openclaw.js";
 export * as runtime from "./runtime.js";
 
-export type FrameworkType = "eliza" | "langchain";
+export type FrameworkType = "eliza" | "langchain" | "openclaw";
 
 export interface FrameworkInfo {
   id: FrameworkType;
@@ -34,6 +36,13 @@ export const FRAMEWORKS: FrameworkInfo[] = [
     name: "LangChain",
     description: "LLM application framework with LangGraph for building stateful agents",
     features: ["LangGraph agents", "Built-in memory", "RAG support", "Tool calling"],
+    status: "active",
+  },
+  {
+    id: "openclaw",
+    name: "OpenClaw",
+    description: "Skills-based agent with infinite memory, web access, and Backpack connectors",
+    features: ["Infinite memory", "800+ connectors access", "Web access", "Self-learning"],
     status: "active",
   },
 ];
