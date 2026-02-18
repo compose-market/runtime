@@ -221,7 +221,7 @@ interface McpServerSession {
   lastUsedAt: Date;
 }
 
-interface ServerSpawnConfig {
+export interface ServerSpawnConfig {
   transport: "stdio" | "http" | "docker" | "npx";
   command?: string;
   args?: string[];
@@ -352,6 +352,7 @@ export class McpRuntime {
       }
       transport = new NpxClientTransport({
         package: config.package,
+        args: config.args,
         env: config.env,
       });
       transportType = "npx";
@@ -898,7 +899,7 @@ export async function executeServerTool(
  * Connector enforces strict resolution on spawn path (no partial execution matches).
  */
 async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig | null> {
-  const CONNECTOR_URL = process.env.CONNECTOR_URL || "http://localhost:4001";
+  const CONNECTOR_URL = process.env.CONNECTOR_URL || "https://services.compose.market/connector";
   const url = `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(serverId)}/spawn`;
 
   try {

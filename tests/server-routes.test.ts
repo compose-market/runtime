@@ -38,16 +38,25 @@ const mcpMock = vi.hoisted(() => {
   }
 
   const initialize = vi.fn(async () => undefined);
+  const spawnServer = vi.fn();
+  const getSessionTools = vi.fn();
+  const terminateSession = vi.fn(async () => undefined);
   const getServerTools = vi.fn();
   const executeServerTool = vi.fn();
   class MockMcpRuntime {
     initialize = initialize;
+    spawnServer = spawnServer;
+    getSessionTools = getSessionTools;
+    terminateSession = terminateSession;
   }
 
   return {
     McpRuntimeError: MockMcpRuntimeError,
     McpRuntime: MockMcpRuntime,
     initialize,
+    spawnServer,
+    getSessionTools,
+    terminateSession,
     getServerTools,
     executeServerTool,
   };
@@ -89,6 +98,13 @@ describe("runtime server routes", () => {
       toolCount: 2,
       tools: [],
     });
+
+    mcpMock.spawnServer.mockResolvedValue("inspect-session-1");
+    mcpMock.getSessionTools.mockReturnValue([
+      { name: "tool_a", description: "Tool A does a thing." },
+      { name: "tool_b" },
+    ]);
+    mcpMock.terminateSession.mockResolvedValue(undefined);
 
     mcpMock.executeServerTool.mockResolvedValue({ result: { ok: true } });
     goatMock.executeGoatTool.mockResolvedValue({
@@ -214,5 +230,74 @@ describe("runtime server routes", () => {
         retryable: false,
       },
     });
+  });
+
+  it("returns 404 for /mcp/inspect when disabled", async () => {
+    delete process.env.MCP_INSPECT_ENABLED;
+    const response = await request(app)
+      .post("/mcp/inspect")
+      .send({ serverId: "mcp:test", candidates: [] });
+    expect(response.status).toBe(404);
+  });
+
+  it("rejects /mcp/inspect without internal secret", async () => {
+    process.env.MCP_INSPECT_ENABLED = "true";
+    process.env.MANOWAR_INTERNAL_SECRET = "secret";
+
+    const response = await request(app)
+      .post("/mcp/inspect")
+      .send({
+        serverId: "mcp:test",
+        candidates: [{ transport: "npx", package: "example" }],
+      });
+
+    expect(response.status).toBe(403);
+  });
+
+  it("returns ok=true for /mcp/inspect on first successful candidate and terminates the session", async () => {
+    process.env.MCP_INSPECT_ENABLED = "true";
+    process.env.MANOWAR_INTERNAL_SECRET = "secret";
+
+    mcpMock.spawnServer.mockResolvedValueOnce("inspect-session-123");
+
+    const response = await request(app)
+      .post("/mcp/inspect")
+      .set("x-manowar-internal", "secret")
+      .send({
+        serverId: "mcp:test",
+        candidates: [
+          { transport: "npx", package: "valid-package" },
+        ],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.ok).toBe(true);
+    expect(response.body.serverId).toBe("mcp:test");
+    expect(response.body.transportUsed).toBe("npx");
+    expect(mcpMock.terminateSession).toHaveBeenCalledWith("inspect-session-123");
+  });
+
+  it("returns ok=false for /mcp/inspect when all candidates fail", async () => {
+    process.env.MCP_INSPECT_ENABLED = "true";
+    process.env.MANOWAR_INTERNAL_SECRET = "secret";
+
+    mcpMock.spawnServer.mockRejectedValueOnce(
+      new mcpMock.McpRuntimeError("MCP_SPAWN_FAILED", "spawn failed", true, 503),
+    );
+
+    const response = await request(app)
+      .post("/mcp/inspect")
+      .set("x-manowar-internal", "secret")
+      .send({
+        serverId: "mcp:test",
+        candidates: [
+          { transport: "npx", package: "valid-package" },
+        ],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.ok).toBe(false);
+    expect(Array.isArray(response.body.errors)).toBe(true);
+    expect(response.body.errors[0].code).toBe("MCP_SPAWN_FAILED");
   });
 });

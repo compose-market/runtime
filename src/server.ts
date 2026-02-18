@@ -11,6 +11,7 @@ import cors, { type CorsOptions } from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { z } from "zod";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 import {
   getRuntimeStatus,
@@ -29,6 +30,7 @@ import {
   executeServerTool,
   getServerTools,
 } from "./runtimes/mcp.js";
+import type { ServerSpawnConfig } from "./runtimes/mcp.js";
 
 const app = express();
 
@@ -104,6 +106,124 @@ function sendRuntimeError(res: Response, error: unknown, fallback: string): void
       retryable: false,
     },
   });
+}
+
+// ============================================================================
+// MCP Inspect (Ephemeral Spawn + Tool Introspection)
+// ============================================================================
+
+function isInspectEnabled(): boolean {
+  return String(process.env.MCP_INSPECT_ENABLED || "").toLowerCase() === "true";
+}
+
+function isPlaceholderUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  return (
+    lower.includes("your-") ||
+    lower.includes("your_") ||
+    lower.includes("localhost") ||
+    lower.includes("127.0.0.1") ||
+    lower.includes("0.0.0.0") ||
+    lower.includes("example.com") ||
+    lower.includes("placeholder") ||
+    lower.includes("your-deployment") ||
+    lower.includes("your-server") ||
+    lower.includes("your-mcp")
+  );
+}
+
+function isSafeAbsoluteHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    if (!parsed.hostname) return false;
+    if (isPlaceholderUrl(url)) return false;
+    // Defensive: avoid connecting to local/private hosts.
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeNpmPackageName(pkg: string): boolean {
+  // Accept: name, name@version, @scope/name, @scope/name@version
+  // Reject whitespace and shell metacharacters.
+  if (!pkg || pkg.length > 214) return false;
+  if (/\s/.test(pkg)) return false;
+  if (/[;&|`$<>]/.test(pkg)) return false;
+
+  const scoped = pkg.startsWith("@");
+  if (scoped) {
+    const slash = pkg.indexOf("/");
+    if (slash <= 1) return false;
+    const scope = pkg.slice(1, slash);
+    const rest = pkg.slice(slash + 1);
+    if (!/^[a-zA-Z0-9._-]+$/.test(scope)) return false;
+    const [name, version] = rest.split("@", 2);
+    if (!name || !/^[a-zA-Z0-9._-]+$/.test(name)) return false;
+    if (version && !/^[a-zA-Z0-9._+-]+$/.test(version)) return false;
+    return true;
+  }
+
+  const [name, version] = pkg.split("@", 2);
+  if (!name || !/^[a-zA-Z0-9._-]+$/.test(name)) return false;
+  if (version && !/^[a-zA-Z0-9._+-]+$/.test(version)) return false;
+  return true;
+}
+
+const InspectCandidateSchema = z.object({
+  transport: z.enum(["stdio", "http", "docker", "npx"]),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  image: z.string().optional(),
+  remoteUrl: z.string().optional(),
+  protocol: z.enum(["sse", "streamable-http"]).optional(),
+  package: z.string().optional(),
+}).strict();
+
+const InspectRequestSchema = z.object({
+  serverId: z.string().min(1),
+  candidates: z.array(InspectCandidateSchema).min(1).max(6),
+}).strict();
+
+function validateInspectCandidate(candidate: z.infer<typeof InspectCandidateSchema>): { ok: true; value: ServerSpawnConfig } | { ok: false; error: string } {
+  if (candidate.transport === "http") {
+    if (!candidate.remoteUrl) return { ok: false, error: "remoteUrl is required for http transport" };
+    if (!isSafeAbsoluteHttpUrl(candidate.remoteUrl)) return { ok: false, error: `unsafe remoteUrl: ${candidate.remoteUrl}` };
+    return { ok: true, value: { transport: "http", remoteUrl: candidate.remoteUrl, protocol: candidate.protocol } };
+  }
+
+  if (candidate.transport === "docker") {
+    if (!candidate.image) return { ok: false, error: "image is required for docker transport" };
+    if (/\s/.test(candidate.image) || /[;&|`$<>]/.test(candidate.image)) {
+      return { ok: false, error: `unsafe image: ${candidate.image}` };
+    }
+    return { ok: true, value: { transport: "docker", image: candidate.image } };
+  }
+
+  if (candidate.transport === "npx") {
+    if (!candidate.package) return { ok: false, error: "package is required for npx transport" };
+    if (!isSafeNpmPackageName(candidate.package)) return { ok: false, error: `unsafe npm package: ${candidate.package}` };
+    return { ok: true, value: { transport: "npx", package: candidate.package, args: candidate.args, env: candidate.env } };
+  }
+
+  // stdio transport
+  if (!candidate.command) return { ok: false, error: "command is required for stdio transport" };
+  const allowed = new Set(["uvx", "docker"]);
+  if (!allowed.has(candidate.command)) {
+    return { ok: false, error: `stdio command not allowed: ${candidate.command}` };
+  }
+
+  const args = candidate.args || [];
+  // Basic args safety: no shell metacharacters.
+  if (args.some((a) => /[;&|`$<>]/.test(a))) {
+    return { ok: false, error: "stdio args contain unsafe characters" };
+  }
+
+  return { ok: true, value: { transport: "stdio", command: candidate.command, args, env: candidate.env } };
 }
 
 // ============================================================================
@@ -306,6 +426,112 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
 
 const mcpRuntime = new McpRuntime();
 mcpRuntime.initialize().catch(console.error);
+
+const inspectRuntime = new McpRuntime({ maxSessions: 5, sessionTimeoutMs: 60 * 1000 });
+inspectRuntime.initialize().catch(console.error);
+
+/**
+ * POST /mcp/inspect
+ * Internal-only: Spawn a server with candidate configs, list tools, then immediately terminate the session.
+ */
+app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
+  if (!isInspectEnabled()) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+
+  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
+  const expectedSecret = process.env.MANOWAR_INTERNAL_SECRET;
+  if (!internalSecret || !expectedSecret || internalSecret !== expectedSecret) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  const parsed = InspectRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: "Invalid request body",
+      details: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+    });
+    return;
+  }
+
+  const { serverId, candidates } = parsed.data;
+
+  const validCandidates: ServerSpawnConfig[] = [];
+  const errors: Array<{ transport: string; code: string; message: string; retryable: boolean; statusCode?: number }> = [];
+
+  for (const candidate of candidates) {
+    const validated = validateInspectCandidate(candidate);
+    if (!validated.ok) {
+      errors.push({
+        transport: candidate.transport,
+        code: "INVALID_CANDIDATE",
+        message: validated.error,
+        retryable: false,
+        statusCode: 400,
+      });
+      continue;
+    }
+    validCandidates.push(validated.value);
+  }
+
+  if (validCandidates.length === 0) {
+    res.status(200).json({ ok: false, serverId, errors });
+    return;
+  }
+
+  for (const candidate of validCandidates) {
+    let sessionId: string | null = null;
+    try {
+      sessionId = await inspectRuntime.spawnServer(serverId, candidate);
+      const tools = inspectRuntime.getSessionTools(sessionId);
+
+      // Return a capped, minimal tool payload (name + description only).
+      const MAX_TOOLS = 500;
+      const trimmedTools = tools.slice(0, MAX_TOOLS).map((t: any) => ({
+        name: String(t?.name || ""),
+        description: typeof t?.description === "string" ? t.description : undefined,
+      })).filter((t: any) => t.name.length > 0);
+
+      res.status(200).json({
+        ok: true,
+        serverId,
+        transportUsed: candidate.transport,
+        toolCount: trimmedTools.length,
+        tools: trimmedTools,
+      });
+      return;
+    } catch (error) {
+      if (error instanceof McpRuntimeError) {
+        errors.push({
+          transport: candidate.transport,
+          code: error.code,
+          message: error.message,
+          retryable: error.retryable,
+          statusCode: error.statusCode,
+        });
+      } else {
+        errors.push({
+          transport: candidate.transport,
+          code: "UNKNOWN",
+          message: error instanceof Error ? error.message : String(error),
+          retryable: false,
+        });
+      }
+    } finally {
+      if (sessionId) {
+        try {
+          await inspectRuntime.terminateSession(sessionId);
+        } catch {
+          // Ignore cleanup errors.
+        }
+      }
+    }
+  }
+
+  res.status(200).json({ ok: false, serverId, errors });
+}));
 
 
 /**
