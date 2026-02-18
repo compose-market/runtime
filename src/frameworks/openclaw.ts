@@ -123,7 +123,7 @@ export async function ensureOpenClawRuntime(params: Omit<OpenClawExecutionParams
     runtimeId?: string;
     containerName?: string;
 }> {
-    const userKey = params.userId;
+    const userKey = params.userId || "";
     const sessionKey = buildStableSessionKey(params.agentWallet, userKey);
 
     const response = await postInternal("/internal/openclaw/runtime/ensure", {
@@ -148,7 +148,7 @@ export async function ensureOpenClawRuntime(params: Omit<OpenClawExecutionParams
 }
 
 export async function executeOpenClawAgent(params: OpenClawExecutionParams): Promise<OpenClawExecutionResult> {
-    const userKey = params.userId;
+    const userKey = params.userId || "";
     const sessionKey = buildStableSessionKey(params.agentWallet, userKey);
 
     const response = await postInternal("/internal/openclaw/chat", {
@@ -197,7 +197,7 @@ export async function executeOpenClawAgent(params: OpenClawExecutionParams): Pro
 export async function* streamOpenClawAgent(
     params: OpenClawExecutionParams,
 ): AsyncGenerator<Record<string, unknown>, void, unknown> {
-    const userKey = params.userId;
+    const userKey = params.userId || "";
     const sessionKey = buildStableSessionKey(params.agentWallet, userKey);
 
     const response = await postInternal("/internal/openclaw/chat/stream", {
