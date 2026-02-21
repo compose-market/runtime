@@ -1,6 +1,6 @@
 import { ScheduleOverlapPolicy } from "@temporalio/client";
 import type { Client } from "@temporalio/client";
-import { getTemporalClient } from "./client.js";
+import { getTemporalClient } from "../client.js";
 import {
     MEMORY_ACTIVITY_TASK_QUEUE,
     MEMORY_DAILY_CONSOLIDATION_CRON,
@@ -8,12 +8,12 @@ import {
     MEMORY_HOURLY_DECAY_CRON,
     MEMORY_SCHEDULE_CATCHUP_WINDOW_MS,
     MEMORY_WORKFLOW_ID_PREFIX,
-} from "./constants.js";
+} from "../constants.js";
 import type {
     MemoryConsolidationInput,
     ArchiveCreationInput,
     DecayUpdateInput,
-} from "./types.js";
+} from "../types.js";
 
 export const MEMORY_SCHEDULE_OVERLAP_POLICY = ScheduleOverlapPolicy.SKIP;
 

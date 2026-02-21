@@ -14,7 +14,7 @@ import {
     QUERY_GET_MEMORY_WORKFLOW_STATE,
     SIGNAL_PAUSE_MEMORY_WORKFLOW,
     SIGNAL_RESUME_MEMORY_WORKFLOW,
-} from "./constants.js";
+} from "../constants.js";
 import type {
     MemoryConsolidationInput,
     PatternExtractionInput,
@@ -24,7 +24,7 @@ import type {
     MemoryCleanupInput,
     MemoryWorkflowResult,
     MemoryWorkflowState,
-} from "./types.js";
+} from "../types.js";
 
 const MAX_BATCH_SIZE = 50;
 const MAX_CONTINUOUS_ITERATIONS = 100;
@@ -34,7 +34,7 @@ const memoryWorkflowStateQuery = defineQuery<MemoryWorkflowState>(QUERY_GET_MEMO
 const pauseMemoryWorkflowSignal = defineSignal(SIGNAL_PAUSE_MEMORY_WORKFLOW);
 const resumeMemoryWorkflowSignal = defineSignal(SIGNAL_RESUME_MEMORY_WORKFLOW);
 
-const memoryActivities = proxyActivities<typeof import("./memory-activities.js")>({
+const memoryActivities = proxyActivities<typeof import("./activities.js")>({
     taskQueue: MEMORY_ACTIVITY_TASK_QUEUE,
     startToCloseTimeout: "30m",
     heartbeatTimeout: "60s",

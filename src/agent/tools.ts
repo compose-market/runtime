@@ -653,3 +653,115 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
 
     return [searchKnowledge, storeKnowledge];
 }
+
+export function createAdvancedMemoryTools(agentWallet: string, userId?: string): DynamicStructuredTool[] {
+    const searchAdvanced = new DynamicStructuredTool({
+        name: "search_memory_advanced",
+        description: "Advanced memory search with hybrid retrieval (vector + keyword), temporal decay scoring, and MMR diversity re-ranking. Use when you need more precise or diverse results.",
+        schema: z.object({
+            query: z.string().describe("Search query"),
+            temporal_decay: z.boolean().optional().describe("Apply temporal decay (prefer recent memories)"),
+            mmr: z.boolean().optional().describe("Apply MMR re-ranking for diverse results"),
+            limit: z.number().optional().describe("Max results (default 10)"),
+        }),
+        func: async ({ query, temporal_decay, mmr, limit }: { query: string; temporal_decay?: boolean; mmr?: boolean; limit?: number }) => {
+            const context = getAgentExecutionContext();
+
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/vector-search`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-tool-price": "750",
+                },
+                body: JSON.stringify({
+                    query,
+                    agentWallet,
+                    userId,
+                    threadId: context?.threadId,
+                    limit: limit || 10,
+                    options: {
+                        temporalDecay: temporal_decay ?? true,
+                        mmr: mmr ?? false,
+                        rerank: true,
+                    },
+                }),
+            });
+
+            if (!response.ok) return "Advanced memory search unavailable.";
+            const data = await response.json() as { results: Array<{ content: string; score: number; source: string }> };
+
+            if (!data.results?.length) return "No relevant memories found.";
+
+            return data.results
+                .map((r, i) => `[${r.source}] (score: ${r.score.toFixed(3)}) ${r.content}`)
+                .join("\n\n");
+        },
+    });
+
+    const indexConversation = new DynamicStructuredTool({
+        name: "index_conversation",
+        description: "Index the current conversation transcript into vector memory for future retrieval. Call at natural breakpoints (topic changes, task completion).",
+        schema: z.object({
+            summary: z.string().optional().describe("Optional summary of the conversation so far"),
+        }),
+        func: async ({ summary }: { summary?: string }) => {
+            const context = getAgentExecutionContext();
+
+            if (!context?.threadId) {
+                return "Cannot index: no active conversation thread.";
+            }
+
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/index-session`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-tool-price": "2000",
+                },
+                body: JSON.stringify({
+                    agentWallet,
+                    userId,
+                    threadId: context.threadId,
+                    summary,
+                    composeRunId: context.composeRunId,
+                }),
+            });
+
+            if (!response.ok) return "Failed to index conversation.";
+
+            const data = await response.json() as { indexed: boolean; vectorCount: number };
+            return data.indexed
+                ? `Indexed conversation: ${data.vectorCount} memory vectors created.`
+                : "Conversation not yet ready for indexing (too short).";
+        },
+    });
+
+    const getMemoryStats = new DynamicStructuredTool({
+        name: "memory_stats",
+        description: "Get statistics about your memory: total memories, by source type, oldest/newest entries. Use to understand your knowledge base.",
+        schema: z.object({}),
+        func: async () => {
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/stats`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ agentWallet, userId }),
+            });
+
+            if (!response.ok) return "Memory stats unavailable.";
+
+            const data = await response.json() as {
+                totalVectors: number;
+                bySource: Record<string, number>;
+                oldestEntry?: number;
+                newestEntry?: number;
+            };
+
+            const sourceBreakdown = Object.entries(data.bySource)
+                .map(([source, count]) => `${source}: ${count}`)
+                .join(", ");
+
+            return `Memory Stats: ${data.totalVectors} total memories (${sourceBreakdown})`;
+        },
+    });
+
+    return [searchAdvanced, indexConversation, getMemoryStats];
+}

@@ -14,14 +14,13 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import fs from "fs";
-import path from "path";
 
 // New Modules
 import { createAgentGraph } from "../agent/graph.js";
 import { createAgentTools, createMem0Tools } from "../agent/tools.js";
 import { Mem0CallbackHandler } from "../agent/callbacks.js";
 import { runWithAgentExecutionContext } from "../agent/context.js";
+import { getRedisCheckpointSaver } from "../agent/checkpoint.js";
 
 // =============================================================================
 // Helpers
@@ -274,11 +273,11 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   // 2. Prepare Model - use model from on-chain metadata via Lambda gateway
   const model = createModel(config.model, config.temperature ?? 0.7);
 
-  // 3. Prepare Checkpoint Directory
-  const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
+  // 3. Get Redis Checkpoint Saver
+  const checkpointer = await getRedisCheckpointSaver();
 
   // 4. Compile Graph
-  const app = createAgentGraph(model, tools, checkpointDir, config.systemPrompt);
+  const app = createAgentGraph(model, tools, checkpointer, config.systemPrompt);
 
   const instance: AgentInstance = {
     id,

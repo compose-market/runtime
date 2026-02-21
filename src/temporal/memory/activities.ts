@@ -3,7 +3,7 @@ import {
     DEFAULT_MEMORY_HALF_LIFE_DAYS,
     DEFAULT_MEMORY_BATCH_SIZE,
     DEFAULT_PATTERN_CONFIDENCE_THRESHOLD,
-} from "./constants.js";
+} from "../constants.js";
 import type {
     MemoryActivityOptions,
     ConsolidationActivityResult,
@@ -14,7 +14,7 @@ import type {
     SkillPromotionResult,
     MemoryCleanupActivityResult,
     SyncToPinataResult,
-} from "./types.js";
+} from "../types.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "";
