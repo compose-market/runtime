@@ -50,7 +50,7 @@ function isMcpRuntimeError(error: unknown): error is McpRuntimeError {
 }
 
 // Spawn timeout to prevent hanging on failed MCP servers
-const SPAWN_TIMEOUT_MS = 20000;  // 20s - NPX packages need time to download on cold start
+const SPAWN_TIMEOUT_MS = 60000;  // 60s - NPX packages need time to download and install
 
 // Disk health thresholds
 const MIN_DISK_MB = 500;         // Refuse spawns below 500MB free
@@ -261,8 +261,8 @@ export class McpRuntime {
   constructor(config: McpRuntimeConfig = {}) {
     this.config = {
       logLevel: 'INFO',
-      maxSessions: 100,
-      sessionTimeoutMs: 30 * 60 * 1000, // 30 mins
+      maxSessions: 500,  // Increased from 100 to handle more concurrent spawns
+      sessionTimeoutMs: 5 * 60 * 1000, // 5 mins (reduced from 30 for faster cleanup)
       ...config
     };
   }
@@ -675,10 +675,11 @@ export class McpRuntime {
 // Session cache to avoid re-spawning servers
 const serverSessions = new Map<string, { sessionId: string; runtime: McpRuntime; createdAt: Date }>();
 const spawnLocks = new Map<string, Promise<string>>();
-const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+const SESSION_TTL = 5 * 60 * 1000; // 5 minutes (reduced for faster cleanup)
 
 // Singleton runtime for on-demand spawning
 let sharedRuntime: McpRuntime | null = null;
+let sessionCleanupInterval: NodeJS.Timeout | null = null;
 
 /**
  * Get or create the shared MCP runtime instance
@@ -687,6 +688,25 @@ async function getSharedRuntime(): Promise<McpRuntime> {
   if (!sharedRuntime) {
     sharedRuntime = new McpRuntime();
     await sharedRuntime.initialize();
+    
+    // Start periodic cleanup of serverSessions cache
+    if (!sessionCleanupInterval) {
+      sessionCleanupInterval = setInterval(async () => {
+        const now = Date.now();
+        for (const [serverId, cached] of serverSessions) {
+          const age = now - cached.createdAt.getTime();
+          if (age > SESSION_TTL) {
+            console.log(`[mcp] Cleaning up expired session for ${serverId}`);
+            serverSessions.delete(serverId);
+            try {
+              await cached.runtime.terminateSession(cached.sessionId);
+            } catch {
+              // Ignore cleanup errors
+            }
+          }
+        }
+      }, 60 * 1000); // Check every minute
+    }
   }
   return sharedRuntime;
 }
