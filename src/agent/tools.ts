@@ -13,6 +13,7 @@ import { getAgentExecutionContext } from "./context.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 const RUNTIME_SERVICE_URL = process.env.RUNTIME_SERVICE_URL || "https://runtime.compose.market";
+const CONNECTOR_URL = process.env.CONNECTOR_URL || "https://services.compose.market/connector";
 
 interface ToolExecutionContext {
     getComposeRunId?: () => string | undefined;
@@ -584,23 +585,22 @@ async function searchMemory(params: {
 }
 
 export function createMem0Tools(agentId: string, userId?: string, manowarWallet?: string): DynamicStructuredTool[] {
-    // Search Knowledge with Graph Memory
+    const context = getAgentExecutionContext();
+
     const searchKnowledge = new DynamicStructuredTool({
         name: "search_memory",
         description: "Search your long-term memory/knowledge base for past interactions or learned facts. Uses graph memory for better relation-based retrieval.",
         schema: z.object({ query: z.string().describe("Search query") }),
         func: async ({ query }: { query: string }) => {
-            const context = getAgentExecutionContext();
             const filters: Record<string, unknown> = {};
             if (manowarWallet) filters.manowar_wallet = manowarWallet;
             if (context?.composeRunId) filters.compose_run_id = context.composeRunId;
 
-            // Use graph-enabled search with reranking
             const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    "x-tool-price": "500", // $0.0005 per memory search
+                    "x-tool-price": "500",
                 },
                 body: JSON.stringify({
                     query,
@@ -608,8 +608,8 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
                     user_id: userId,
                     run_id: context?.threadId,
                     limit: 8,
-                    enable_graph: true, // Enable graph memory for relations
-                    rerank: true, // Enable reranking for relevance
+                    enable_graph: true,
+                    rerank: true,
                     filters
                 }),
             });
@@ -620,25 +620,23 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
         },
     });
 
-    // Store Knowledge with Graph Extraction
     const storeKnowledge = new DynamicStructuredTool({
         name: "save_memory",
         description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
         schema: z.object({ content: z.string().describe("Fact to remember") }),
         func: async ({ content }: { content: string }) => {
-            const context = getAgentExecutionContext();
             const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    "x-tool-price": "1000", // $0.001 per memory save (includes graph extraction)
+                    "x-tool-price": "1000",
                 },
                 body: JSON.stringify({
                     messages: [{ role: "user", content }],
                     agent_id: agentId,
                     user_id: userId,
                     run_id: context?.threadId,
-                    enable_graph: true, // Enable graph extraction
+                    enable_graph: true,
                     metadata: {
                         type: "explicit_save",
                         manowar_wallet: manowarWallet,
@@ -651,23 +649,15 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
         },
     });
 
-    return [searchKnowledge, storeKnowledge];
-}
-
-export function createAdvancedMemoryTools(agentWallet: string, userId?: string): DynamicStructuredTool[] {
-    const searchAdvanced = new DynamicStructuredTool({
-        name: "search_memory_advanced",
-        description: "Advanced memory search with hybrid retrieval (vector + keyword), temporal decay scoring, and MMR diversity re-ranking. Use when you need more precise or diverse results.",
+    const hybridSearch = new DynamicStructuredTool({
+        name: "search_all_memory",
+        description: "Hybrid search across all memory layers including working, scene, graph, patterns, and archives.",
         schema: z.object({
             query: z.string().describe("Search query"),
-            temporal_decay: z.boolean().optional().describe("Apply temporal decay (prefer recent memories)"),
-            mmr: z.boolean().optional().describe("Apply MMR re-ranking for diverse results"),
-            limit: z.number().optional().describe("Max results (default 10)"),
+            layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives"])).optional(),
         }),
-        func: async ({ query, temporal_decay, mmr, limit }: { query: string; temporal_decay?: boolean; mmr?: boolean; limit?: number }) => {
-            const context = getAgentExecutionContext();
-
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/vector-search`, {
+        func: async ({ query, layers }: { query: string; layers?: string[] }) => {
+            const response = await fetch(`${LAMBDA_API_URL}/api/memory/layers/search`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -675,93 +665,30 @@ export function createAdvancedMemoryTools(agentWallet: string, userId?: string):
                 },
                 body: JSON.stringify({
                     query,
-                    agentWallet,
-                    userId,
-                    threadId: context?.threadId,
-                    limit: limit || 10,
-                    options: {
-                        temporalDecay: temporal_decay ?? true,
-                        mmr: mmr ?? false,
-                        rerank: true,
-                    },
+                    agent_id: agentId,
+                    user_id: userId,
+                    manowar_wallet: manowarWallet,
+                    layers: layers || ["working", "scene", "graph", "patterns", "archives"],
+                    limit: 5,
+                    compose_run_id: context?.composeRunId,
+                    thread_id: context?.threadId,
                 }),
             });
-
-            if (!response.ok) return "Advanced memory search unavailable.";
-            const data = await response.json() as { results: Array<{ content: string; score: number; source: string }> };
-
-            if (!data.results?.length) return "No relevant memories found.";
-
-            return data.results
-                .map((r, i) => `[${r.source}] (score: ${r.score.toFixed(3)}) ${r.content}`)
-                .join("\n\n");
+            if (!response.ok) return "Memory search unavailable.";
+            const data = await response.json();
+            return JSON.stringify(data);
         },
     });
 
-    const indexConversation = new DynamicStructuredTool({
-        name: "index_conversation",
-        description: "Index the current conversation transcript into vector memory for future retrieval. Call at natural breakpoints (topic changes, task completion).",
-        schema: z.object({
-            summary: z.string().optional().describe("Optional summary of the conversation so far"),
-        }),
-        func: async ({ summary }: { summary?: string }) => {
-            const context = getAgentExecutionContext();
+    return [searchKnowledge, storeKnowledge, hybridSearch];
+}
 
-            if (!context?.threadId) {
-                return "Cannot index: no active conversation thread.";
-            }
+export interface EnhancedMemoryToolsConfig {
+    agentId: string;
+    userId?: string;
+    manowarWallet?: string;
+}
 
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/index-session`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-tool-price": "2000",
-                },
-                body: JSON.stringify({
-                    agentWallet,
-                    userId,
-                    threadId: context.threadId,
-                    summary,
-                    composeRunId: context.composeRunId,
-                }),
-            });
-
-            if (!response.ok) return "Failed to index conversation.";
-
-            const data = await response.json() as { indexed: boolean; vectorCount: number };
-            return data.indexed
-                ? `Indexed conversation: ${data.vectorCount} memory vectors created.`
-                : "Conversation not yet ready for indexing (too short).";
-        },
-    });
-
-    const getMemoryStats = new DynamicStructuredTool({
-        name: "memory_stats",
-        description: "Get statistics about your memory: total memories, by source type, oldest/newest entries. Use to understand your knowledge base.",
-        schema: z.object({}),
-        func: async () => {
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/stats`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ agentWallet, userId }),
-            });
-
-            if (!response.ok) return "Memory stats unavailable.";
-
-            const data = await response.json() as {
-                totalVectors: number;
-                bySource: Record<string, number>;
-                oldestEntry?: number;
-                newestEntry?: number;
-            };
-
-            const sourceBreakdown = Object.entries(data.bySource)
-                .map(([source, count]) => `${source}: ${count}`)
-                .join(", ");
-
-            return `Memory Stats: ${data.totalVectors} total memories (${sourceBreakdown})`;
-        },
-    });
-
-    return [searchAdvanced, indexConversation, getMemoryStats];
+export function createEnhancedMemoryTools(config: EnhancedMemoryToolsConfig): DynamicStructuredTool[] {
+    return createMem0Tools(config.agentId, config.userId, config.manowarWallet);
 }

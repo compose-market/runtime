@@ -9,13 +9,13 @@ import { StateGraph, MessagesAnnotation, START, END } from "@langchain/langgraph
 import { type BaseMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { FileSystemCheckpointSaver } from "./checkpoint.js";
 import type { RunnableConfig } from "@langchain/core/runnables";
-import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 
-export async function createAgentGraph(
+export function createAgentGraph(
     model: any,
     tools: DynamicStructuredTool[],
-    checkpointer: BaseCheckpointSaver,
+    checkpointDir: string,
     systemPrompt?: string
 ) {
     // DEBUG: Log tools before binding
@@ -114,6 +114,9 @@ export async function createAgentGraph(
         .addEdge(START, "agent")
         .addConditionalEdges("agent", shouldContinue)
         .addEdge("tools", "agent");
+
+    // Initialize Checkpointer
+    const checkpointer = new FileSystemCheckpointSaver(checkpointDir);
 
     // Compile
     return workflow.compile({
