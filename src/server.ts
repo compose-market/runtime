@@ -42,6 +42,7 @@ import {
     markManowarExecuted,
     resolveAgent,
 } from "./frameworks/runtime.js";
+import { resolveManowarIdentifier } from "./onchain.js";
 import type { WorkflowStep, TriggerDefinition } from "./manowar/types.js";
 
 const app = express();
@@ -56,6 +57,7 @@ const ALLOW_DIRECT_EXECUTION_FALLBACK = process.env.TEMPORAL_ALLOW_DIRECT_FALLBA
 
 function buildWorkflowFromManowar(manowar: {
     walletAddress: string;
+    chainId: number;
     title?: string;
     description?: string;
     agentWalletAddresses?: string[];
@@ -68,9 +70,12 @@ function buildWorkflowFromManowar(manowar: {
             name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
             type: "agent",
             agentAddress: agentWallet,
+            // Pass the chainId to ensure tools use the correct chain
+            chainId: manowar.chainId,
             inputTemplate: {
                 agentAddress: agentWallet,
                 agentCardUri: agent?.agentCardUri,
+                chainId: manowar.chainId,
             },
             saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
         });
@@ -81,6 +86,7 @@ function buildWorkflowFromManowar(manowar: {
         name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
         description: manowar.description || "",
         steps,
+        chainId: manowar.chainId,
     };
 }
 
@@ -251,6 +257,7 @@ app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) =>
         name: manowar.title || `Manowar ${manowar.walletAddress.slice(0, 8)}`,
         description: manowar.description || "",
         steps,
+        chainId: manowar.chainId,
     };
 
     // Prepare payment context
@@ -329,9 +336,12 @@ app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) =
         return;
     }
 
+    // Register directly from frontend data (matches agent pattern)
+    const chainIdNum = parseInt(String(req.body.chainId || req.headers["x-chain-id"]));
+
     try {
-        // Register directly from frontend data (matches agent pattern)
         const registrationResult = await registerManowar({
+            chainId: chainIdNum,
             walletAddress,
             onchainTokenId: manowarId,
             manowarCardUri,  // contains all metadata
@@ -495,7 +505,32 @@ const manowarChatHandler = asyncHandler(async (req: Request, res: Response) => {
     });
 
     // Resolve manowar from in-memory registry - wallet address only
-    const manowar = getManowar(identifier);
+    let manowar = getManowar(identifier);
+    if (!manowar) {
+        const chainId = paymentInfo.chainId!;
+        console.log(`[manowar] Manowar "${identifier}" not found in local registry, attempting on-chain resolution on chain ${chainId}...`);
+
+        // On-chain fallback using resolveManowarIdentifier
+        const onchainResult = await resolveManowarIdentifier(chainId, identifier);
+        if (onchainResult) {
+            console.log(`[manowar] Auto-registering Manowar ${identifier} from chain ${chainId}...`);
+            manowar = await registerManowar({
+                chainId: chainId,
+                walletAddress: onchainResult.data.walletAddress,
+                onchainTokenId: onchainResult.manowarId,
+                manowarCardUri: onchainResult.data.manowarCardUri,
+                dnaHash: onchainResult.data.dnaHash,
+                title: onchainResult.data.title,
+                description: onchainResult.data.description,
+                banner: onchainResult.data.banner,
+                creator: (req.headers["x-session-user-address"] as string) || "0x0000000000000000000000000000000000000000",
+                hasCoordinator: onchainResult.data.hasCoordinator,
+                coordinatorModel: onchainResult.data.coordinatorModel,
+                agentWalletAddresses: onchainResult.data.agentWalletAddresses,
+            });
+        }
+    }
+
     if (!manowar) {
         res.status(404).json({ error: `Manowar "${identifier}" not found` });
         return;

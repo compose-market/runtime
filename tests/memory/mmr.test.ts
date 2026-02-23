@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { mmrRerank } from "../../memory/mmr.js";
-import type { SearchResult, MMRConfig } from "../../memory/types.js";
+import { mmrRerank } from "../../src/agent/memory/mmr.js";
+import type { SearchResult, MMRConfig } from "../../src/agent/memory/types.js";
 
 describe("MMR Re-ranking - Unit Tests", () => {
     const createResult = (id: string, content: string, score: number): SearchResult => ({
@@ -305,7 +305,7 @@ describe("MMR Re-ranking - Unit Tests", () => {
 
             expect(reranked[0].id).toBe("doc1");
             expect(reranked).toHaveLength(5);
-            
+
             const top3Ids = reranked.slice(0, 3).map(r => r.id);
             const uniqueTopics = new Set(top3Ids);
             expect(uniqueTopics.size).toBeGreaterThan(1);
@@ -323,7 +323,7 @@ describe("MMR Re-ranking - Unit Tests", () => {
 
             expect(reranked[0].score).toBeGreaterThanOrEqual(reranked[1].score);
             expect(reranked).toHaveLength(4);
-            
+
             const top4 = reranked.slice(0, 4);
             const hasEmailQuestion = top4.some(r => r.id === "faq4");
             expect(hasEmailQuestion).toBe(true);

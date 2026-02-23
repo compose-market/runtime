@@ -23,7 +23,7 @@ const MAX_TOTAL_PAYLOAD_SIZE_BYTES = 4 * 1024 * 1024; // 4MB limit for total gRP
 function validatePayloadSize(payload: unknown, context: string): void {
     const serialized = JSON.stringify(payload);
     const sizeBytes = Buffer.byteLength(serialized, "utf8");
-    
+
     if (sizeBytes > MAX_PAYLOAD_SIZE_BYTES) {
         const error = new Error(
             `${context} payload exceeds 2MB limit (${(sizeBytes / 1024 / 1024).toFixed(2)}MB). ` +
@@ -39,7 +39,7 @@ function validateTotalPayloadSize(inputs: unknown[]): void {
     for (const input of inputs) {
         totalSize += Buffer.byteLength(JSON.stringify(input), "utf8");
     }
-    
+
     if (totalSize > MAX_TOTAL_PAYLOAD_SIZE_BYTES) {
         const error = new Error(
             `Total payload size exceeds 4MB limit (${(totalSize / 1024 / 1024).toFixed(2)}MB). ` +
@@ -76,9 +76,11 @@ function resolveWorkflow(input: ExecuteManowarWorkflowInput): NonNullable<Execut
             name: agent?.name || `Agent ${agentWallet.slice(0, 8)}`,
             type: "agent",
             agentAddress: agentWallet,
+            chainId: manowar.chainId,
             inputTemplate: {
                 agentAddress: agentWallet,
                 agentCardUri: agent?.agentCardUri,
+                chainId: manowar.chainId,
             },
             saveAs: `agent_${agentWallet.slice(0, 8)}_output`,
         });
@@ -89,6 +91,7 @@ function resolveWorkflow(input: ExecuteManowarWorkflowInput): NonNullable<Execut
         name: manowar.title || `Manowar ${walletAddress.slice(0, 8)}`,
         description: manowar.description || "",
         steps,
+        chainId: manowar.chainId,
     };
 }
 
@@ -229,7 +232,7 @@ export async function runManowarExecutionActivity(
     validatePayloadSize(input, "Manowar execution input");
     validatePayloadSize(input.userRequest, "User request");
     validatePayloadSize(input.options, "Execution options");
-    
+
     if (!input.composeRunId) {
         const error = new Error("composeRunId is required");
         error.name = "ValidationError";
@@ -341,7 +344,7 @@ export async function runAgentExecutionActivity(input: ExecuteAgentWorkflowInput
     // Validate payload sizes per Temporal Cloud best practices
     validatePayloadSize(input, "Agent execution input");
     validatePayloadSize(input.message, "Agent message");
-    
+
     const heartbeatInterval = startPeriodicHeartbeat({
         composeRunId: input.composeRunId,
         agentWallet: input.agentWallet,
@@ -412,7 +415,7 @@ export async function executeMcpToolActivity(
     input: ExecuteMcpToolActivityInput,
 ): Promise<ToolExecutionResult> {
     const startTime = Date.now();
-    
+
     const heartbeatInterval = startPeriodicHeartbeat({
         activity: "executeMcpToolActivity",
         serverId: input.serverId,
@@ -489,7 +492,7 @@ export async function executeGoatToolActivity(
     input: ExecuteGoatToolActivityInput,
 ): Promise<ToolExecutionResult> {
     const startTime = Date.now();
-    
+
     const heartbeatInterval = startPeriodicHeartbeat({
         activity: "executeGoatToolActivity",
         pluginId: input.pluginId,

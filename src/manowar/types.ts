@@ -55,6 +55,8 @@ export interface WorkflowStep {
 
     // Optional conditions for execution
     condition?: string;
+    /** Chain ID for execution context */
+    chainId?: number;
 }
 
 // =============================================================================
@@ -331,6 +333,8 @@ export interface Workflow {
     name: string;
     description: string;
     steps: WorkflowStep[];
+    /** Chain ID for execution context */
+    chainId: number;
     /** Triggers that can start this workflow */
     triggers?: TriggerDefinition[];
     /** Lifecycle hooks */

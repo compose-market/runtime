@@ -12,7 +12,7 @@ import {
     isMem0Available,
     type MemoryItem,
     type GraphMemoryResult,
-} from "../memory.js";
+} from "../src/manowar/memory.js";
 
 describe("isMem0Available", () => {
     it("should return boolean", () => {

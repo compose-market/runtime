@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
-import type { Workflow } from "../types.js";
+import type { Workflow } from "../src/manowar/types.js";
 
 const TEST_WALLET = "0x1234567890123456789012345678901234567890";
 
@@ -201,12 +201,14 @@ function createTestWorkflow(workflowId: string = `manowar-${TEST_WALLET}`): Work
         id: workflowId,
         name: "Test Workflow",
         description: "A test workflow for unit testing",
+        chainId: 43113,
         steps: [
             {
                 id: "step-1",
                 name: "DataAnalyst",
                 type: "agent",
                 agentAddress: "0x0000000000000000000000000000000000000001",
+                chainId: 43113,
                 inputTemplate: {
                     model: "gpt-4o-mini",
                     plugins: [],
@@ -218,6 +220,7 @@ function createTestWorkflow(workflowId: string = `manowar-${TEST_WALLET}`): Work
                 name: "Summarizer",
                 type: "agent",
                 agentAddress: "0x0000000000000000000000000000000000000002",
+                chainId: 43113,
                 inputTemplate: {
                     model: "gpt-4o-mini",
                     plugins: [],
@@ -233,11 +236,11 @@ beforeAll(async () => {
     process.env.RUNTIME_SERVICE_URL = process.env.RUNTIME_SERVICE_URL || "https://runtime.compose.market";
     process.env.MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "test-secret";
 
-    const orchestratorModule = await import("../orchestrator.js");
+    const orchestratorModule = await import("../src/manowar/orchestrator.js");
     ManowarOrchestrator = orchestratorModule.ManowarOrchestrator as typeof ManowarOrchestrator;
     executeWithOrchestrator = orchestratorModule.executeWithOrchestrator;
 
-    const registryModule = await import("../registry.js");
+    const registryModule = await import("../src/manowar/registry.js");
     clearCardCache = registryModule.clearCardCache;
 }, 30000);
 

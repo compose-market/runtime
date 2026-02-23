@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ScheduleOverlapPolicy } from "@temporalio/client";
-import type { TriggerDefinition, Workflow } from "../types.js";
+import type { TriggerDefinition, Workflow } from "../src/manowar/types.js";
 
 const workflowHandle = {
     result: vi.fn(),
@@ -23,7 +23,7 @@ const mockWorkflowGetHandle = vi.fn(() => workflowHandle);
 const mockScheduleCreate = vi.fn();
 const mockScheduleGetHandle = vi.fn(() => scheduleHandle);
 
-vi.mock("../../temporal/client.js", () => ({
+vi.mock("../../src/manowar/temporal/client.js", () => ({
     getTemporalClient: vi.fn(async () => ({
         workflow: {
             start: mockWorkflowStart,
@@ -44,7 +44,7 @@ import {
     signalStepApproval,
     startManowarRun,
     upsertTriggerSchedule,
-} from "../../temporal/service.js";
+} from "../src/temporal/service.js";
 
 function createWorkflow(walletAddress: string): Workflow {
     return {
@@ -52,6 +52,7 @@ function createWorkflow(walletAddress: string): Workflow {
         name: "Test Workflow",
         description: "Temporal test workflow",
         steps: [],
+        chainId: 43113,
     };
 }
 

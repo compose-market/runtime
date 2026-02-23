@@ -24,7 +24,7 @@ import {
     listCronStats,
     type TrackedRun,
     type RunFilter,
-} from "../run-tracker.js";
+} from "../src/manowar/run-tracker.js";
 
 describe("createRun", () => {
     it("should create a new tracked run", () => {
@@ -177,19 +177,19 @@ describe("listRuns", () => {
     it("should filter by workflowId", () => {
         const runsA = listRuns({ workflowId: "wf-A" });
 
-        expect(runsA.every(r => r.workflowId === "wf-A")).toBe(true);
+        expect(runsA.every((r: TrackedRun) => r.workflowId === "wf-A")).toBe(true);
     });
 
     it("should filter by status", () => {
         const completedRuns = listRuns({ status: "success" });
 
-        expect(completedRuns.every(r => r.status === "success")).toBe(true);
+        expect(completedRuns.every((r: TrackedRun) => r.status === "success")).toBe(true);
     });
 
     it("should filter by trigger type", () => {
         const cronRuns = listRuns({ triggeredBy: "cron" });
 
-        expect(cronRuns.every(r => r.triggeredBy?.type === "cron")).toBe(true);
+        expect(cronRuns.every((r: TrackedRun) => r.triggeredBy?.type === "cron")).toBe(true);
     });
 
     it("should limit results", () => {

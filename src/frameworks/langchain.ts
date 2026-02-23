@@ -66,6 +66,7 @@ export interface AgentConfig {
   name: string;
   agentWallet: string; // Wallet address - ONLY identifier
   wallet?: AgentWallet;
+  chainId?: number;    // Chain ID context
   model?: string;
   temperature?: number;
   systemPrompt?: string;
@@ -265,7 +266,9 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   const composeTools = await createAgentTools(
     config.plugins || [],
     config.wallet,
-    config.sessionContext  // Pass session context for tool execution
+    config.sessionContext,  // Pass session context for tool execution
+    undefined,              // executionContext
+    config.chainId          // Pass chainId context
   );
   const memTools = createMem0Tools(id, config.userId, config.manowarWallet);
   const tools = [...composeTools, ...memTools];

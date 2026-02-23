@@ -5,12 +5,10 @@ import {
     type SearchResult,
     type EmbeddingResult,
     type HybridSearchParams,
-    type MMRConfig,
-    type TemporalDecayConfig,
     DEFAULT_MMR_CONFIG,
     DEFAULT_TEMPORAL_DECAY_CONFIG,
     EMBEDDING_DIMENSIONS,
-} from "../../memory/types.js";
+} from "../../src/agent/memory/types.js";
 
 describe("Memory Types - Type Validation", () => {
     describe("MemoryVector", () => {
@@ -40,7 +38,7 @@ describe("Memory Types - Type Validation", () => {
 
         it("should support all source types", () => {
             const sources: MemoryVector["source"][] = ["session", "knowledge", "pattern", "archive", "fact"];
-            
+
             for (const source of sources) {
                 const vector: MemoryVector = {
                     vectorId: `vec_${source}`,
@@ -122,7 +120,7 @@ describe("Memory Types - Type Validation", () => {
 
         it("should support all message roles", () => {
             const roles: SessionTranscript["messages"][0]["role"][] = ["user", "assistant", "system", "tool"];
-            
+
             const messages: SessionTranscript["messages"] = roles.map((role, i) => ({
                 role,
                 content: `${role} message ${i}`,
@@ -243,7 +241,7 @@ describe("Memory Types - Type Validation", () => {
 
         it("should only support valid providers", () => {
             const providers: EmbeddingResult["provider"][] = ["voyage", "cloudflare"];
-            
+
             for (const provider of providers) {
                 const result: EmbeddingResult = {
                     embedding: [],

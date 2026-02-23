@@ -1,6 +1,6 @@
 import { NativeConnection, Worker } from "@temporalio/worker";
-import fs from "fs";
-import path from "path";
+import * as fs from "fs";
+import * as path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_ACTIVITY_TASK_QUEUE, AGENT_TASK_QUEUE, MANOWAR_ACTIVITY_TASK_QUEUE, MANOWAR_TASK_QUEUE, MEMORY_ACTIVITY_TASK_QUEUE } from "./constants.js";
 import { getTemporalNamespace, isTemporalConfigured } from "./client.js";

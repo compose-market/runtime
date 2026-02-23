@@ -15,10 +15,10 @@ import {
     fetchModelContextWindow,
     SLIDING_WINDOW_SIZE,
     type ModelContextSpec,
-} from "../context.js";
+} from "../src/manowar/context.js";
 import {
     estimateCost,
-} from "../langsmith.js";
+} from "../src/manowar/langsmith.js";
 
 // NO MOCKS - Real API calls to api.compose.market
 

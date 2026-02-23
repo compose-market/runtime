@@ -81,8 +81,8 @@ export function deriveAgentWallet(dnaHash: `0x${string}`, timestamp: number): Ag
         dnaHash,
         address: account.address,
         account,
-        walletClient,
-        publicClient,
+        walletClient: walletClient as any,
+        publicClient: publicClient as any,
     };
 }
 

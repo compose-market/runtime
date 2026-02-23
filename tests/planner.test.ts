@@ -6,8 +6,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TaskPlanner, type ExecutionPlan, type PlanStep } from "../planner.js";
-import type { Workflow } from "../types.js";
+import { TaskPlanner, type ExecutionPlan, type PlanStep } from "../src/manowar/planner.js";
+import type { Workflow } from "../src/manowar/types.js";
 
 let plannerPayload: Record<string, unknown>;
 let reflectionPayload: Record<string, unknown>;
@@ -31,13 +31,13 @@ const mockModelInvoke = vi.fn(async (messages: Array<{ content?: unknown }>) => 
     return { content: "{}" };
 });
 
-vi.mock("../../frameworks/langchain.js", () => ({
+vi.mock("../../src/manowar/frameworks/langchain.js", () => ({
     createModel: vi.fn(() => ({
         invoke: mockModelInvoke,
     })),
 }));
 
-vi.mock("../memory.js", () => ({
+vi.mock("../src/manowar/memory.js", () => ({
     searchMemoryWithGraph: vi.fn(async () => ({ memories: [] })),
     addMemoryWithGraph: vi.fn(async () => []),
     getAgentReliability: vi.fn(async () => ({
@@ -47,11 +47,11 @@ vi.mock("../memory.js", () => ({
     })),
 }));
 
-vi.mock("../registry.js", () => ({
+vi.mock("../src/manowar/registry.js", () => ({
     discoverAgentTools: vi.fn(async () => []),
 }));
 
-vi.mock("../langsmith.js", () => ({
+vi.mock("../src/manowar/langsmith.js", () => ({
     isLangSmithEnabled: vi.fn(() => false),
     getRelevantLearnings: vi.fn(async () => []),
 }));
@@ -97,6 +97,7 @@ describe("TaskPlanner", () => {
             id: "test-workflow",
             name: "Test Workflow",
             description: "A test workflow for unit testing",
+            chainId: 43113,
             steps: [
                 {
                     id: "step-1",
@@ -353,6 +354,7 @@ describe("ExecutionPlan interface", () => {
             steps: [],
             totalEstimatedTokens: 5000,
             createdAt: Date.now(),
+            chainId: 43113,
             validated: true,
         };
 

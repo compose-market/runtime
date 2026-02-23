@@ -67,6 +67,8 @@ export interface ExecutionPlan {
     createdAt: number;
     /** Whether plan has been validated */
     validated: boolean;
+    /** Chain ID context */
+    chainId: number;
     /** Validation notes */
     validationNotes?: string;
 }
@@ -610,6 +612,7 @@ Create an execution plan for this goal`;
             planId: `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             goal,
             version: 1,
+            chainId: this.workflow.chainId,
             steps: (parsed.steps || []).map((s: any, idx: number) => {
                 const requestedWallet = typeof s.agentWallet === "string" ? s.agentWallet : undefined;
                 const requestedName = typeof s.agentName === "string" ? s.agentName : undefined;

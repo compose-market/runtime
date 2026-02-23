@@ -155,6 +155,8 @@ export async function uploadBase64ToPinata(
 // =============================================================================
 
 export interface RegisteredAgent {
+    /** Chain ID where the agent is deployed */
+    chainId: number;
     /** On-chain agent ID (ERC8004 NFT ID) */
     agentId: bigint;
     /** Agent's unique DNA hash from contract */
@@ -188,6 +190,7 @@ export interface RegisteredAgent {
 }
 
 export interface RegisterAgentParams {
+    chainId: number;
     agentId?: bigint | number | string; // Legacy
     dnaHash: `0x${string}`;
     walletAddress: string; // From IPFS metadata - single source of truth
@@ -220,6 +223,8 @@ interface AgentKnowledgeStore {
 // =============================================================================
 
 export interface RegisteredManowar {
+    /** Chain ID where the manowar is deployed */
+    chainId: number;
     /** Derived wallet address (PRIMARY IDENTIFIER - used for all lookups) */
     walletAddress: string;
     /** On-chain manowar ID (ERC721 NFT ID) - stored for on-chain reference only */
@@ -251,6 +256,8 @@ export interface RegisteredManowar {
 }
 
 export interface RegisterManowarParams {
+    /** Chain ID where the manowar is deployed */
+    chainId: number;
     /** PRIMARY IDENTIFIER - wallet address derived from on-chain data */
     walletAddress: string;
     /** On-chain token ID (for display/on-chain reference only) */
@@ -511,6 +518,7 @@ export async function registerAgent(
             : "langchain";
 
     const registered: RegisteredAgent = {
+        chainId: params.chainId,
         agentId,
         dnaHash: params.dnaHash,
         instanceId: walletAddress,
@@ -840,6 +848,7 @@ export async function registerManowar(params: RegisterManowarParams): Promise<Re
     }
 
     const registered: RegisteredManowar = {
+        chainId: params.chainId,
         walletAddress,
         onchainTokenId: params.onchainTokenId,
         manowarCardUri: params.manowarCardUri,

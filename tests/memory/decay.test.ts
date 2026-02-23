@@ -4,15 +4,15 @@ import {
     calculateDecayMultiplier,
     applyTemporalDecay,
     applyDecayToResults,
-} from "../../memory/decay.js";
-import type { TemporalDecayConfig, SearchResult } from "../../memory/types.js";
+} from "../../src/agent/memory/decay.js";
+import type { TemporalDecayConfig, SearchResult } from "../../src/agent/memory/types.js";
 
 describe("Temporal Decay - Unit Tests", () => {
     describe("toDecayLambda", () => {
         it("should calculate correct decay lambda for standard half-life", () => {
             const halfLifeDays = 30;
             const lambda = toDecayLambda(halfLifeDays);
-            
+
             expect(lambda).toBeCloseTo(Math.LN2 / 30, 10);
         });
 
@@ -88,7 +88,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should produce consistent decay curve", () => {
             const halfLife = 30;
             const results: number[] = [];
-            
+
             for (let day = 0; day <= 120; day += 10) {
                 results.push(calculateDecayMultiplier(day, halfLife));
             }
@@ -108,7 +108,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should not modify score when decay is disabled", () => {
             const disabledConfig: TemporalDecayConfig = { enabled: false, halfLifeDays: 30 };
             const now = Date.now();
-            
+
             expect(applyTemporalDecay(0.9, now, disabledConfig)).toBe(0.9);
             expect(applyTemporalDecay(1.0, now - 86400000 * 60, disabledConfig)).toBe(1.0);
         });
@@ -116,14 +116,14 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should apply decay to fresh content with full score", () => {
             const now = Date.now();
             const result = applyTemporalDecay(1.0, now, config);
-            
+
             expect(result).toBeCloseTo(1.0, 5);
         });
 
         it("should apply decay to content at half-life", () => {
             const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
             const result = applyTemporalDecay(1.0, thirtyDaysAgo, config);
-            
+
             expect(result).toBeCloseTo(0.5, 2);
         });
 
@@ -131,16 +131,16 @@ describe("Temporal Decay - Unit Tests", () => {
             const now = Date.now();
             const result1 = applyTemporalDecay(0.9, now, config);
             const result2 = applyTemporalDecay(0.8, now, config);
-            
+
             expect(result1).toBeGreaterThan(result2);
         });
 
         it("should combine decay with original score", () => {
             const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
-            
+
             const result1 = applyTemporalDecay(1.0, thirtyDaysAgo, config);
             const result2 = applyTemporalDecay(0.8, thirtyDaysAgo, config);
-            
+
             expect(result1).toBeCloseTo(0.5, 2);
             expect(result2).toBeCloseTo(0.4, 2);
         });
@@ -249,7 +249,7 @@ describe("Temporal Decay - Unit Tests", () => {
 
             const processed = applyDecayToResults(results, config);
 
-            const scores = processed.map(r => r.score);
+            const scores = processed.map((r: SearchResult) => r.score);
             for (let i = 1; i < scores.length; i++) {
                 expect(scores[i]).toBeLessThanOrEqual(scores[i - 1]);
             }
@@ -274,7 +274,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should handle zero half-life gracefully", () => {
             const zeroConfig: TemporalDecayConfig = { enabled: true, halfLifeDays: 0 };
             const now = Date.now();
-            
+
             const result = applyTemporalDecay(1.0, now, zeroConfig);
             expect(result).toBe(1.0);
         });
@@ -282,7 +282,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should handle extremely large half-life", () => {
             const hugeConfig: TemporalDecayConfig = { enabled: true, halfLifeDays: 1000000 };
             const yearAgo = Date.now() - 365 * 24 * 60 * 60 * 1000;
-            
+
             const result = applyTemporalDecay(1.0, yearAgo, hugeConfig);
             expect(result).toBeGreaterThan(0.999);
         });
@@ -290,7 +290,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should handle future createdAt timestamps", () => {
             const future = Date.now() + 86400000;
             const config: TemporalDecayConfig = { enabled: true, halfLifeDays: 30 };
-            
+
             const result = applyTemporalDecay(1.0, future, config);
             expect(result).toBe(1.0);
         });
@@ -298,14 +298,14 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should handle very small scores", () => {
             const now = Date.now();
             const config: TemporalDecayConfig = { enabled: true, halfLifeDays: 30 };
-            
+
             const result = applyTemporalDecay(0.0001, now, config);
             expect(result).toBeCloseTo(0.0001, 6);
         });
 
         it("should handle score of 0", () => {
             const config: TemporalDecayConfig = { enabled: true, halfLifeDays: 30 };
-            
+
             expect(applyTemporalDecay(0, Date.now(), config)).toBe(0);
             expect(applyTemporalDecay(0, Date.now() - 86400000 * 60, config)).toBe(0);
         });
@@ -313,7 +313,7 @@ describe("Temporal Decay - Unit Tests", () => {
         it("should handle score greater than 1", () => {
             const config: TemporalDecayConfig = { enabled: true, halfLifeDays: 30 };
             const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
-            
+
             const result = applyTemporalDecay(2.0, thirtyDaysAgo, config);
             expect(result).toBeCloseTo(1.0, 2);
         });

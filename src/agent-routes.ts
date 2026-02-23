@@ -79,6 +79,7 @@ async function warmAgentRuntimeOrTimeout(walletAddress: string): Promise<boolean
 // =============================================================================
 
 const RegisterAgentSchema = z.object({
+    chainId: z.number(), // Added chainId
     // walletAddress comes from IPFS metadata (single source of truth)
     walletAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
     // walletTimestamp is OPTIONAL - only needed if agent needs to sign transactions
@@ -151,6 +152,7 @@ router.post(
         const params = parseResult.data;
 
         const registration = await registerAgentWithWarmup({
+            chainId: params.chainId,
             walletAddress: params.walletAddress,
             walletTimestamp: params.walletTimestamp,
             dnaHash: params.dnaHash,

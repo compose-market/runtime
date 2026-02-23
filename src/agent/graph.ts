@@ -27,8 +27,6 @@ export function createAgentGraph(
         console.log(`[DEBUG] System prompt provided (${systemPrompt.length} chars)`);
     }
 
-    // Store tool definitions in memory to allow the agent to recall tool usage instructions without bloating the context window
-    // We do this asynchronously/optimistically without blocking the graph build
     // Store tool definitions in memory to allow the agent to recall tool usage instructions
     // We do this asynchronously/optimistically using the Lambda API (which wraps Mem0)
     // This avoids using the mem0ai SDK directly in the MCP server (which causes window is not defined errors)

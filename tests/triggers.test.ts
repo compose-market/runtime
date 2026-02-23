@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { TriggerDefinition } from "../types.js";
+import type { TriggerDefinition } from "../src/manowar/types.js";
 
 const temporalState = vi.hoisted(() => ({
     schedules: new Map<string, { scheduleId: string; paused: boolean; memo?: Record<string, unknown> }>(),
@@ -57,7 +57,7 @@ const temporalMock = vi.hoisted(() => {
     };
 });
 
-vi.mock("../../temporal/client.js", () => ({
+vi.mock("../src/temporal/client.js", () => ({
     getTemporalClient: vi.fn(async () => ({
         schedule: {
             list: async function* () {
@@ -73,7 +73,7 @@ vi.mock("../../temporal/client.js", () => ({
     })),
 }));
 
-vi.mock("../../temporal/service.js", () => ({
+vi.mock("../src/temporal/service.js", () => ({
     upsertTriggerSchedule: temporalMock.upsertTriggerSchedule,
     deleteTriggerSchedule: temporalMock.deleteTriggerSchedule,
     listTriggerSchedules: temporalMock.listTriggerSchedules,
@@ -90,7 +90,7 @@ import {
     unregisterAllTriggers,
     getActiveTriggerCount,
     getNextRunTime,
-} from "../triggers.js";
+} from "../src/manowar/triggers.js";
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);

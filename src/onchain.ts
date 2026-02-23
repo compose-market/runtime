@@ -1,30 +1,56 @@
 /**
  * On-Chain Data Fetching
  * 
- * Reads Manowar and Agent data from deployed contracts on Avalanche Fuji.
+ * Reads Manowar and Agent data from deployed contracts on supported chains.
  * Uses viem for contract interaction.
  */
-import { createPublicClient, http, type Address } from "viem";
-import { avalancheFuji } from "viem/chains";
+import { type Address } from "viem";
 import type { WorkflowStep } from "./manowar/types.js";
 import { registerAgent, hasAgent } from "./frameworks/runtime.js";
+import { getPublicClient } from "./chains.js";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const RPC_URL = process.env.AVALANCHE_FUJI_RPC;
-const USE_MAINNET = process.env.USE_MAINNET === "true";
-
-// Contract Addresses from environment (with testnet defaults from env)
-const CONTRACT_ADDRESSES = {
-    AgentFactory: (process.env.FUJI_AGENT_FACTORY_CONTRACT_ADDRESS || "") as Address,
-    Manowar: (process.env.FUJI_MANOWAR_CONTRACT_ADDRESS || "") as Address,
-};
+// Universal Contract Addresses from environment
+const AGENT_FACTORY_CONTRACT = (process.env.AGENT_FACTORY_CONTRACT || "") as Address;
+const MANOWAR_CONTRACT = (process.env.MANOWAR_CONTRACT || "") as Address;
 
 // =============================================================================
 // ABIs (Minimal)
 // =============================================================================
+
+const AgentFactoryABI = [
+    {
+        name: "getAgentData",
+        type: "function",
+        stateMutability: "view",
+        inputs: [{ name: "agentId", type: "uint256" }],
+        outputs: [{
+            name: "data",
+            type: "tuple",
+            components: [
+                { name: "dnaHash", type: "bytes32" },
+                { name: "licenses", type: "uint256" },
+                { name: "licensesMinted", type: "uint256" },
+                { name: "licensePrice", type: "uint256" },
+                { name: "creator", type: "address" },
+                { name: "cloneable", type: "bool" },
+                { name: "isClone", type: "bool" },
+                { name: "parentAgentId", type: "uint256" },
+                { name: "agentCardUri", type: "string" },
+            ],
+        }],
+    },
+    {
+        name: "totalAgents",
+        type: "function",
+        stateMutability: "view",
+        inputs: [],
+        outputs: [{ name: "total", type: "uint256" }],
+    },
+] as const;
 
 const ManowarABI = [
     {
@@ -33,6 +59,7 @@ const ManowarABI = [
         stateMutability: "view",
         inputs: [{ name: "manowarId", type: "uint256" }],
         outputs: [{
+            name: "data",
             type: "tuple",
             components: [
                 { name: "title", type: "string" },
@@ -60,28 +87,19 @@ const ManowarABI = [
         inputs: [{ name: "manowarId", type: "uint256" }],
         outputs: [{ name: "agentIds", type: "uint256[]" }],
     },
-] as const;
-
-const AgentFactoryABI = [
     {
-        name: "getAgentData",
+        name: "totalManowars",
         type: "function",
         stateMutability: "view",
-        inputs: [{ name: "agentId", type: "uint256" }],
-        outputs: [{
-            type: "tuple",
-            components: [
-                { name: "dnaHash", type: "bytes32" },
-                { name: "licenses", type: "uint256" },
-                { name: "licensesMinted", type: "uint256" },
-                { name: "licensePrice", type: "uint256" },
-                { name: "creator", type: "address" },
-                { name: "cloneable", type: "bool" },
-                { name: "isClone", type: "bool" },
-                { name: "parentAgentId", type: "uint256" },
-                { name: "agentCardUri", type: "string" },
-            ],
-        }],
+        inputs: [],
+        outputs: [{ name: "total", type: "uint256" }],
+    },
+    {
+        name: "tokenURI",
+        type: "function",
+        stateMutability: "view",
+        inputs: [{ name: "tokenId", type: "uint256" }],
+        outputs: [{ name: "uri", type: "string" }],
     },
 ] as const;
 
@@ -90,12 +108,15 @@ const AgentFactoryABI = [
 // =============================================================================
 
 interface ManowarData {
+    walletAddress: string;
+    dnaHash: string;
     title: string;
     description: string;
     banner: string;
     manowarCardUri: string;
     hasCoordinator: boolean;
     coordinatorModel: string;
+    agentWalletAddresses: string[];
 }
 
 interface AgentData {
@@ -115,40 +136,84 @@ interface AgentMetadata {
 }
 
 // =============================================================================
-// Client
-// =============================================================================
-
-const publicClient = createPublicClient({
-    chain: avalancheFuji,
-    transport: http(RPC_URL),
-});
-
-// =============================================================================
 // Fetch Functions
 // =============================================================================
 
 /**
  * Fetch Manowar on-chain data
  */
-export async function fetchManowarOnchain(manowarId: number): Promise<ManowarData | null> {
+export async function fetchManowarOnchain(chainId: number, manowarId: number): Promise<ManowarData | null> {
     try {
-        const data = await publicClient.readContract({
-            address: CONTRACT_ADDRESSES.Manowar,
+        const client = getPublicClient(chainId);
+        const data = await client.readContract({
+            address: MANOWAR_CONTRACT,
             abi: ManowarABI,
             functionName: "getManowarData",
             args: [BigInt(manowarId)],
         });
 
+        // Fetch tokenURI to get walletAddress and dnaHash from IPFS metadata
+        const tokenUri = await client.readContract({
+            address: MANOWAR_CONTRACT,
+            abi: ManowarABI,
+            functionName: "tokenURI",
+            args: [BigInt(manowarId)],
+        });
+
+        let walletAddress = "0x0000000000000000000000000000000000000000";
+        let dnaHash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        if (tokenUri) {
+            const metadata = await fetchIpfsMetadata<{ walletAddress: string; dnaHash: string }>(tokenUri);
+            if (metadata) {
+                walletAddress = metadata.walletAddress || walletAddress;
+                dnaHash = metadata.dnaHash || dnaHash;
+            }
+        }
+
+        // Fetch agent IDs and resolve their wallet addresses
+        const agentIds = await fetchManowarAgentIds(chainId, manowarId);
+        const agentWalletAddresses: string[] = [];
+        for (const agentId of agentIds) {
+            const agentData = await fetchAgentOnchain(chainId, agentId);
+            if (agentData) {
+                const metadata = await fetchIpfsMetadata<{ walletAddress: string }>(agentData.agentCardUri);
+                if (metadata?.walletAddress) {
+                    agentWalletAddresses.push(metadata.walletAddress);
+                }
+            }
+        }
+
+        const [
+            title,
+            description,
+            banner,
+            manowarCardUri,
+            totalPrice,
+            units,
+            unitsMinted,
+            creator,
+            leaseEnabled,
+            leaseDuration,
+            leasePercent,
+            hasCoordinator,
+            coordinatorModel,
+            hasActiveRfa,
+            rfaId
+        ] = data as any;
+
         return {
-            title: data.title,
-            description: data.description,
-            banner: data.banner,
-            manowarCardUri: data.manowarCardUri,
-            hasCoordinator: data.hasCoordinator,
-            coordinatorModel: data.coordinatorModel,
+            walletAddress,
+            dnaHash,
+            title,
+            description,
+            banner,
+            manowarCardUri,
+            hasCoordinator,
+            coordinatorModel,
+            agentWalletAddresses,
         };
     } catch (error) {
-        console.error(`[onchain] Failed to fetch manowar ${manowarId}:`, error);
+        console.error(`[onchain][chain:${chainId}] Failed to fetch manowar ${manowarId}:`, error);
         return null;
     }
 }
@@ -156,10 +221,11 @@ export async function fetchManowarOnchain(manowarId: number): Promise<ManowarDat
 /**
  * Fetch agent IDs for a manowar
  */
-export async function fetchManowarAgentIds(manowarId: number): Promise<number[]> {
+export async function fetchManowarAgentIds(chainId: number, manowarId: number): Promise<number[]> {
     try {
-        const agentIds = await publicClient.readContract({
-            address: CONTRACT_ADDRESSES.Manowar,
+        const client = getPublicClient(chainId);
+        const agentIds = await client.readContract({
+            address: MANOWAR_CONTRACT,
             abi: ManowarABI,
             functionName: "getAgents",
             args: [BigInt(manowarId)],
@@ -167,7 +233,7 @@ export async function fetchManowarAgentIds(manowarId: number): Promise<number[]>
 
         return agentIds.map((id: bigint) => Number(id));
     } catch (error) {
-        console.error(`[onchain] Failed to fetch agents for manowar ${manowarId}:`, error);
+        console.error(`[onchain][chain:${chainId}] Failed to fetch agents for manowar ${manowarId}:`, error);
         return [];
     }
 }
@@ -175,46 +241,58 @@ export async function fetchManowarAgentIds(manowarId: number): Promise<number[]>
 /**
  * Fetch agent on-chain data
  */
-export async function fetchAgentOnchain(agentId: number): Promise<AgentData | null> {
+export async function fetchAgentOnchain(chainId: number, agentId: number): Promise<AgentData | null> {
     try {
-        const data = await publicClient.readContract({
-            address: CONTRACT_ADDRESSES.AgentFactory,
+        const client = getPublicClient(chainId);
+        const data = await client.readContract({
+            address: AGENT_FACTORY_CONTRACT,
             abi: AgentFactoryABI,
             functionName: "getAgentData",
             args: [BigInt(agentId)],
         });
 
+        const [
+            dnaHash,
+            licenses,
+            licensesMinted,
+            licensePrice,
+            creator,
+            cloneable,
+            isClone,
+            parentAgentId,
+            agentCardUri
+        ] = data as any;
+
         return {
             id: agentId,
-            dnaHash: data.dnaHash,
-            agentCardUri: data.agentCardUri,
+            dnaHash,
+            agentCardUri,
         };
     } catch (error) {
-        console.error(`[onchain] Failed to fetch agent ${agentId}:`, error);
+        console.error(`[onchain][chain:${chainId}] Failed to fetch agent ${agentId}:`, error);
         return null;
     }
 }
 
 /**
- * Fetch agent metadata from IPFS
+ * Fetch metadata from IPFS
  */
-async function fetchAgentMetadata(ipfsUri: string): Promise<AgentMetadata | null> {
+async function fetchIpfsMetadata<T>(ipfsUri: string): Promise<T | null> {
     if (!ipfsUri || !ipfsUri.startsWith("ipfs://")) return null;
 
     try {
         const cid = ipfsUri.replace("ipfs://", "");
-        // Skip invalid CIDs
         if (!cid.startsWith("Qm") && !cid.startsWith("baf")) return null;
 
-        const gateway = process.env.PINATA_GATEWAY || "compose.mypinata.cloud";
+        const gateway = process.env.IPFS_PINATA_GATEWAY || "compose.mypinata.cloud";
         const url = `https://${gateway}/ipfs/${cid}`;
 
         const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
         if (!response.ok) return null;
 
-        return await response.json() as AgentMetadata;
+        return await response.json() as T;
     } catch (error) {
-        console.error(`[onchain] Failed to fetch metadata from ${ipfsUri}:`, error);
+        console.error(`[onchain] Failed to fetch IPFS metadata from ${ipfsUri}:`, error);
         return null;
     }
 }
@@ -228,84 +306,53 @@ interface ManowarMetadata {
 }
 
 /**
- * Fetch manowar metadata via tokenURI (standard ERC721)
- */
-async function fetchManowarMetadataFromTokenUri(manowarId: number): Promise<ManowarMetadata | null> {
-    try {
-        // Add tokenURI to the ABI for this call
-        const tokenUri = await publicClient.readContract({
-            address: CONTRACT_ADDRESSES.Manowar,
-            abi: [...ManowarABI, {
-                name: "tokenURI",
-                type: "function",
-                stateMutability: "view",
-                inputs: [{ name: "tokenId", type: "uint256" }],
-                outputs: [{ name: "uri", type: "string" }],
-            }] as const,
-            functionName: "tokenURI",
-            args: [BigInt(manowarId)],
-        }) as string;
-
-        if (!tokenUri) return null;
-
-        // Handle IPFS URIs
-        let metadataUrl = tokenUri;
-        if (tokenUri.startsWith("ipfs://")) {
-            const cid = tokenUri.replace("ipfs://", "");
-            const gateway = process.env.PINATA_GATEWAY || "compose.mypinata.cloud";
-            metadataUrl = `https://${gateway}/ipfs/${cid}`;
-        }
-
-        const response = await fetch(metadataUrl, { signal: AbortSignal.timeout(10000) });
-        if (!response.ok) return null;
-
-        return await response.json() as ManowarMetadata;
-    } catch (error) {
-        console.error(`[onchain] Failed to fetch manowar metadata for ID ${manowarId}:`, error);
-        return null;
-    }
-}
-
-/**
  * Fetch total number of manowars
  */
-async function fetchTotalManowars(): Promise<number> {
+async function fetchTotalManowars(chainId: number): Promise<number> {
     try {
-        const total = await publicClient.readContract({
-            address: CONTRACT_ADDRESSES.Manowar,
-            abi: [...ManowarABI, {
-                name: "totalManowars",
-                type: "function",
-                stateMutability: "view",
-                inputs: [],
-                outputs: [{ name: "total", type: "uint256" }],
-            }] as const,
+        const client = getPublicClient(chainId);
+        const total = await client.readContract({
+            address: MANOWAR_CONTRACT,
+            abi: ManowarABI,
             functionName: "totalManowars",
             args: [],
         });
         return Number(total);
     } catch (error) {
-        console.error(`[onchain] Failed to fetch total manowars:`, error);
+        console.error(`[onchain][chain:${chainId}] Failed to fetch total manowars:`, error);
         return 0;
     }
 }
 
 /**
- * Find manowar by wallet address (iterates all manowars and checks metadata)
+ * Find manowar by wallet address
  */
-export async function fetchManowarByWalletAddress(walletAddress: string): Promise<{ manowarId: number; data: ManowarData } | null> {
-    const total = await fetchTotalManowars();
+export async function fetchManowarByWalletAddress(chainId: number, walletAddress: string): Promise<{ manowarId: number; data: ManowarData } | null> {
+    const total = await fetchTotalManowars(chainId);
     const normalizedSearch = walletAddress.toLowerCase();
+    const client = getPublicClient(chainId);
 
     // Search in reverse (most recent first)
     for (let i = total; i >= 1; i--) {
-        const manowarData = await fetchManowarOnchain(i);
+        const manowarData = await fetchManowarOnchain(chainId, i);
         if (!manowarData) continue;
 
-        // Fetch metadata via tokenURI to get wallet address
-        const metadata = await fetchManowarMetadataFromTokenUri(i);
-        if (metadata?.walletAddress && metadata.walletAddress.toLowerCase() === normalizedSearch) {
-            return { manowarId: i, data: manowarData };
+        try {
+            const tokenUri = await client.readContract({
+                address: MANOWAR_CONTRACT,
+                abi: ManowarABI,
+                functionName: "tokenURI",
+                args: [BigInt(i)],
+            });
+
+            if (tokenUri) {
+                const metadata = await fetchIpfsMetadata<ManowarMetadata>(tokenUri);
+                if (metadata?.walletAddress && metadata.walletAddress.toLowerCase() === normalizedSearch) {
+                    return { manowarId: i, data: manowarData };
+                }
+            }
+        } catch (err) {
+            console.warn(`[onchain][chain:${chainId}] Failed to fetch tokenURI/metadata for manowar ${i}:`, err);
         }
     }
 
@@ -315,17 +362,17 @@ export async function fetchManowarByWalletAddress(walletAddress: string): Promis
 /**
  * Resolve manowar identifier (supports both wallet address and numeric ID)
  */
-export async function resolveManowarIdentifier(identifier: string): Promise<{ manowarId: number; data: ManowarData } | null> {
-    // Check if it's a wallet address (0x + 40 hex chars)
+export async function resolveManowarIdentifier(chainId: number, identifier: string): Promise<{ manowarId: number; data: ManowarData } | null> {
+    // Check if it's a wallet address
     if (identifier.startsWith("0x") && identifier.length === 42) {
-        return fetchManowarByWalletAddress(identifier);
+        return fetchManowarByWalletAddress(chainId, identifier);
     }
 
     // Otherwise treat as numeric ID
     const numericId = parseInt(identifier);
     if (isNaN(numericId)) return null;
 
-    const data = await fetchManowarOnchain(numericId);
+    const data = await fetchManowarOnchain(chainId, numericId);
     if (!data) return null;
 
     return { manowarId: numericId, data };
@@ -333,71 +380,61 @@ export async function resolveManowarIdentifier(identifier: string): Promise<{ ma
 
 /**
  * Build workflow steps from manowar on-chain data
- * 
- * Fetches:
- * 1. Manowar data from contract
- * 2. Agent IDs from manowar
- * 3. Each agent's on-chain data
- * 4. Each agent's IPFS metadata (for plugins/tools)
- * 
- * Returns workflow steps representing each agent in the manowar
  */
-export async function buildManowarWorkflow(manowarId: number): Promise<{
+export async function buildManowarWorkflow(chainId: number, manowarId: number): Promise<{
     id: string;
     name: string;
     description: string;
     steps: WorkflowStep[];
 } | null> {
-    console.log(`[onchain] Building workflow for manowar ${manowarId}...`);
+    console.log(`[onchain][chain:${chainId}] Building workflow for manowar ${manowarId}...`);
 
     // 1. Fetch manowar data
-    const manowarData = await fetchManowarOnchain(manowarId);
+    const manowarData = await fetchManowarOnchain(chainId, manowarId);
     if (!manowarData) {
-        console.error(`[onchain] Manowar ${manowarId} not found`);
+        console.error(`[onchain][chain:${chainId}] Manowar ${manowarId} not found`);
         return null;
     }
 
     // 2. Fetch agent IDs
-    const agentIds = await fetchManowarAgentIds(manowarId);
-    console.log(`[onchain] Manowar ${manowarId} has ${agentIds.length} agents: [${agentIds.join(", ")}]`);
+    const agentIds = await fetchManowarAgentIds(chainId, manowarId);
+    console.log(`[onchain][chain:${chainId}] Manowar ${manowarId} has ${agentIds.length} agents: [${agentIds.join(", ")}]`);
 
     // 3. Build workflow steps from agents
     const steps: WorkflowStep[] = [];
 
     for (const agentId of agentIds) {
-        const agentData = await fetchAgentOnchain(agentId);
+        const agentData = await fetchAgentOnchain(chainId, agentId);
         if (!agentData) continue;
 
         // Fetch metadata for plugins/tools
-        const metadata = await fetchAgentMetadata(agentData.agentCardUri);
+        const metadata = await fetchIpfsMetadata<AgentMetadata>(agentData.agentCardUri);
 
         // Auto-register the agent if not already registered
-        // This ensures agents are available when manowar delegates to them
         if (metadata?.walletAddress && !hasAgent(metadata.walletAddress)) {
             try {
-                console.log(`[onchain] Auto-registering agent ${metadata.name || agentId} (${metadata.walletAddress})...`);
+                console.log(`[onchain][chain:${chainId}] Auto-registering agent ${metadata.name || agentId} (${metadata.walletAddress})...`);
 
-                // Model comes from blockchain metadata
                 if (!metadata.model) {
-                    throw new Error(`Agent ${metadata.name || agentId} has no model specified in blockchain metadata`);
+                    throw new Error(`Agent ${metadata.name || agentId} has no model specified in metadata`);
                 }
 
                 await registerAgent({
+                    chainId: chainId,
                     dnaHash: agentData.dnaHash as `0x${string}`,
                     walletAddress: metadata.walletAddress,
                     name: metadata.name || `Agent #${agentId}`,
                     description: metadata.description || "",
                     agentCardUri: agentData.agentCardUri,
-                    creator: "0x0000000000000000000000000000000000000000", // Unknown creator
+                    creator: "0x0000000000000000000000000000000000000000",
                     model: metadata.model,
                     framework: metadata.framework || "langchain",
                     plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
                     systemPrompt: (metadata as any).systemPrompt,
                 });
-                console.log(`[onchain] Successfully registered agent ${metadata.walletAddress}`);
+                console.log(`[onchain][chain:${chainId}] Successfully registered agent ${metadata.walletAddress}`);
             } catch (err) {
-                // Agent might already be registered (race condition), that's OK
-                console.warn(`[onchain] Agent registration skipped (may already exist): ${err instanceof Error ? err.message : err}`);
+                console.warn(`[onchain][chain:${chainId}] Agent registration skipped: ${err instanceof Error ? err.message : err}`);
             }
         }
 
@@ -418,7 +455,7 @@ export async function buildManowarWorkflow(manowarId: number): Promise<{
             saveAs: `agent_${agentId}_output`,
         });
 
-        console.log(`[onchain] Added agent step: ${metadata?.name || `Agent #${agentId}`} with ${metadata?.plugins?.length || 0} plugins`);
+        console.log(`[onchain][chain:${chainId}] Added agent step: ${metadata?.name || `Agent #${agentId}`}`);
     }
 
     return {

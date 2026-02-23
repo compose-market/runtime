@@ -282,6 +282,7 @@ export async function createAgentTools(
     agentWallet?: AgentWallet,
     sessionContext?: { sessionActive: boolean; sessionBudgetRemaining: number },
     executionContext?: ToolExecutionContext,
+    chainId?: number,
 ): Promise<DynamicStructuredTool[]> {
     if (!pluginIds || pluginIds.length === 0) return [];
 
@@ -318,6 +319,7 @@ export async function createAgentTools(
                         method: "GET",
                         headers: {
                             ...buildCorrelationHeaders(executionContext, `goat:plugin:${id}`),
+                            ...(chainId ? { "x-chain-id": chainId.toString() } : {}),
                         },
                     },
                 );
@@ -346,6 +348,11 @@ export async function createAgentTools(
                             if (sessionContext?.sessionActive) {
                                 headers["x-session-active"] = "true";
                                 headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
+                            }
+
+                            // Pass chainId if available
+                            if (chainId) {
+                                headers["x-chain-id"] = chainId.toString();
                             }
 
                             // Add internal bypass header (user already paid for this conversation)
