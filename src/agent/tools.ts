@@ -350,7 +350,7 @@ export async function createAgentTools(
                                 headers["x-session-budget-remaining"] = sessionContext.sessionBudgetRemaining.toString();
                             }
 
-                            // Pass chainId if available
+                            // Pass chainId
                             if (chainId) {
                                 headers["x-chain-id"] = chainId.toString();
                             }
