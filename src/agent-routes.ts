@@ -25,10 +25,16 @@ import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment
 import { streamAgent } from "./frameworks/langchain.js";
 import { executeOpenClawAgent, streamOpenClawAgent } from "./frameworks/openclaw.js";
 import { createComposeRunId, executeAgentRunWithFallback, getAgentRunState } from "./temporal/service.js";
+import { CHAIN_IDS } from "./chains.js";
 
 const router = Router();
 const JSON_KEEPALIVE_INTERVAL_MS = 5000; // 5 seconds - keeps proxies alive, prevents 504s
 const AGENT_WARMUP_TIMEOUT_MS = 12000;
+const SUPPORTED_AGENT_CHAIN_IDS = Object.values(CHAIN_IDS)
+    .map((id) => Number(id))
+    .filter((id, index, arr) => Number.isInteger(id) && arr.indexOf(id) === index)
+    .sort((a, b) => a - b);
+const SUPPORTED_AGENT_CHAIN_ID_SET = new Set<number>(SUPPORTED_AGENT_CHAIN_IDS);
 
 // =============================================================================
 // Middleware
@@ -79,7 +85,12 @@ async function warmAgentRuntimeOrTimeout(walletAddress: string): Promise<boolean
 // =============================================================================
 
 const RegisterAgentSchema = z.object({
-    chainId: z.number(), // Added chainId
+    chainId: z
+        .number()
+        .int("chainId must be an integer")
+        .refine((value) => SUPPORTED_AGENT_CHAIN_ID_SET.has(value), {
+            message: `Unsupported chainId. Supported values: ${SUPPORTED_AGENT_CHAIN_IDS.join(", ")}`,
+        }),
     // walletAddress comes from IPFS metadata (single source of truth)
     walletAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
     // walletTimestamp is OPTIONAL - only needed if agent needs to sign transactions
@@ -142,9 +153,22 @@ router.post(
     asyncHandler(async (req: Request, res: Response) => {
         const parseResult = RegisterAgentSchema.safeParse(req.body);
         if (!parseResult.success) {
+            const details = parseResult.error.issues;
+            const chainIssues = details.filter((issue) => issue.path.join(".") === "chainId");
             res.status(400).json({
                 error: "Invalid request body",
-                details: parseResult.error.issues,
+                code: "INVALID_AGENT_REGISTRATION",
+                details,
+                ...(chainIssues.length > 0
+                    ? {
+                        chainValidation: {
+                            valid: false,
+                            received: req.body?.chainId ?? null,
+                            supportedChainIds: SUPPORTED_AGENT_CHAIN_IDS,
+                            issues: chainIssues,
+                        },
+                    }
+                    : {}),
             });
             return;
         }
