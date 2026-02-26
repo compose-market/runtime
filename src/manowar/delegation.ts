@@ -176,10 +176,13 @@ export async function callAgent(
         };
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        const failure = classifyFailure(undefined, errorMessage);
         return {
             success: false,
             output: "",
             error: errorMessage.includes("aborted") ? "Request timeout" : errorMessage,
+            retryable: failure.retryable,
+            failureCategory: failure.failureCategory,
         };
     }
 }
