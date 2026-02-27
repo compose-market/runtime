@@ -10,6 +10,7 @@ import type { ComposeTool } from "../types.js";
 import type { AgentWallet } from "../agent-wallet.js";
 import { createHash } from "crypto";
 import { getAgentExecutionContext } from "./context.js";
+import { addMemory, searchMemory, searchMemoryLayers } from "../memory/index.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
 const RUNTIME_SERVICE_URL = process.env.RUNTIME_SERVICE_URL || "https://runtime.compose.market";
@@ -539,58 +540,6 @@ export async function createAgentTools(
 // Mem0 / Built-in Tools
 // =============================================================================
 
-interface MemoryItem {
-    id: string;
-    memory: string;
-    user_id?: string;
-    agent_id?: string;
-    run_id?: string;
-    metadata?: Record<string, unknown>;
-}
-
-async function addMemory(params: {
-    messages: Array<{ role: string; content: string }>;
-    agent_id?: string;
-    user_id?: string;
-    run_id?: string;
-    metadata?: Record<string, unknown>;
-}): Promise<MemoryItem[]> {
-    try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(params),
-        });
-        if (!response.ok) return [];
-        return await response.json();
-    } catch (error) {
-        console.error("[mem0] Failed to add memory:", error);
-        return [];
-    }
-}
-
-async function searchMemory(params: {
-    query: string;
-    agent_id?: string;
-    user_id?: string;
-    run_id?: string;
-    limit?: number;
-    filters?: Record<string, unknown>;
-}): Promise<MemoryItem[]> {
-    try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(params),
-        });
-        if (!response.ok) return [];
-        return await response.json();
-    } catch (error) {
-        console.error("[mem0] Failed to search memory:", error);
-        return [];
-    }
-}
-
 export function createMem0Tools(agentId: string, userId?: string, manowarWallet?: string): DynamicStructuredTool[] {
     const context = getAgentExecutionContext();
 
@@ -603,27 +552,18 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
             if (manowarWallet) filters.manowar_wallet = manowarWallet;
             if (context?.composeRunId) filters.compose_run_id = context.composeRunId;
 
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-tool-price": "500",
-                },
-                body: JSON.stringify({
-                    query,
-                    agent_id: agentId,
-                    user_id: userId,
-                    run_id: context?.threadId,
-                    limit: 8,
-                    enable_graph: true,
-                    rerank: true,
-                    filters
-                }),
+            const items = await searchMemory({
+                query,
+                agent_id: agentId,
+                user_id: userId,
+                run_id: context?.threadId,
+                limit: 8,
+                enable_graph: true,
+                rerank: true,
+                filters,
             });
-            if (!response.ok) return "Memory search unavailable.";
-            const items = await response.json();
             if (!items.length) return "No relevant memories found.";
-            return items.map((i: MemoryItem) => `[Memory]: ${i.memory}`).join("\n\n");
+            return items.map((item) => `[Memory]: ${item.memory}`).join("\n\n");
         },
     });
 
@@ -632,26 +572,19 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
         description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
         schema: z.object({ content: z.string().describe("Fact to remember") }),
         func: async ({ content }: { content: string }) => {
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-tool-price": "1000",
+            const saved = await addMemory({
+                messages: [{ role: "user", content }],
+                agent_id: agentId,
+                user_id: userId,
+                run_id: context?.threadId,
+                enable_graph: true,
+                metadata: {
+                    type: "explicit_save",
+                    manowar_wallet: manowarWallet,
+                    compose_run_id: context?.composeRunId,
                 },
-                body: JSON.stringify({
-                    messages: [{ role: "user", content }],
-                    agent_id: agentId,
-                    user_id: userId,
-                    run_id: context?.threadId,
-                    enable_graph: true,
-                    metadata: {
-                        type: "explicit_save",
-                        manowar_wallet: manowarWallet,
-                        compose_run_id: context?.composeRunId,
-                    }
-                }),
             });
-            if (!response.ok) return "Failed to save memory.";
+            if (saved.length === 0) return "Failed to save memory.";
             return "Memory saved with graph extraction.";
         },
     });
@@ -664,26 +597,15 @@ export function createMem0Tools(agentId: string, userId?: string, manowarWallet?
             layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives"])).optional(),
         }),
         func: async ({ query, layers }: { query: string; layers?: string[] }) => {
-            const response = await fetch(`${LAMBDA_API_URL}/api/memory/layers/search`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-tool-price": "750",
-                },
-                body: JSON.stringify({
-                    query,
-                    agent_id: agentId,
-                    user_id: userId,
-                    manowar_wallet: manowarWallet,
-                    layers: layers || ["working", "scene", "graph", "patterns", "archives"],
-                    limit: 5,
-                    compose_run_id: context?.composeRunId,
-                    thread_id: context?.threadId,
-                }),
+            const results = await searchMemoryLayers({
+                query,
+                agentWallet: agentId,
+                userId,
+                threadId: context?.threadId,
+                layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || ["working", "scene", "graph", "patterns", "archives"],
+                limit: 5,
             });
-            if (!response.ok) return "Memory search unavailable.";
-            const data = await response.json();
-            return JSON.stringify(data);
+            return JSON.stringify(results);
         },
     });
 

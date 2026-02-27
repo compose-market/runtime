@@ -11,6 +11,7 @@ import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { FileSystemCheckpointSaver } from "./checkpoint.js";
 import type { RunnableConfig } from "@langchain/core/runnables";
+import { addMemory } from "../memory/mem0.js";
 
 export function createAgentGraph(
     model: any,
@@ -27,13 +28,9 @@ export function createAgentGraph(
         console.log(`[DEBUG] System prompt provided (${systemPrompt.length} chars)`);
     }
 
-    // Store tool definitions in memory to allow the agent to recall tool usage instructions
-    // We do this asynchronously/optimistically using the Lambda API (which wraps Mem0)
-    // This avoids using the mem0ai SDK directly in the MCP server (which causes window is not defined errors)
+    // Store tool definitions in graph memory to improve tool-selection context quality.
     (async () => {
         try {
-            const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
-
             // For each tool, check/add to agent memory
             for (const tool of tools) {
                 const toolDef = {
@@ -42,25 +39,15 @@ export function createAgentGraph(
                     schema: JSON.stringify(tool.schema)
                 };
 
-                // Add to memory via Lambda API
-                const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        messages: [
-                            { role: "system", content: `Tooltip: ${tool.name}. Valid JSON Schema: ${toolDef.schema}. purpose: ${tool.description}` }
-                        ],
-                        user_id: "system_tools_v1",
-                        metadata: { type: "tool_definition", tool_name: tool.name }
-                    }),
+                await addMemory({
+                    messages: [
+                        { role: "system", content: `Tooltip: ${tool.name}. Valid JSON Schema: ${toolDef.schema}. purpose: ${tool.description}` }
+                    ],
+                    user_id: "system_tools_v1",
+                    metadata: { type: "tool_definition", tool_name: tool.name },
                 });
-
-                if (!response.ok) {
-                    // Silent fail for optimization
-                    // console.warn(`[Mem0] Failed to optimize tool ${tool.name}: ${response.status}`);
-                }
             }
-            console.log(`[Mem0] Optimized ${tools.length} tool definitions into shared memory (via Lambda).`);
+            console.log(`[Mem0] Optimized ${tools.length} tool definitions into shared memory.`);
         } catch (e) {
             console.warn("[Mem0] Failed to optimize tool definitions:", e);
         }

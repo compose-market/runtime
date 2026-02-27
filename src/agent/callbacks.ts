@@ -8,36 +8,7 @@
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
 import type { ChainValues } from "@langchain/core/utils/types";
-
-const LAMBDA_API_URL = process.env.LAMBDA_API_URL || process.env.API_URL;
-if (!LAMBDA_API_URL) {
-    throw new Error("LAMBDA_API_URL or API_URL is required");
-}
-
-// HTTP client for mem0 API
-async function addMemory(params: {
-    messages: Array<{ role: string; content: string }>;
-    agent_id?: string;
-    user_id?: string;
-    run_id?: string;
-    metadata?: Record<string, unknown>;
-}): Promise<any[]> {
-    try {
-        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(params),
-        });
-        if (!response.ok) {
-            console.error(`[mem0] HTTP ${response.status}: ${await response.text()}`);
-            return [];
-        }
-        return await response.json();
-    } catch (error) {
-        console.error("[mem0] Failed to add memory:", error);
-        return [];
-    }
-}
+import { addMemory } from "../memory/mem0.js";
 
 export class Mem0CallbackHandler extends BaseCallbackHandler {
     name = "mem0_callback_handler";
