@@ -8,7 +8,7 @@ import {
     DEFAULT_MMR_CONFIG,
     DEFAULT_TEMPORAL_DECAY_CONFIG,
     EMBEDDING_DIMENSIONS,
-} from "../../src/agent/memory/types.js";
+} from "../../src/memory/types.js";
 
 describe("Memory Types - Type Validation", () => {
     describe("MemoryVector", () => {

@@ -31,7 +31,7 @@ const mockModelInvoke = vi.fn(async (messages: Array<{ content?: unknown }>) => 
     return { content: "{}" };
 });
 
-vi.mock("../../src/manowar/frameworks/langchain.js", () => ({
+vi.mock("../src/frameworks/langchain.js", () => ({
     createModel: vi.fn(() => ({
         invoke: mockModelInvoke,
     })),

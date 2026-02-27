@@ -1,11 +1,11 @@
 /**
  * Context Tests
  * 
- * INTEGRATION TESTS - Uses real API calls to api.compose.market
- * No mocks - tests actual connectivity and data.
+ * Unit tests for context helpers and context window management.
+ * Uses mocked API responses for deterministic, fast execution.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
     ContextWindowManager,
     getModelContextSpec,
@@ -20,7 +20,20 @@ import {
     estimateCost,
 } from "../src/manowar/langsmith.js";
 
-// NO MOCKS - Real API calls to api.compose.market
+function mockRegistryFetch(contextWindow = 128000) {
+    return vi.spyOn(globalThis, "fetch").mockResolvedValue({
+        ok: true,
+        json: async () => ({ contextWindow }),
+    } as Response);
+}
+
+beforeEach(() => {
+    vi.restoreAllMocks();
+});
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
 
 // ============================================================================
 // estimateCost Tests (from langsmith.ts)
@@ -77,36 +90,38 @@ describe("Constants", () => {
 });
 
 // ============================================================================
-// getModelContextSpec Tests - REAL API CALLS
+// getModelContextSpec Tests
 // ============================================================================
-describe("fetchModelContextWindow (Real API)", () => {
-    it("should fetch contextWindow from api.compose.market", async () => {
-        // Real API call - no mocks
+describe("fetchModelContextWindow", () => {
+    it("should fetch contextWindow from registry endpoint", async () => {
+        const fetchSpy = mockRegistryFetch(128000);
         const contextWindow = await fetchModelContextWindow("gpt-4o");
 
-        // Real gpt-4o has 128k context window
         expect(contextWindow).toBeGreaterThan(0);
         expect(contextWindow).toBe(128000);
-        console.log(`[TEST] Real API returned contextWindow: ${contextWindow}`);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
 
     it("should cache repeated requests", async () => {
-        // First call fetches from API
-        const first = await fetchModelContextWindow("gpt-4o-mini");
-        // Second call should use cache (faster)
-        const second = await fetchModelContextWindow("gpt-4o-mini");
+        const modelId = `gpt-4o-mini-${Date.now()}`;
+        const fetchSpy = mockRegistryFetch(64000);
+
+        const first = await fetchModelContextWindow(modelId);
+        const second = await fetchModelContextWindow(modelId);
 
         expect(first).toBe(second);
-        expect(first).toBeGreaterThan(0);
+        expect(first).toBe(64000);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
 });
 
 describe("getModelContextSpec", () => {
-    it("should return spec from real API", async () => {
-        const spec = await getModelContextSpec("gpt-4o");
+    it("should return spec from API", async () => {
+        mockRegistryFetch(128000);
+        const spec = await getModelContextSpec("gpt-4o-spec");
 
-        expect(spec.modelId).toBe("gpt-4o");
-        expect(spec.contextLength).toBe(128000); // Real API value
+        expect(spec.modelId).toBe("gpt-4o-spec");
+        expect(spec.contextLength).toBe(128000);
         expect(spec.effectiveWindow).toBe(Math.floor(128000 * 0.70));
         expect(spec.source).toBe("api");
     });
@@ -131,14 +146,16 @@ describe("ContextWindowManager", () => {
     });
 
     it("should initialize with real context from API", async () => {
+        mockRegistryFetch(128000);
         const manager = new ContextWindowManager("gpt-4o");
         await manager.initialize();
 
         const state = manager.getState();
-        expect(state.maxTokens).toBe(128000); // From mock
+        expect(state.maxTokens).toBe(128000);
     });
 
     it("should record usage and update state", async () => {
+        mockRegistryFetch(128000);
         const manager = new ContextWindowManager("gpt-4o");
         await manager.initialize();
 
@@ -156,6 +173,7 @@ describe("ContextWindowManager", () => {
     });
 
     it("should record message and track actual token count", async () => {
+        mockRegistryFetch(128000);
         const manager = new ContextWindowManager("gpt-4o");
         await manager.initialize();
 
@@ -167,6 +185,7 @@ describe("ContextWindowManager", () => {
     });
 
     it("should accumulate usage for same agent", async () => {
+        mockRegistryFetch(128000);
         const manager = new ContextWindowManager("gpt-4o");
         await manager.initialize();
 
@@ -193,6 +212,7 @@ describe("ContextWindowManager", () => {
     });
 
     it("should calculate remaining tokens", async () => {
+        mockRegistryFetch(128000);
         const manager = new ContextWindowManager("gpt-4o");
         await manager.initialize();
 

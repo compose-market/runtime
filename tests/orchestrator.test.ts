@@ -129,15 +129,15 @@ class MockContextWindowManager {
     }
 }
 
-vi.mock("../../frameworks/langchain.js", () => ({
+vi.mock("../src/frameworks/langchain.js", () => ({
     createModel: vi.fn(() => ({ invoke: mockModelInvoke })),
 }));
 
-vi.mock("../delegation.js", () => ({
+vi.mock("../src/manowar/delegation.js", () => ({
     delegatePlanStep: mockDelegatePlanStep,
 }));
 
-vi.mock("../registry.js", () => ({
+vi.mock("../src/manowar/registry.js", () => ({
     fetchManowarCard: mockFetchManowarCard,
     buildSystemPromptFromCard: vi.fn(() => "system prompt"),
     normalizeManowarCard: vi.fn((card) => card),
@@ -146,19 +146,19 @@ vi.mock("../registry.js", () => ({
     discoverAgentTools: vi.fn(async () => []),
 }));
 
-vi.mock("../embeddings.js", () => ({
+vi.mock("../src/manowar/embeddings.js", () => ({
     getRelevantContext: vi.fn(async () => []),
     recordConversationTurn: vi.fn(async () => undefined),
 }));
 
-vi.mock("../memory.js", () => ({
+vi.mock("../src/manowar/memory.js", () => ({
     addMemoryWithGraph: vi.fn(async () => []),
     performSafeWipe: vi.fn(async () => undefined),
     searchMemoryWithGraph: vi.fn(async () => ({ memories: [] })),
     getAgentReliability: vi.fn(async () => ({ avgQuality: 0, successRate: 0, totalRuns: 0 })),
 }));
 
-vi.mock("../langsmith.js", () => ({
+vi.mock("../src/manowar/langsmith.js", () => ({
     LangSmithTokenTracker: MockLangSmithTokenTracker,
     isLangSmithEnabled: vi.fn(() => false),
     recordLearning: vi.fn(async () => undefined),
@@ -166,7 +166,7 @@ vi.mock("../langsmith.js", () => ({
     getRelevantLearnings: vi.fn(async () => []),
 }));
 
-vi.mock("../checkpoint.js", () => ({
+vi.mock("../src/manowar/checkpoint.js", () => ({
     persistCheckpoints: vi.fn(async () => undefined),
     recordInsight: vi.fn(() => undefined),
     recordObservation: vi.fn(() => undefined),
@@ -174,18 +174,18 @@ vi.mock("../checkpoint.js", () => ({
     recordError: vi.fn(() => undefined),
 }));
 
-vi.mock("../run-tracker.js", () => ({
+vi.mock("../src/manowar/run-tracker.js", () => ({
     createRun: mockCreateRun,
     startRun: vi.fn(() => undefined),
     completeRun: vi.fn(() => undefined),
     failRun: vi.fn(() => undefined),
 }));
 
-vi.mock("../agentic.js", () => ({
+vi.mock("../src/manowar/agentic.js", () => ({
     isAgenticCoordinatorModel: vi.fn(() => true),
 }));
 
-vi.mock("../context.js", () => ({
+vi.mock("../src/manowar/context.js", () => ({
     ContextWindowManager: MockContextWindowManager,
 }));
 

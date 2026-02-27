@@ -44,6 +44,28 @@ import {
 } from "./frameworks/runtime.js";
 import { resolveManowarIdentifier } from "./onchain.js";
 import type { WorkflowStep, TriggerDefinition } from "./manowar/types.js";
+import {
+    addMemory as addGraphMemory,
+    cleanupExpiredMemories,
+    consolidateAgentMemories,
+    createMemoryArchive,
+    extractExecutionPatterns,
+    getAllMemories,
+    getMemoryStats,
+    getTranscriptBySessionId,
+    getTranscriptByThreadId,
+    hybridVectorSearch,
+    indexVector,
+    promotePatternToSkill,
+    rerankDocuments,
+    searchMemory as searchGraphMemory,
+    searchMemoryLayers,
+    searchVectors,
+    storeTranscript,
+    syncArchiveToPinata,
+    updateMemoryDecayScores,
+    validateExtractedPattern,
+} from "./memory/index.js";
 
 const app = express();
 const activeRunIds = new Map<string, string>();
@@ -164,6 +186,15 @@ function asyncHandler(
 function getParam(value: string | string[] | undefined): string {
     if (Array.isArray(value)) return value[0] || "";
     return value || "";
+}
+
+function isInternalRequest(req: Request): boolean {
+    const configuredSecret = process.env.MANOWAR_INTERNAL_SECRET;
+    if (!configuredSecret) {
+        return false;
+    }
+    const providedSecret = req.headers["x-manowar-internal"];
+    return typeof providedSecret === "string" && providedSecret === configuredSecret;
 }
 
 // ============================================================================
@@ -469,6 +500,357 @@ app.delete("/api/manowar/:walletAddress/triggers/:triggerId", asyncHandler(async
     const userId = req.headers["x-session-user-address"] as string | undefined;
     const ok = await deleteTriggerFromMemory(triggerId, manowarWallet, userId);
     res.json({ success: ok });
+}));
+
+// ============================================================================
+// Memory Routes (Manowar Local Authority)
+// ============================================================================
+
+app.post("/api/memory/add", asyncHandler(async (req: Request, res: Response) => {
+    const { messages, agentWallet, agent_id, userId, user_id, runId, run_id, metadata, enableGraph, enable_graph } = req.body || {};
+    const agentId = agentWallet || agent_id;
+    const user = userId || user_id;
+    const run = runId || run_id;
+    const enableGraphValue = enableGraph ?? enable_graph ?? true;
+
+    if (!Array.isArray(messages) || !agentId) {
+        res.status(400).json({ error: "messages and (agentWallet or agent_id) are required" });
+        return;
+    }
+
+    const result = await addGraphMemory({
+        messages,
+        agent_id: agentId,
+        user_id: user,
+        run_id: run,
+        metadata,
+        enable_graph: Boolean(enableGraphValue),
+    });
+
+    res.json(result);
+}));
+
+app.post("/api/memory/search", asyncHandler(async (req: Request, res: Response) => {
+    const { query, agentWallet, agent_id, userId, user_id, runId, run_id, limit, filters, enableGraph, enable_graph, rerank } = req.body || {};
+    const agentId = agentWallet || agent_id;
+    const user = userId || user_id;
+    const run = runId || run_id;
+
+    if (typeof query !== "string" || !agentId) {
+        res.status(400).json({ error: "query and (agentWallet or agent_id) are required" });
+        return;
+    }
+
+    const result = await searchGraphMemory({
+        query,
+        agent_id: agentId,
+        user_id: user,
+        run_id: run,
+        limit: typeof limit === "number" ? limit : 10,
+        filters: typeof filters === "object" && filters ? filters : undefined,
+        enable_graph: Boolean(enableGraph ?? enable_graph ?? true),
+        rerank: Boolean(rerank ?? true),
+    });
+
+    res.json(result);
+}));
+
+app.get("/api/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
+    const agentWallet = getParam(req.params.agentWallet);
+    const userId = typeof req.query.userId === "string" ? req.query.userId : undefined;
+
+    const memories = await getAllMemories({
+        agent_id: agentWallet,
+        user_id: userId,
+        enable_graph: true,
+    });
+
+    res.json(memories);
+}));
+
+app.post("/api/memory/vector-search", asyncHandler(async (req: Request, res: Response) => {
+    const {
+        query,
+        queryEmbedding,
+        agentWallet,
+        userId,
+        threadId,
+        limit,
+        threshold,
+    } = req.body || {};
+
+    if (typeof query !== "string" || typeof agentWallet !== "string") {
+        res.status(400).json({ error: "query and agentWallet are required" });
+        return;
+    }
+
+    if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
+        const results = await hybridVectorSearch({
+            query,
+            queryEmbedding,
+            agentWallet,
+            userId,
+            threadId,
+            limit: typeof limit === "number" ? limit : 10,
+            threshold: typeof threshold === "number" ? threshold : undefined,
+            applyDecay: true,
+        });
+        res.json({ results });
+        return;
+    }
+
+    const results = await searchVectors({
+        query,
+        agentWallet,
+        userId,
+        threadId,
+        limit: typeof limit === "number" ? limit : 10,
+        threshold: typeof threshold === "number" ? threshold : undefined,
+        options: {
+            temporalDecay: true,
+            rerank: true,
+            mmr: true,
+            mmrLambda: 0.7,
+        },
+    });
+
+    res.json({ results });
+}));
+
+app.post("/api/memory/vector-index", asyncHandler(async (req: Request, res: Response) => {
+    const { content, embedding, agentWallet, userId, threadId, source, metadata } = req.body || {};
+    const validSources = new Set(["session", "knowledge", "pattern", "archive", "fact"]);
+
+    if (
+        typeof content !== "string"
+        || !Array.isArray(embedding)
+        || typeof agentWallet !== "string"
+        || typeof source !== "string"
+        || !validSources.has(source)
+    ) {
+        res.status(400).json({ error: "content, embedding, agentWallet, and source are required" });
+        return;
+    }
+
+    const result = await indexVector({
+        content,
+        embedding,
+        agentWallet,
+        userId,
+        threadId,
+        source: source as "session" | "knowledge" | "pattern" | "archive" | "fact",
+        metadata,
+    });
+
+    res.json({ success: true, vectorId: result.vectorId });
+}));
+
+app.post("/api/memory/transcript-store", asyncHandler(async (req: Request, res: Response) => {
+    const { sessionId, threadId, agentWallet, userId, messages, tokenCount, summary, summaryEmbedding, metadata } = req.body || {};
+    if (!sessionId || !threadId || !agentWallet || !Array.isArray(messages) || typeof tokenCount !== "number") {
+        res.status(400).json({ error: "sessionId, threadId, agentWallet, messages, and tokenCount are required" });
+        return;
+    }
+
+    const result = await storeTranscript({
+        sessionId,
+        threadId,
+        agentWallet,
+        userId,
+        messages,
+        tokenCount,
+        summary,
+        summaryEmbedding,
+        metadata,
+    });
+
+    res.json(result);
+}));
+
+app.get("/api/memory/transcript-get/:id", asyncHandler(async (req: Request, res: Response) => {
+    const id = getParam(req.params.id);
+    const type = typeof req.query.type === "string" ? req.query.type : "sessionId";
+
+    const transcript = type === "threadId"
+        ? await getTranscriptByThreadId(id)
+        : await getTranscriptBySessionId(id);
+
+    if (!transcript) {
+        res.status(404).json({ error: "Transcript not found" });
+        return;
+    }
+
+    res.json(transcript);
+}));
+
+app.post("/api/memory/rerank", asyncHandler(async (req: Request, res: Response) => {
+    const { query, documents, topK } = req.body || {};
+    if (typeof query !== "string" || !Array.isArray(documents)) {
+        res.status(400).json({ error: "query and documents are required" });
+        return;
+    }
+
+    const results = await rerankDocuments({ query, documents, topK });
+    res.json({ results });
+}));
+
+app.post("/api/memory/layers/search", asyncHandler(async (req: Request, res: Response) => {
+    const { query, agentWallet, agent_id, userId, user_id, threadId, thread_id, layers, limit } = req.body || {};
+    const wallet = agentWallet || agent_id;
+    const user = userId || user_id;
+    const thread = threadId || thread_id;
+
+    if (typeof query !== "string" || typeof wallet !== "string") {
+        res.status(400).json({ error: "query and (agentWallet or agent_id) are required" });
+        return;
+    }
+
+    const result = await searchMemoryLayers({
+        query,
+        agentWallet: wallet,
+        userId: user,
+        threadId: thread,
+        layers: Array.isArray(layers) ? layers : ["working", "scene", "graph", "patterns", "archives", "vectors"],
+        limit: typeof limit === "number" ? limit : 5,
+    });
+
+    res.json(result);
+}));
+
+app.get("/api/memory/stats/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
+    const agentWallet = getParam(req.params.agentWallet);
+    const stats = await getMemoryStats(agentWallet);
+    res.json(stats);
+}));
+
+app.post("/internal/memory/consolidate", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { agentWallets } = req.body || {};
+    if (!Array.isArray(agentWallets)) {
+        res.status(400).json({ success: false, error: "agentWallets is required" });
+        return;
+    }
+
+    const data = await consolidateAgentMemories({ agentWallets });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/patterns/extract", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { agentWallet, timeRange, confidenceThreshold } = req.body || {};
+    if (typeof agentWallet !== "string" || !timeRange || typeof timeRange.start !== "number" || typeof timeRange.end !== "number") {
+        res.status(400).json({ success: false, error: "agentWallet and valid timeRange are required" });
+        return;
+    }
+
+    const data = await extractExecutionPatterns({
+        agentWallet,
+        timeRange,
+        confidenceThreshold: typeof confidenceThreshold === "number" ? confidenceThreshold : 0.7,
+    });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/archive/create", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { agentWallet, dateRange, options } = req.body || {};
+    if (typeof agentWallet !== "string" || !dateRange || typeof dateRange.start !== "number" || typeof dateRange.end !== "number") {
+        res.status(400).json({ success: false, error: "agentWallet and valid dateRange are required" });
+        return;
+    }
+
+    const data = await createMemoryArchive({
+        agentWallet,
+        dateRange,
+        compress: options?.compress,
+    });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/decay/update", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { halfLifeDays } = req.body || {};
+    const data = await updateMemoryDecayScores({
+        halfLifeDays: typeof halfLifeDays === "number" ? halfLifeDays : 30,
+    });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/patterns/validate", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { patternId } = req.body || {};
+    if (typeof patternId !== "string") {
+        res.status(400).json({ success: false, error: "patternId is required" });
+        return;
+    }
+
+    const data = await validateExtractedPattern({ patternId });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/patterns/promote", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { patternId, skillName, validationData } = req.body || {};
+    if (typeof patternId !== "string" || typeof skillName !== "string" || !validationData) {
+        res.status(400).json({ success: false, error: "patternId, skillName, and validationData are required" });
+        return;
+    }
+
+    const data = await promotePatternToSkill({ patternId, skillName, validationData });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/cleanup", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { olderThanDays } = req.body || {};
+    const data = await cleanupExpiredMemories({
+        olderThanDays: typeof olderThanDays === "number" ? olderThanDays : 90,
+    });
+    res.json({ success: true, data });
+}));
+
+app.post("/internal/memory/archive/sync-pinata", asyncHandler(async (req: Request, res: Response) => {
+    if (!isInternalRequest(req)) {
+        res.status(401).json({ success: false, error: "Unauthorized" });
+        return;
+    }
+
+    const { archiveId, agentWallet } = req.body || {};
+    if (typeof archiveId !== "string" || typeof agentWallet !== "string") {
+        res.status(400).json({ success: false, error: "archiveId and agentWallet are required" });
+        return;
+    }
+
+    const data = await syncArchiveToPinata({ archiveId, agentWallet });
+    res.json({ success: true, data });
 }));
 
 // ============================================================================
@@ -908,6 +1290,177 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
         runId: req.headers["x-compose-run-id"] || undefined,
     });
 });
+
+// ============================================================================
+// Desktop Agent Memory API (for local agents)
+// ============================================================================
+
+app.post("/api/desktop/memory/add", asyncHandler(async (req: Request, res: Response) => {
+    const { agentWallet, userAddress, messages, metadata, runId, run_id } = req.body || {};
+    const agentId = agentWallet;
+    const user = userAddress;
+    const run = runId || run_id || `desktop-${Date.now()}`;
+
+    if (!agentId) {
+        res.status(400).json({ error: "agentWallet is required" });
+        return;
+    }
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        res.status(400).json({ error: "messages array is required" });
+        return;
+    }
+
+    const result = await addGraphMemory({
+        messages,
+        agent_id: agentId,
+        user_id: user,
+        run_id: run,
+        metadata: typeof metadata === "object" && metadata ? metadata : undefined,
+    });
+
+    console.log(`[Desktop Memory] Added ${result.length} memories for agent ${agentId}`);
+    res.json({ success: true, count: result.length, memories: result });
+}));
+
+app.post("/api/desktop/memory/search", asyncHandler(async (req: Request, res: Response) => {
+    const { query, agentWallet, userAddress, runId, run_id, limit } = req.body || {};
+    const agentId = agentWallet;
+    const user = userAddress;
+    const run = runId || run_id;
+
+    if (!query || !agentId) {
+        res.status(400).json({ error: "query and agentWallet are required" });
+        return;
+    }
+
+    const memories = await searchGraphMemory({
+        query,
+        agent_id: agentId,
+        user_id: user,
+        run_id: run,
+        limit: typeof limit === "number" ? limit : 10,
+    });
+
+    res.json({
+        memories,
+        entities: [],
+        relations: [],
+    });
+}));
+
+app.get("/api/desktop/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
+    const agentWallet = getParam(req.params.agentWallet);
+    const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
+
+    const memories = await getAllMemories({
+        agent_id: agentWallet,
+        user_id: userAddress,
+    });
+
+    res.json({
+        agentWallet,
+        memories,
+        count: memories.length,
+    });
+}));
+
+app.post("/api/desktop/memory/context", asyncHandler(async (req: Request, res: Response) => {
+    const { agentWallet, userAddress, runId, run_id } = req.body || {};
+    const agentId = agentWallet;
+    const user = userAddress;
+    const run = runId || run_id;
+
+    if (!agentId) {
+        res.status(400).json({ error: "agentWallet is required" });
+        return;
+    }
+
+    const memories = await getAllMemories({
+        agent_id: agentId,
+        user_id: user,
+        run_id: run,
+    });
+
+    const contextText = memories
+        .slice(0, 10)
+        .map(m => m.memory)
+        .join("\n\n");
+
+    res.json({
+        context: contextText || "No prior context found.",
+        memoryCount: memories.length,
+    });
+}));
+
+// ============================================================================
+// Desktop Agent Self-Learning API
+// ============================================================================
+
+app.get("/api/desktop/skills/recommended", asyncHandler(async (req: Request, res: Response) => {
+    const { agentWallet, task } = req.query;
+    
+    if (!agentWallet) {
+        res.status(400).json({ error: "agentWallet is required" });
+        return;
+    }
+
+    const recentMemories = await searchGraphMemory({
+        query: task as string || "agent capabilities tools",
+        agent_id: agentWallet as string,
+        limit: 5,
+    });
+
+    const recommendedSkills = recentMemories.map((m) => ({
+        id: m.id,
+        name: m.memory.slice(0, 50),
+        relevance: "high",
+    }));
+
+    res.json({
+        agentWallet,
+        recommendedSkills,
+        basedOn: "execution_history",
+    });
+}));
+
+app.post("/api/desktop/skills/learn", asyncHandler(async (req: Request, res: Response) => {
+    const { agentWallet, userAddress, task, outcome, toolSequence } = req.body || {};
+
+    if (!agentWallet) {
+        res.status(400).json({ error: "agentWallet is required" });
+        return;
+    }
+
+    const runId = `learn-${Date.now()}`;
+    
+    const messages = [
+        { role: "user", content: `Task: ${task}` },
+        { role: "assistant", content: `Completed with: ${outcome}\nTools used: ${(toolSequence || []).join(" → ")}` },
+    ];
+
+    await addGraphMemory({
+        messages,
+        agent_id: agentWallet,
+        user_id: userAddress,
+        run_id: runId,
+        metadata: {
+            type: "execution_learning",
+            task,
+            outcome,
+            toolSequence: toolSequence || [],
+            timestamp: Date.now(),
+        },
+    });
+
+    console.log(`[Self-Learning] Agent ${agentWallet} learned from task: ${task}`);
+    
+    res.json({
+        success: true,
+        task,
+        learned: true,
+    });
+}));
 
 // ============================================================================
 // Temporal Integration Helpers

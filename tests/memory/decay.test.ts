@@ -4,8 +4,8 @@ import {
     calculateDecayMultiplier,
     applyTemporalDecay,
     applyDecayToResults,
-} from "../../src/agent/memory/decay.js";
-import type { TemporalDecayConfig, SearchResult } from "../../src/agent/memory/types.js";
+} from "../../src/memory/decay.js";
+import type { TemporalDecayConfig, SearchResult } from "../../src/memory/types.js";
 
 describe("Temporal Decay - Unit Tests", () => {
     describe("toDecayLambda", () => {

@@ -23,7 +23,7 @@ const mockWorkflowGetHandle = vi.fn(() => workflowHandle);
 const mockScheduleCreate = vi.fn();
 const mockScheduleGetHandle = vi.fn(() => scheduleHandle);
 
-vi.mock("../../src/manowar/temporal/client.js", () => ({
+vi.mock("../src/temporal/client.js", () => ({
     getTemporalClient: vi.fn(async () => ({
         workflow: {
             start: mockWorkflowStart,

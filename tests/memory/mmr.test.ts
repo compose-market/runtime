@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { mmrRerank } from "../../src/agent/memory/mmr.js";
-import type { SearchResult, MMRConfig } from "../../src/agent/memory/types.js";
+import { mmrRerank } from "../../src/memory/mmr.js";
+import type { SearchResult, MMRConfig } from "../../src/memory/types.js";
 
 describe("MMR Re-ranking - Unit Tests", () => {
     const createResult = (id: string, content: string, score: number): SearchResult => ({

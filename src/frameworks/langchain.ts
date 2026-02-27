@@ -5,7 +5,7 @@
  * USES NEW COMPONENT ARCHITECTURE:
  * - src/agent/graph.ts: StateGraph definition
  * - src/agent/tools.ts: Tool factories
- * - src/agent/callbacks.ts: Mem0 middleware
+ * - src/agent/callbacks.ts: Memory middleware (backed by src/memory/*)
  * - src/agent/checkpoint.ts: Persistence
  */
 

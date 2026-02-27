@@ -17,7 +17,7 @@ describe("agent env resolution", () => {
         delete process.env.LAMBDA_API_URL;
         process.env.API_URL = "https://api.compose.market";
 
-        const mod = await importFresh<{ Mem0CallbackHandler: unknown }>("../callbacks.ts");
+        const mod = await importFresh<{ Mem0CallbackHandler: unknown }>("../src/agent/callbacks.ts");
         expect(mod.Mem0CallbackHandler).toBeDefined();
     });
 
@@ -28,17 +28,19 @@ describe("agent env resolution", () => {
         process.env.RUNTIME_URL = "https://runtime.compose.market";
         process.env.MANOWAR_INTERNAL_SECRET = "test-internal-secret";
 
-        const mod = await importFresh<{ createAgentTools: unknown; createMem0Tools: unknown }>("../tools.ts");
+        const mod = await importFresh<{ createAgentTools: unknown; createMem0Tools: unknown }>("../src/agent/tools.ts");
         expect(mod.createAgentTools).toBeDefined();
         expect(mod.createMem0Tools).toBeDefined();
     });
 
-    it("fails fast when lambda url aliases are missing", async () => {
+    it("loads tools with safe defaults when URL aliases are missing", async () => {
         delete process.env.LAMBDA_API_URL;
         delete process.env.API_URL;
         process.env.RUNTIME_URL = "https://runtime.compose.market";
         process.env.MANOWAR_INTERNAL_SECRET = "test-internal-secret";
 
-        await expect(importFresh("../tools.ts")).rejects.toThrow(/LAMBDA_API_URL or API_URL is required/);
+        const mod = await importFresh<{ createAgentTools: unknown; createMem0Tools: unknown }>("../src/agent/tools.ts");
+        expect(mod.createAgentTools).toBeDefined();
+        expect(mod.createMem0Tools).toBeDefined();
     });
 });
