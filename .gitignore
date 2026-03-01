@@ -7,3 +7,6 @@ data/checkpoints
 test-deep-refactor.ts
 src/data/build-progress.json
 scripts
+
+.DS_Store
+**/.DS_Store
