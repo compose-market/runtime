@@ -1,9 +1,8 @@
 /**
  * MCP Server - Tool & Runtime Service
  *
- * Simplified MCP server focused on tool/runtime management.
- * Handles GOAT plugins and MCP tools only.
- * Agent/Framework orchestration moved to Manowar service.
+ * Runtime execution plane for tools, long-running agent/workflow execution,
+ * and the embedded moved Workflow stack.
  */
 import "dotenv/config";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -12,7 +11,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { z } from "zod";
-import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
+import { registerOrchestrationRoutes, initializeWorkflowRuntime } from "./orchestration.js";
+import { requireRuntimeInternalToken } from "./auth.js";
 import {
   getRuntimeStatus,
   listPlugins,
@@ -50,16 +50,8 @@ const corsOptions: CorsOptions = {
   allowedHeaders: [
     "Content-Type",
     "Authorization",
-    "PAYMENT-SIGNATURE",
-    "payment-signature",
-    "x-session-user-address",
-    "x-session-active",
-    "x-session-budget-remaining",
-    "x-manowar-internal",
-    "x-chain-id",
     "x-compose-run-id",
     "x-idempotency-key",
-    "x-tool-price",
     "access-control-expose-headers"
   ],
   exposedHeaders: ["*", "PAYMENT-RESPONSE", "payment-response", "x-session-id"]
@@ -107,6 +99,51 @@ function sendRuntimeError(res: Response, error: unknown, fallback: string): void
     },
   });
 }
+
+function getRequestHeader(req: Request, key: string): string | undefined {
+  const value = req.headers[key.toLowerCase()];
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  return typeof value === "string" ? value : undefined;
+}
+
+function isProtectedRuntimeRoute(pathname: string): boolean {
+  return (
+    pathname.startsWith("/goat/") ||
+    pathname.startsWith("/mcp/") ||
+    pathname.startsWith("/runtime/") ||
+    pathname.startsWith("/internal/workflow/")
+  );
+}
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!isProtectedRuntimeRoute(req.path)) {
+    next();
+    return;
+  }
+
+  if (req.path.startsWith("/internal/workflow/")) {
+    if (getRequestHeader(req, "x-runtime-internal-token") !== requireRuntimeInternalToken()) {
+      res.status(401).json({
+        error: "Missing or invalid runtime internal token",
+      });
+      return;
+    }
+    next();
+    return;
+  }
+
+  const expected = `Bearer ${requireRuntimeInternalToken()}`;
+  if (getRequestHeader(req, "authorization") !== expected) {
+    res.status(401).json({
+      error: "Missing or invalid runtime internal authorization",
+    });
+    return;
+  }
+
+  next();
+});
 
 // ============================================================================
 // MCP Inspect (Ephemeral Spawn + Tool Introspection)
@@ -247,10 +284,15 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
       goatTools: goatStatus.totalTools,
     },
     orchestration: {
-      durabilityBoundary: "manowar",
+      durabilityBoundary: "runtime",
     }
   });
 }));
+
+const orchestrationRouter = express.Router();
+registerOrchestrationRoutes(orchestrationRouter);
+initializeWorkflowRuntime();
+app.use("/internal/workflow", orchestrationRouter);
 
 app.get("/status", asyncHandler(async (req: Request, res: Response) => {
   // Alias for /health but explicitly requested by Connector
@@ -361,28 +403,6 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
   const toolName = req.params.toolName as string;
   const { args } = req.body;
 
-  // Extract payment info and internal bypass header (includes chainId from X-CHAIN-ID)
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-
-  // Handle x402 payment (with internal bypass support + multichain)
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.GOAT_EXECUTE,
-    internalSecret,
-    paymentInfo.chainId,
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  // Phase 1: Extract pricing metadata for usage logging
-  const toolPrice = req.headers["x-tool-price"] as string | undefined;
-
   const pluginIds = await getPluginIds();
   if (!pluginIds.includes(pluginId)) {
     res.status(404).json({ error: `Plugin "${pluginId}" not found` });
@@ -407,9 +427,6 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
   }
 
   const walletAddress = getWalletAddress();
-
-  // Phase 1: Log usage with pricing for analytics
-  console.log(`[usage] GOAT tool executed: ${pluginId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
 
   res.json({
     success: true,
@@ -437,13 +454,6 @@ inspectRuntime.initialize().catch(console.error);
 app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
   if (!isInspectEnabled()) {
     res.status(404).json({ error: "Not found" });
-    return;
-  }
-
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-  const expectedSecret = process.env.MANOWAR_INTERNAL_SECRET;
-  if (!internalSecret || !expectedSecret || internalSecret !== expectedSecret) {
-    res.status(403).json({ error: "Forbidden" });
     return;
   }
 
@@ -545,25 +555,6 @@ app.post("/mcp/spawn", asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
-  // Extract payment info and internal bypass header (includes chainId from X-CHAIN-ID)
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-
-  // Handle x402 payment (with internal bypass support + multichain) - use CALL price for spawning
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.MCP_TOOL_CALL,
-    internalSecret,
-    paymentInfo.chainId,
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
   try {
     const result = await getServerTools(serverId);
     console.log(`[mcp] Spawned server ${serverId} via /mcp/spawn`);
@@ -597,33 +588,8 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
   const toolName = req.params.toolName as string;
   const { args } = req.body;
 
-  // Extract payment info and internal bypass header (includes chainId from X-CHAIN-ID)
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-
-  // Handle x402 payment (with internal bypass support + multichain)
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.MCP_TOOL_CALL,
-    internalSecret,
-    paymentInfo.chainId,
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  // Phase 1: Extract pricing metadata for usage logging
-  const toolPrice = req.headers["x-tool-price"] as string | undefined;
-
   try {
     const result = await executeServerTool(serverId, toolName, args || {});
-
-    // Phase 1: Log usage with pricing for analytics
-    console.log(`[usage] MCP tool executed: ${serverId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
 
     res.json({
       success: true,
@@ -642,32 +608,10 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
 
 /**
  * POST /runtime/execute
- * Unified endpoint for tool execution from Manowar service
+ * Unified endpoint for tool execution from the API control plane and embedded runtime flows.
  */
 app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) => {
   const { source, pluginId, serverId, toolName, args } = req.body;
-
-  // Extract payment info and internal bypass header (includes chainId from X-CHAIN-ID)
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-
-  // Handle x402 payment (with internal bypass support + multichain)
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    source === 'goat' ? DEFAULT_PRICES.GOAT_EXECUTE : DEFAULT_PRICES.MCP_TOOL_CALL,
-    internalSecret,
-    paymentInfo.chainId,
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  // Phase 1: Extract pricing metadata for usage logging
-  const toolPrice = req.headers["x-tool-price"] as string | undefined;
 
   try {
     let resultData;
@@ -676,15 +620,9 @@ app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) =>
       const result = await executeGoatTool(pluginId, toolName, args || {});
       resultData = { success: result.success, result: result.result, error: result.error };
 
-      // Phase 1: Log usage
-      console.log(`[usage] GOAT runtime executed: ${pluginId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
-
     } else if (source === 'mcp') {
       const result = await executeServerTool(serverId, toolName, args || {});
       resultData = { success: true, result };
-
-      // Phase 1: Log usage
-      console.log(`[usage] MCP runtime executed: ${serverId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
 
     } else {
       res.status(400).json({ error: 'Invalid source. Must be "goat" or "mcp"' });
@@ -701,6 +639,18 @@ app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) =>
 // Error Handling
 // ==================================================================== ========
 
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next();
+    return;
+  }
+
+  res.status(404).json({
+    error: `Route not found: ${req.method} ${req.path}`,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error("[error]", err);
   res.status(500).json({
@@ -713,20 +663,74 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // Server Startup
 // ============================================================================
 
-export async function startRuntimeServer(port?: number): Promise<HttpServer> {
-  const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
-  const server = app.listen(resolvedPort, () => {
-    console.log(`[mcp] Server listening on port ${resolvedPort}`);
-    console.log(`[mcp] Runtime Service (GOAT + MCP Tools)`);
-  });
-  return server;
+type RuntimeAutostartOptions = {
+  argv?: string[];
+  env?: NodeJS.ProcessEnv;
+  moduleUrl?: string;
+};
+
+export function shouldAutoStartRuntimeServer(options: RuntimeAutostartOptions = {}): boolean {
+  const argv = options.argv || process.argv;
+  const env = options.env || process.env;
+  const modulePath = path.resolve(fileURLToPath(options.moduleUrl || import.meta.url));
+
+  if (env.COMPOSE_RUNTIME_NO_AUTOSTART === "true" || env.VITEST === "true" || env.NODE_ENV === "test") {
+    return false;
+  }
+
+  if (typeof env.NODE_APP_INSTANCE !== "undefined" || typeof env.pm_id !== "undefined" || typeof env.PM2_HOME !== "undefined") {
+    return true;
+  }
+
+  const entryArgs = argv.slice(1).filter(Boolean);
+  if (entryArgs.length === 0) {
+    return false;
+  }
+
+  const normalizedEntryArgs = entryArgs.map((value) => path.resolve(value));
+  if (normalizedEntryArgs.includes(modulePath)) {
+    return true;
+  }
+
+  const validEntryBasenames = new Set([
+    path.basename(modulePath),
+    path.basename(modulePath).replace(/\.js$/i, ".ts"),
+  ]);
+  if (normalizedEntryArgs.some((value) => validEntryBasenames.has(path.basename(value)))) {
+    return true;
+  }
+
+  const wrapperBasenames = new Set(["processcontainerfork.js", "processcontainer.js"]);
+  return normalizedEntryArgs.some((value) => wrapperBasenames.has(path.basename(value).toLowerCase()));
 }
 
-const isMainModule = process.argv[1]
-  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-  : false;
+let runtimeServerPromise: Promise<HttpServer> | null = null;
 
-if (isMainModule) {
+export async function startRuntimeServer(port?: number): Promise<HttpServer> {
+  if (runtimeServerPromise) {
+    return await runtimeServerPromise;
+  }
+
+  const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
+  runtimeServerPromise = new Promise<HttpServer>((resolve, reject) => {
+    const server = app.listen(resolvedPort);
+
+    server.once("listening", () => {
+      console.log(`[mcp] Server listening on port ${resolvedPort}`);
+      console.log(`[mcp] Runtime Service (GOAT + MCP Tools)`);
+      resolve(server);
+    });
+
+    server.once("error", (error) => {
+      runtimeServerPromise = null;
+      reject(error);
+    });
+  });
+
+  return await runtimeServerPromise;
+}
+
+if (shouldAutoStartRuntimeServer()) {
   startRuntimeServer().catch((error) => {
     console.error("[mcp] Failed to start server:", error);
     process.exit(1);
