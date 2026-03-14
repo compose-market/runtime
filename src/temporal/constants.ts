@@ -1,0 +1,34 @@
+export const WORKFLOW_TASK_QUEUE = "compose.workflow.workflow";
+export const AGENT_TASK_QUEUE = "compose.agent.workflow";
+export const WORKFLOW_ACTIVITY_TASK_QUEUE = "compose.workflow.activities";
+export const AGENT_ACTIVITY_TASK_QUEUE = "compose.agent.activities";
+export const MEMORY_ACTIVITY_TASK_QUEUE = "compose.memory.activities";
+
+export const WORKFLOW_WORKFLOW_TYPE = "executeWorkflowWorkflow";
+export const AGENT_WORKFLOW_TYPE = "executeAgentTurnWorkflow";
+
+export const MEMORY_WORKFLOW_ID_PREFIX = "memory-";
+
+export const SIGNAL_REPORT_PROGRESS = "reportProgress";
+export const SIGNAL_CANCEL_EXECUTION = "cancelExecution";
+export const SIGNAL_SET_STEP_APPROVAL = "setStepApproval";
+export const SIGNAL_PAUSE_MEMORY_WORKFLOW = "pauseMemoryWorkflow";
+export const SIGNAL_RESUME_MEMORY_WORKFLOW = "resumeMemoryWorkflow";
+
+export const QUERY_GET_RUN_STATE = "getRunState";
+export const QUERY_GET_APPROVAL_DECISION = "getApprovalDecision";
+export const QUERY_GET_AGENT_RUN_STATE = "getAgentRunState";
+export const QUERY_GET_MEMORY_WORKFLOW_STATE = "getMemoryWorkflowState";
+
+export const APPROVAL_TIMEOUT_MS = 15 * 60 * 1000;
+export const APPROVAL_POLL_INTERVAL_MS = 2000;
+export const APPROVAL_BLOCKED_POLL_INTERVAL_MS = 10000;
+
+export const MEMORY_DAILY_CONSOLIDATION_CRON = "0 2 * * *";
+export const MEMORY_WEEKLY_ARCHIVE_CRON = "0 3 * * 0";
+export const MEMORY_HOURLY_DECAY_CRON = "0 * * * *";
+export const MEMORY_SCHEDULE_CATCHUP_WINDOW_MS = 30 * 60 * 1000;
+
+export const DEFAULT_MEMORY_HALF_LIFE_DAYS = 30;
+export const DEFAULT_MEMORY_BATCH_SIZE = 50;
+export const DEFAULT_PATTERN_CONFIDENCE_THRESHOLD = 0.7;
