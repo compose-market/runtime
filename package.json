@@ -14,6 +14,14 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@langchain/core": "^1.1.32",
+    "@langchain/langgraph": "^1.2.2",
+    "@langchain/langgraph-checkpoint": "^1.0.0",
+    "@langchain/openai": "^1.2.13",
+    "@temporalio/activity": "^1.15.0",
+    "@temporalio/client": "^1.15.0",
+    "@temporalio/worker": "^1.15.0",
+    "@temporalio/workflow": "^1.15.0",
     "@crypto.com/facilitator-client": "^1.0.4",
     "@goat-sdk/adapter-vercel-ai": "^0.2.10",
     "@goat-sdk/core": "^0.5.0",
@@ -46,21 +54,26 @@
     "dotenv": "^17.3.1",
     "eventsource": "^4.1.0",
     "express": "^5.2.1",
+    "langsmith": "^0.5.10",
     "mcp-starter": "^0.1.0",
-    "simple-git": "^3.32.3",
-    "thirdweb": "^5.119.0",
-    "viem": "^2.46.3",
+    "mem0ai": "^2.3.0",
+    "mongodb": "^7.1.0",
+    "redis": "^5.11.0",
+    "simple-git": "^3.33.0",
+    "thirdweb": "^5.119.1",
+    "uuid": "^13.0.0",
+    "viem": "^2.47.2",
     "zod": "^4.3.6",
     "zod-to-json-schema": "^3.25.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "@types/node": "^25.3.3",
+    "@types/node": "^25.5.0",
     "@types/supertest": "^7.2.0",
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.0"
   }
 }

@@ -1,12 +1,12 @@
 .env
-.env.pat
+.env.*
 node_modules
 dist
-test-agent.ts
+tests
 data/checkpoints
-test-deep-refactor.ts
 src/data/build-progress.json
 scripts
+templates
 
 .DS_Store
 **/.DS_Store
