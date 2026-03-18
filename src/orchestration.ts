@@ -10,7 +10,7 @@ import {
     WORKFLOW_PRICES,
     type Workflow,
     type PaymentContext,
-} from "./workflow/index.js";
+} from "./framework/workflow/index.js";
 import {
     cancelWorkflowRun,
     createComposeRunId,
@@ -28,7 +28,7 @@ import {
     deleteTriggerFromMemory,
     registerTrigger,
     unregisterTrigger,
-} from "./workflow/triggers.js";
+} from "./framework/workflow/triggers.js";
 import {
     getTemporalWorkerRuntimeStatus,
     isTemporalWorkerReady,
@@ -38,8 +38,8 @@ import {
     ensureRegisteredWorkflowByWallet,
     markWorkflowExecuted,
     resolveAgent,
-} from "./frameworks/runtime.js";
-import type { WorkflowStep, TriggerDefinition } from "./workflow/types.js";
+} from "./framework/runtime.js";
+import type { WorkflowStep, TriggerDefinition } from "./framework/workflow/types.js";
 import {
     addMemory as addGraphMemory,
     cleanupExpiredMemories,
@@ -61,7 +61,7 @@ import {
     syncArchiveToPinata,
     updateMemoryDecayScores,
     validateExtractedPattern,
-} from "./memory/index.js";
+} from "./framework/memory/index.js";
 import { extractRuntimeSessionHeaders, isRuntimeInternalRequest } from "./auth.js";
 
 const activeRunIds = new Map<string, string>();
@@ -938,14 +938,14 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     });
 
     // ============================================================================
-    // Desktop Agent Memory API (for local agents)
+    // Local Agent Memory API (for local agents)
     // ============================================================================
 
-    app.post("/api/desktop/memory/add", asyncHandler(async (req: Request, res: Response) => {
+    app.post("/api/local/memory/add", asyncHandler(async (req: Request, res: Response) => {
         const { agentWallet, userAddress, messages, metadata, runId, run_id } = req.body || {};
         const agentId = agentWallet;
         const user = userAddress;
-        const run = runId || run_id || `desktop-${Date.now()}`;
+        const run = runId || run_id || `local-${Date.now()}`;
 
         if (!agentId) {
             res.status(400).json({ error: "agentWallet is required" });
@@ -965,11 +965,11 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             metadata: typeof metadata === "object" && metadata ? metadata : undefined,
         });
 
-        console.log(`[Desktop Memory] Added ${result.length} memories for agent ${agentId}`);
+        console.log(`[Local Memory] Added ${result.length} memories for agent ${agentId}`);
         res.json({ success: true, count: result.length, memories: result });
     }));
 
-    app.post("/api/desktop/memory/search", asyncHandler(async (req: Request, res: Response) => {
+    app.post("/api/local/memory/search", asyncHandler(async (req: Request, res: Response) => {
         const { query, agentWallet, userAddress, runId, run_id, limit } = req.body || {};
         const agentId = agentWallet;
         const user = userAddress;
@@ -995,7 +995,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         });
     }));
 
-    app.get("/api/desktop/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
+    app.get("/api/local/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
         const agentWallet = getParam(req.params.agentWallet);
         const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
 
@@ -1011,7 +1011,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         });
     }));
 
-    app.post("/api/desktop/memory/context", asyncHandler(async (req: Request, res: Response) => {
+    app.post("/api/local/memory/context", asyncHandler(async (req: Request, res: Response) => {
         const { agentWallet, userAddress, runId, run_id } = req.body || {};
         const agentId = agentWallet;
         const user = userAddress;
@@ -1040,10 +1040,10 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     // ============================================================================
-    // Desktop Agent Self-Learning API
+    // Local Agent Self-Learning API
     // ============================================================================
 
-    app.get("/api/desktop/skills/recommended", asyncHandler(async (req: Request, res: Response) => {
+    app.get("/api/local/skills/recommended", asyncHandler(async (req: Request, res: Response) => {
         const { agentWallet, task } = req.query;
 
         if (!agentWallet) {
@@ -1070,7 +1070,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         });
     }));
 
-    app.post("/api/desktop/skills/learn", asyncHandler(async (req: Request, res: Response) => {
+    app.post("/api/local/skills/learn", asyncHandler(async (req: Request, res: Response) => {
         const { agentWallet, userAddress, task, outcome, toolSequence } = req.body || {};
 
         if (!agentWallet) {
