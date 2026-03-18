@@ -5,8 +5,8 @@
  * Provides a single interface for loading and executing tools from multiple sources.
  */
 
-import { GoatRuntime, type GoatRuntimeConfig } from './runtimes/goat.js';
-import { McpRuntime, type McpRuntimeConfig } from './runtimes/mcp.js';
+import { GoatRuntime, type GoatRuntimeConfig } from './mcps/goat.js';
+import { McpRuntime, type McpRuntimeConfig } from './mcps/mcp.js';
 import type { ComposeTool, RuntimeSource } from './types.js';
 
 export interface ComposeRuntimeConfig {
