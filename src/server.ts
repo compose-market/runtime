@@ -1,8 +1,8 @@
 /**
- * MCP Server - Tool & Runtime Service
+ * Runtime Server - Tool & Runtime Service
  *
  * Runtime execution plane for tools, long-running agent/workflow execution,
- * and the embedded moved Workflow stack.
+ * and the embedded Mesh state.
  */
 import "dotenv/config";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -23,14 +23,19 @@ import {
   getWalletAddress,
   getPluginIds,
   executeGoatTool,
-} from "./runtimes/goat.js";
+} from "./mcps/goat.js";
 import {
   McpRuntime,
   McpRuntimeError,
   executeServerTool,
   getServerTools,
-} from "./runtimes/mcp.js";
-import type { ServerSpawnConfig } from "./runtimes/mcp.js";
+} from "./mcps/mcp.js";
+import type { ServerSpawnConfig } from "./mcps/mcp.js";
+import {
+  resolveRuntimeHostMode,
+  shouldInitializeWorkflowRuntime,
+} from "./framework/mode.js";
+import { createMeshRouter } from "./mesh/routes.js";
 
 const app = express();
 
@@ -269,12 +274,16 @@ function validateInspectCandidate(candidate: z.infer<typeof InspectCandidateSche
 
 app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
   const goatStatus = await getRuntimeStatus();
+  const hostMode = resolveRuntimeHostMode();
+  const temporalWorkersEnabled = shouldInitializeWorkflowRuntime();
 
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    service: "mcp-runtime",
+    service: "runtime",
     version: "0.3.0",
+    hostMode,
+    temporalWorkersEnabled,
     runtimes: {
       goat: goatStatus.initialized,
       mcp: true,
@@ -291,24 +300,32 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
 
 const orchestrationRouter = express.Router();
 registerOrchestrationRoutes(orchestrationRouter);
-initializeWorkflowRuntime();
+if (shouldInitializeWorkflowRuntime()) {
+  initializeWorkflowRuntime();
+}
 app.use("/internal/workflow", orchestrationRouter);
 
 app.get("/status", asyncHandler(async (req: Request, res: Response) => {
   // Alias for /health but explicitly requested by Connector
   // We can redirect or just reuse the logic
   const goatStatus = await getRuntimeStatus();
+  const hostMode = resolveRuntimeHostMode();
+  const temporalWorkersEnabled = shouldInitializeWorkflowRuntime();
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     service: "mcp-runtime",
     version: "0.3.0",
+    hostMode,
+    temporalWorkersEnabled,
     runtimes: {
       goat: goatStatus.initialized,
       mcp: true,
     },
   });
 }));
+
+app.use("/mesh", createMeshRouter());
 
 // ============================================================================
 // GOAT Plugin Routes (Tool Execution)
@@ -729,6 +746,8 @@ export async function startRuntimeServer(port?: number): Promise<HttpServer> {
 
   return await runtimeServerPromise;
 }
+
+export { resolveRuntimeHostMode, shouldInitializeWorkflowRuntime } from "./framework/mode.js";
 
 if (shouldAutoStartRuntimeServer()) {
   startRuntimeServer().catch((error) => {
