@@ -1,0 +1,86 @@
+import type { UploadResult } from "@filoz/synapse-sdk";
+import type { Hex } from "viem";
+import { createComposePieceMetadata, loadMeshSynapseConfig } from "./config.js";
+import { createMeshStorageContext } from "./control-plane.js";
+import type { MeshSynapseAnchorRequest, MeshSynapseAnchorResponse } from "./types.js";
+
+function assertCompleteUpload(uploadResult: UploadResult): void {
+  if (uploadResult.copies.length === 0) {
+    throw new Error("Synapse upload returned no persisted copies");
+  }
+
+  if (uploadResult.failedAttempts.length === 0) {
+    return;
+  }
+
+  const failureSummary = uploadResult.failedAttempts
+    .map((attempt) => `${attempt.role}:${attempt.providerId.toString()}:${attempt.error}`)
+    .join("; ");
+  throw new Error(`Synapse upload did not complete all requested copies: ${failureSummary}`);
+}
+
+export async function anchorMeshState(
+  request: MeshSynapseAnchorRequest,
+): Promise<MeshSynapseAnchorResponse> {
+  const config = loadMeshSynapseConfig();
+  const latestAlias = `compose-${request.haiId}:latest`;
+  const payload = new TextEncoder().encode(request.envelopeJson);
+  const pieceMetadata = createComposePieceMetadata({
+    haiId: request.haiId,
+    path: request.path,
+    agentWallet: request.agentWallet,
+    userAddress: request.userAddress,
+    deviceId: request.deviceId,
+  });
+
+  let storage = await createMeshStorageContext(request);
+  let preparation = await storage.synapse.storage.prepare({
+    context: storage.context,
+    dataSize: BigInt(payload.byteLength),
+  });
+
+  if (preparation.transaction != null) {
+    storage = await createMeshStorageContext(request, {
+      depositAmount: preparation.transaction.depositAmount,
+    });
+    preparation = await storage.synapse.storage.prepare({
+      context: storage.context,
+      dataSize: BigInt(payload.byteLength),
+    });
+
+    if (preparation.transaction != null) {
+      throw new Error(
+        `Synapse payer still requires funding after control-plane top-up (deposit=${preparation.transaction.depositAmount.toString()} approval=${String(preparation.transaction.includesApproval)})`,
+      );
+    }
+  }
+
+  const uploadResult = await storage.context.upload(payload, {
+    pieceMetadata,
+  });
+  assertCompleteUpload(uploadResult);
+
+  const primaryCopy = uploadResult.copies[0] ?? null;
+  const pieceCid = typeof uploadResult.pieceCid === "string"
+    ? uploadResult.pieceCid
+    : uploadResult.pieceCid.toString();
+
+  return {
+    haiId: request.haiId,
+    updateNumber: request.updateNumber,
+    path: request.path,
+    fileName: request.path,
+    latestAlias,
+    stateRootHash: request.stateRootHash,
+    pdpPieceCid: pieceCid,
+    pdpAnchoredAt: Date.now(),
+    payloadSize: uploadResult.size,
+    providerId: primaryCopy?.providerId?.toString() ?? storage.context.provider.id.toString(),
+    dataSetId: primaryCopy?.dataSetId?.toString() ?? storage.context.dataSetId?.toString() ?? null,
+    pieceId: primaryCopy?.pieceId?.toString() ?? null,
+    retrievalUrl: primaryCopy?.retrievalUrl ?? null,
+    payerAddress: storage.payerAddress,
+    sessionKeyExpiresAt: storage.sessionKeyExpiresAt,
+    source: config.source,
+  };
+}
