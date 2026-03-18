@@ -17,11 +17,11 @@ import {
     markAgentExecuted,
     uploadAgentKnowledge,
     listAgentKnowledgeKeys,
-    uploadBase64ToPinata,
-} from "./frameworks/runtime.js";
-import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
-import { executeAgent, streamAgent } from "./frameworks/langchain.js";
-import { executeOpenClawAgent, streamOpenClawAgent } from "./frameworks/openclaw.js";
+} from "./framework/runtime.js";
+import {
+    executeResponses,
+    streamAgent,
+} from "./framework/manowar.js";
 import { createComposeRunId, executeAgentRun, getAgentRunState } from "./temporal/service.js";
 import { extractRuntimeSessionHeaders } from "./auth.js";
 
@@ -83,11 +83,9 @@ const ChatSchema = z.object({
     composeRunId: z.string().optional(),
     workflowWallet: z.string().optional(), // Wallet address of the orchestrating workflow (if any)
     userId: z.string().optional(),
-    // New attachment format (Pinata URL)
     attachment: z.object({
-        type: z.enum(["image", "audio", "video"]),
-        url: z.string().url(),
-    }).optional(),
+        type: z.string().min(1, "attachment.type is required"),
+    }).passthrough().optional(),
     grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
     permissionPolicy: z.record(z.string(), z.enum(["allow", "ask", "deny"])).optional(),
     backpackAccounts: z.array(z.object({
@@ -99,12 +97,7 @@ const ChatSchema = z.object({
     })).optional(),
 });
 
-const MultimodalSchema = z.object({
-    prompt: z.string().min(1, "prompt is required"),
-    image: z.string().optional(), // base64 encoded image data
-    audio: z.string().optional(), // base64 encoded audio data
-    threadId: z.string().optional(),
-});
+const ResponsesSchema = z.object({}).passthrough();
 
 async function resolveAgentForRequest(identifier: string): Promise<ReturnType<typeof resolveAgent>> {
     const cached = resolveAgent(identifier);
@@ -241,101 +234,6 @@ router.post(
         }
         const userId = sessionUserAddress || bodyUserId;
 
-        // Detect if this is a multimodal model
-        const task = await detectModelTask(agent.model);
-        console.log(`[agent] Model ${agent.model} detected task: ${task}`);
-
-        // For multimodal models, use multimodal handler instead of LangChain
-        if (!isChatModel(task)) {
-            console.log(`[agent] Routing to multimodal handler for ${agent.name} (${task})`);
-            try {
-                // Pass image or audio data if provided
-                const mediaData = attachment?.url;
-                const result = await executeMultimodal(agent.model, task, message, mediaData);
-                markAgentExecuted(identifier);
-
-                // For binary outputs (image/audio/video), upload to Pinata and return URL
-                // This prevents bloating the orchestrator memory with huge base64 strings
-                let mediaUrl: string | null = null;
-                if (result.success && result.data && (result.type === "image" || result.type === "audio" || result.type === "video")) {
-                    mediaUrl = await uploadBase64ToPinata(result.data, result.type, agent.walletAddress);
-                    if (mediaUrl) {
-                        console.log(`[agent] Uploaded ${result.type} to Pinata: ${mediaUrl}`);
-                    }
-                }
-
-                res.json({
-                    agentId: agent.agentId.toString(),
-                    walletAddress: agent.walletAddress,
-                    name: agent.name,
-                    model: agent.model,
-                    task,
-                    success: result.success,
-                    type: result.type,
-                    // Return URL instead of base64 data if upload succeeded
-                    url: mediaUrl || undefined,
-                    data: mediaUrl ? undefined : result.data, // Only include base64 as fallback
-                    content: result.content,
-                    mimeType: result.mimeType,
-                    usage: result.usage,
-                    media: result.media,
-                    error: result.error,
-                    executionTime: result.executionTime,
-                });
-                return;
-            } catch (error) {
-                throw error;
-            }
-        }
-
-        // For chat/text models, use framework-specific execution
-        const framework = agent.framework || "langchain";
-
-        // Route to OpenClaw runtime if framework is openclaw
-        if (framework === "openclaw") {
-            console.log(`[agent] Routing to OpenClaw runtime for ${agent.name}`);
-
-            try {
-                const result = await executeOpenClawAgent({
-                    agentWallet: agent.walletAddress,
-                    model: agent.model,
-                    message,
-                    userId,
-                    threadId,
-                    grantedPermissions: grantedPermissions || [],
-                    permissionPolicy,
-                    backpackAccounts,
-                });
-
-                markAgentExecuted(identifier);
-
-                res.json({
-                    walletAddress: agent.walletAddress,
-                    name: agent.name,
-                    model: agent.model,
-                    framework: "openclaw",
-                    success: result.success,
-                    output: result.output,
-                    usage: result.usage,
-                    promptTokens: result.promptTokens,
-                    completionTokens: result.completionTokens,
-                    runtimeId: result.runtimeId,
-                    containerName: result.containerName,
-                    sessionKey: result.sessionKey,
-                    toolCalls: result.toolCalls,
-                });
-                return;
-            } catch (error) {
-                console.error(`[agent] OpenClaw execution failed:`, error);
-                res.status(500).json({
-                    error: error instanceof Error ? error.message : String(error),
-                    framework: "openclaw",
-                });
-                return;
-            }
-        }
-
-        // LangChain execution (default for langchain + eliza)
         let instance = resolveAgentInstance(identifier);
         if (!instance) {
             const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
@@ -387,6 +285,17 @@ router.post(
                     },
                 },
             });
+
+            if (!result.success) {
+                res.status(500).json({
+                    error: result.error || "Agent execution failed",
+                    runId: composeRunId,
+                    walletAddress: agent.walletAddress,
+                    name: agent.name,
+                    model: agent.model,
+                });
+                return;
+            }
 
             markAgentExecuted(identifier);
 
@@ -452,10 +361,9 @@ router.post(
         const userId = runtimeSession.sessionUserAddress || bodyUserId;
         const sessionActive = runtimeSession.sessionActive;
         const sessionBudgetRemaining = runtimeSession.sessionBudgetRemaining;
-        const framework = agent.framework || "langchain";
 
         let instance = resolveAgentInstance(identifier);
-        if (framework !== "openclaw" && !instance) {
+        if (!instance) {
             const ready = await warmAgentRuntimeOrTimeout(agent.walletAddress);
             if (!ready) {
                 res.status(503).json({
@@ -499,37 +407,20 @@ router.post(
                 res.write(`data: ${safeStringify(event)}\n\n`);
             }
 
-            if (framework === "openclaw") {
-                for await (const event of streamOpenClawAgent({
-                    agentWallet: agent.walletAddress,
-                    model: agent.model,
-                    message,
-                    userId,
-                    threadId,
-                    workflowWallet,
+            for await (const event of streamAgent(instance!.id, message, {
+                threadId,
+                userId,
+                workflowWallet,
+                composeRunId,
+                sessionContext: {
+                    sessionActive,
+                    sessionBudgetRemaining,
                     grantedPermissions: grantedPermissions || [],
                     permissionPolicy,
                     backpackAccounts,
-                })) {
-                    await writeEvent(event);
                 }
-            } else {
-                // Stream agent responses directly (real-time streaming)
-                for await (const event of streamAgent(instance!.id, message, {
-                    threadId,
-                    userId,
-                    workflowWallet,
-                    composeRunId,
-                    sessionContext: {
-                        sessionActive,
-                        sessionBudgetRemaining,
-                        grantedPermissions: grantedPermissions || [],
-                        permissionPolicy,
-                        backpackAccounts,
-                    }
-                })) {
-                    await writeEvent(event);
-                }
+            })) {
+                await writeEvent(event);
             }
         } catch (err) {
             res.write(`data: ${safeStringify({ type: "error", content: String(err) })}\n\n`);
@@ -541,74 +432,43 @@ router.post(
     })
 );
 
-// =============================================================================
-// Multimodal Agent Execution
-// =============================================================================
-
 /**
- * POST /agent/:id/multimodal
- * Execute multimodal inference (text-to-image, ASR, etc.) with an agent.
+ * POST /agent/:id/responses
+ * Execute a dynamic responses request with the agent's fixed model.
  */
 router.post(
-    "/:walletAddress/multimodal",
+    "/:walletAddress/responses",
     asyncHandler(async (req: Request, res: Response) => {
         const identifier = getParam(req.params.walletAddress);
-
-        // Validate agent exists
         const agent = await resolveAgentForRequest(identifier);
         if (!agent) {
             res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
-        // Parse request
-        const parseResult = MultimodalSchema.safeParse(req.body);
+        const parseResult = ResponsesSchema.safeParse(req.body);
         if (!parseResult.success) {
             res.status(400).json({
                 error: "Invalid request body",
                 details: parseResult.error.issues,
-                hint: "Body should be: { prompt: string, image?: string (base64), audio?: string (base64) }",
             });
             return;
         }
 
-        const { prompt, image, audio } = parseResult.data;
-
-        // Detect task type from model
-        const task = await detectModelTask(agent.model);
-        console.log(`[multimodal] Agent ${agent.name} model=${agent.model} task=${task}`);
-
-        // For chat models, redirect to /chat endpoint
-        if (isChatModel(task)) {
-            res.status(400).json({
-                error: `Model '${agent.model}' is a chat model. Use /agent/${identifier}/chat instead.`,
-                task,
-                suggestion: "Use /agent/:id/chat for text-generation models",
-            });
+        const requestBody = parseResult.data;
+        if (typeof requestBody.model === "string" && requestBody.model.trim().length > 0) {
+            res.status(400).json({ error: "responses request must not override the fixed agent model" });
+            return;
+        }
+        if (typeof requestBody.provider === "string" && requestBody.provider.trim().length > 0) {
+            res.status(400).json({ error: "responses request must not override provider resolution" });
             return;
         }
 
-        // Execute multimodal inference
-        // Use image for image-to-image, audio for ASR
-        const mediaData = image || audio;
-
-        console.log(`[multimodal] Executing ${agent.name} (${identifier}): "${prompt.slice(0, 50)}..." task=${task}`);
-        try {
-            const result = await executeMultimodal(agent.model, task, prompt, mediaData);
-            markAgentExecuted(identifier);
-
-            res.json({
-                agentId: agent.agentId.toString(),
-                walletAddress: agent.walletAddress,
-                name: agent.name,
-                model: agent.model,
-                task,
-                ...result,
-            });
-        } catch (error) {
-            throw error;
-        }
-    })
+        const result = await executeResponses(agent.model, requestBody);
+        markAgentExecuted(identifier);
+        res.json(result);
+    }),
 );
 
 /**
