@@ -5,8 +5,8 @@ import type {
     StepApprovalDecision,
     StepApprovalRequest,
     Workflow,
-} from "../workflow/types.js";
-import type { OrchestratorResult } from "../workflow/orchestrator.js";
+} from "../framework/workflow/types.js";
+import type { OrchestratorResult } from "../framework/workflow/orchestrator.js";
 
 export type SerializableExecutorOptions = Omit<
     Partial<ExecutorOptions>,
@@ -36,7 +36,7 @@ export interface ExecuteAgentWorkflowInput {
         threadId?: string;
         userId?: string;
         workflowWallet?: string;
-        attachment?: { type: "image" | "audio" | "video"; url: string };
+        attachment?: Record<string, unknown>;
         sessionContext?: {
             sessionActive: boolean;
             sessionBudgetRemaining: number;

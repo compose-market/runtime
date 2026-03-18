@@ -24,7 +24,7 @@ import {
     syncArchiveToPinata,
     updateMemoryDecayScores,
     validateExtractedPattern as validateExtractedPatternStore,
-} from "../../memory/index.js";
+} from "../../framework/memory/index.js";
 
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 30000;
 

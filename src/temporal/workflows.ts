@@ -8,8 +8,8 @@ import {
     workflowInfo,
     continueAsNew,
 } from "@temporalio/workflow";
-import type { ExecutionResult } from "../frameworks/langchain.js";
-import type { ExecutionRunStateProjection, SSEProgressEvent, StepApprovalDecision } from "../workflow/types.js";
+import type { ExecutionResult } from "../framework/manowar.js";
+import type { ExecutionRunStateProjection, SSEProgressEvent, StepApprovalDecision } from "../framework/workflow/types.js";
 import {
     AGENT_ACTIVITY_TASK_QUEUE,
     WORKFLOW_ACTIVITY_TASK_QUEUE,
