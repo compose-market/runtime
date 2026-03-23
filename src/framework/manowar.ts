@@ -3,7 +3,6 @@ import { HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@lan
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import type { AgentWallet } from "../agent-wallet.js";
@@ -28,6 +27,7 @@ import {
   extractTokens,
   resolveAuthoritativeTokens,
 } from "./langsmith.js";
+import { resolveRuntimeHostMode, shouldEnforceCloudPermissions } from "./mode.js";
 
 export interface BackpackConnectedAccount {
   slug: string;
@@ -40,8 +40,8 @@ export interface BackpackConnectedAccount {
 export interface AgentSessionContext {
   sessionActive: boolean;
   sessionBudgetRemaining: number;
-  grantedPermissions?: string[];
-  permissionPolicy?: Record<string, "allow" | "ask" | "deny">;
+  sessionGrants?: string[];
+  cloudPermissions?: string[];
   backpackAccounts?: BackpackConnectedAccount[];
 }
 
@@ -55,7 +55,7 @@ export interface AgentConfig {
   systemPrompt?: string;
   memory?: boolean;
   plugins?: string[];
-  userId?: string;
+  userAddress?: string;
   workflowWallet?: string;
   sessionContext?: AgentSessionContext;
 }
@@ -83,16 +83,16 @@ export interface ExecutionResult {
   executionTime: number;
 }
 
-export interface LangChainStatus {
+export interface ManowarStatus {
   ready: boolean;
-  framework: "langchain";
-  version: "0.4.0 (Modular)";
+  framework: "manowar";
+  version: "manowar";
   agentCount: number;
 }
 
 export interface ExecuteOptions {
   threadId?: string;
-  userId?: string;
+  userAddress?: string;
   workflowWallet?: string;
   attachment?: Record<string, unknown>;
   sessionContext?: AgentSessionContext;
@@ -107,8 +107,6 @@ type StreamUsageTotals = {
 };
 
 type SessionUnlock = () => void;
-type PermissionSet = Set<string>;
-
 interface AgentDnaLock {
   agentWallet: string;
   modelId: string;
@@ -129,7 +127,7 @@ interface SkillRequirement {
 
 interface SkillSpec {
   key: string;
-  source: "agent" | "shared" | "bundled" | "generated";
+  source: "agent" | "runtime" | "generated";
   path: string;
   name: string;
   description: string;
@@ -158,7 +156,7 @@ interface WorkerCronJob {
   timer: NodeJS.Timeout | null;
 }
 
-interface OpenClawWorker {
+interface AgentWorker {
   runtime: AgentInstance;
   config: AgentConfig;
   lanes: SessionLaneLock;
@@ -175,21 +173,21 @@ interface OpenClawWorker {
   skills: Map<string, SkillSpec>;
 }
 
-export interface OpenClawExecutionParams {
+export interface ManagedAgentExecutionParams {
   agentWallet: string;
   model: string;
   message: string;
-  userId?: string;
+  userAddress?: string;
   threadId?: string;
   sessionKey?: string;
   workflowWallet?: string;
-  grantedPermissions?: string[];
-  permissionPolicy?: Record<string, "allow" | "ask" | "deny">;
+  sessionGrants?: string[];
+  cloudPermissions?: string[];
   backpackAccounts?: BackpackConnectedAccount[];
   subagentDepth?: number;
 }
 
-export interface OpenClawExecutionResult {
+export interface ManagedAgentExecutionResult {
   success: boolean;
   output?: string;
   usage?: Record<string, unknown>;
@@ -210,12 +208,13 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_REFLECTION_MS = 10 * 60_000;
 const DEFAULT_CRON_SESSION_PREFIX = "cron";
 const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
-const DEFAULT_WORKSPACE_ROOT = process.env.OPENCLAW_WORKSPACE_ROOT || path.resolve(process.cwd(), "data", "openclaw");
-const SHARED_SKILLS_ROOT = process.env.OPENCLAW_SHARED_SKILLS_ROOT || path.join(os.homedir(), ".compose", "runtime", "skills");
-const BUNDLED_SKILLS_ROOT = process.env.OPENCLAW_BUNDLED_SKILLS_ROOT || path.resolve(process.cwd(), "skills");
+const LOCAL_BASE_DIR = String(process.env.COMPOSE_LOCAL_BASE_DIR || "").trim();
+const DEFAULT_WORKSPACE_ROOT = process.env.COMPOSE_AGENT_WORKSPACE_ROOT
+  || (LOCAL_BASE_DIR ? path.join(LOCAL_BASE_DIR, "agents") : path.resolve(process.cwd(), "data", "compose-agents"));
+const RUNTIME_SKILLS_ROOT = process.env.COMPOSE_RUNTIME_SKILLS_ROOT || path.resolve(process.cwd(), "skills");
 
 const agents = new Map<string, AgentInstance>();
-const workers = new Map<string, OpenClawWorker>();
+const workers = new Map<string, AgentWorker>();
 
 class SessionLaneLock {
   private tails = new Map<string, Promise<void>>();
@@ -271,20 +270,22 @@ function buildDynamicSystemContext(config: AgentConfig): string | undefined {
   lines.push("Execution context:");
   lines.push(`- Session active: ${sessionContext.sessionActive ? "yes" : "no"}`);
   lines.push(`- Session budget remaining: ${sessionContext.sessionBudgetRemaining}`);
-  if (sessionContext.grantedPermissions?.length) {
-    lines.push(`- Local authority grants: ${sessionContext.grantedPermissions.join(", ")}`);
+  if (shouldEnforceCloudPermissions() && sessionContext.cloudPermissions?.length) {
+    lines.push(`- Backpack cloud permissions: ${sessionContext.cloudPermissions.join(", ")}`);
   }
 
-  const connectedAccounts = (sessionContext.backpackAccounts || []).filter((account) => account.connected);
-  if (connectedAccounts.length > 0) {
-    lines.push("Backpack accounts currently connected for this user:");
-    connectedAccounts.forEach((account) => {
-      lines.push(`- ${account.slug}: ${account.name} (${account.status || "ACTIVE"})`);
-    });
-    lines.push("Backpack accounts are authenticated user accounts. They are distinct from MCP servers and distinct from skills.");
-    lines.push("Use the backpack tools to inspect available actions and execute them through the user's connected account.");
-  } else {
-    lines.push("No Backpack accounts are currently connected for this user.");
+  if (sessionContext.backpackAccounts) {
+    const connectedAccounts = sessionContext.backpackAccounts.filter((account) => account.connected);
+    if (connectedAccounts.length > 0) {
+      lines.push("Backpack accounts currently connected for this user:");
+      connectedAccounts.forEach((account) => {
+        lines.push(`- ${account.slug}: ${account.name} (${account.status || "ACTIVE"})`);
+      });
+      lines.push("Backpack accounts are authenticated user accounts. They are distinct from MCP servers and distinct from skills.");
+      lines.push("Use the backpack tools to inspect available actions and execute them through the user's connected account.");
+    } else {
+      lines.push("No Backpack accounts are currently connected for this user.");
+    }
   }
 
   return lines.join("\n");
@@ -314,7 +315,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     () => config.sessionContext,
     undefined,
     config.chainId,
-    config.userId,
+    config.userAddress,
   );
   const model = createModel(config.model, config.temperature ?? 0.7);
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
@@ -342,11 +343,11 @@ export function deleteAgent(id: string): boolean {
   return agents.delete(id);
 }
 
-export function getStatus(): LangChainStatus {
+export function getStatus(): ManowarStatus {
   return {
     ready: true,
-    framework: "langchain",
-    version: "0.4.0 (Modular)",
+    framework: "manowar",
+    version: "manowar",
     agentCount: agents.size,
   };
 }
@@ -395,7 +396,7 @@ async function executeAgentCore(
 ): Promise<ExecutionResult> {
   const agentWallet = agent.config.agentWallet;
   const threadId = options.threadId || `thread-${agentWallet}`;
-  const userId = options.userId;
+  const userAddress = options.userAddress;
   const workflowWallet = options.workflowWallet;
   const start = Date.now();
 
@@ -404,7 +405,7 @@ async function executeAgentCore(
       agent.config.sessionContext = options.sessionContext;
     }
 
-    const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userId, workflowWallet, options.composeRunId);
+    const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId);
     const usageTracker = new AgentMemoryTracker(agentWallet, threadId);
     const humanMessage = await buildHumanMessage(message, options);
 
@@ -414,7 +415,7 @@ async function executeAgentCore(
         composeRunId: options.composeRunId,
         threadId,
         agentWallet,
-        userId,
+        userAddress,
         workflowWallet,
       },
       async () => agent.executor.invoke({
@@ -481,13 +482,16 @@ async function* streamAgentCore(
   }
 
   const threadId = options.threadId || `thread-${agentWallet}`;
-  const userId = options.userId;
+  const userAddress = options.userAddress;
   const workflowWallet = options.workflowWallet;
-  const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userId, workflowWallet, options.composeRunId);
+  const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId);
+  const usageTracker = new AgentMemoryTracker(agentWallet, threadId);
   const humanMessage = await buildHumanMessage(message, options);
 
   const maxRecursionLimit = Math.min(parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10), 500);
   const usageTotals = createEmptyStreamUsageTotals();
+  let thinkingActive = false;
+  let lastUsageCandidate: unknown = null;
 
   try {
     const eventStream = await runWithAgentExecutionContext(
@@ -495,7 +499,7 @@ async function* streamAgentCore(
         composeRunId: options.composeRunId,
         threadId,
         agentWallet,
-        userId,
+        userAddress,
         workflowWallet,
       },
       async () => agent.executor.streamEvents({
@@ -507,26 +511,49 @@ async function* streamAgentCore(
           maxRecursionDepth: maxRecursionLimit,
           startTime: Date.now(),
         },
-        callbacks: [mem0Handler],
+        callbacks: [mem0Handler, usageTracker],
         recursionLimit: maxRecursionLimit,
         version: "v2",
       }),
     );
 
     for await (const event of eventStream) {
-      if (event.event === "on_chat_model_stream") {
+      if (event.event === "on_chat_model_start") {
+        thinkingActive = true;
+        yield {
+          type: "thinking_start",
+          message: "Thinking...",
+        };
+      } else if (event.event === "on_chat_model_stream") {
+        if (thinkingActive) {
+          thinkingActive = false;
+          yield {
+            type: "thinking_end",
+          };
+        }
         const chunk = event.data?.chunk;
         const content = normalizeMessageContent(chunk?.content);
         if (content) {
           yield { choices: [{ delta: { content } }] };
         }
       } else if (event.event === "on_chat_model_end") {
-        const tokens = extractTokens(event.data?.output ?? event.data);
-        if (tokens.totalTokens > 0) {
-          usageTotals.promptTokens += tokens.inputTokens;
-          usageTotals.completionTokens += tokens.outputTokens;
-          usageTotals.reasoningTokens += tokens.reasoningTokens;
-          usageTotals.totalTokens += tokens.totalTokens;
+        if (thinkingActive) {
+          thinkingActive = false;
+          yield {
+            type: "thinking_end",
+          };
+        }
+        lastUsageCandidate = event.data?.output ?? event.data ?? lastUsageCandidate;
+        try {
+          const tokens = extractTokens(lastUsageCandidate);
+          if (tokens.totalTokens > 0) {
+            usageTotals.promptTokens += tokens.inputTokens;
+            usageTotals.completionTokens += tokens.outputTokens;
+            usageTotals.reasoningTokens += tokens.reasoningTokens;
+            usageTotals.totalTokens += tokens.totalTokens;
+          }
+        } catch {
+          // Tool-heavy streams can emit model-end events without usage metadata.
         }
       } else if (event.event === "on_tool_start") {
         const toolInput = event.data?.input;
@@ -553,7 +580,20 @@ async function* streamAgentCore(
     }
 
     if (usageTotals.totalTokens <= 0) {
-      throw new Error("authoritative stream usage is required");
+      const trackedMetrics = usageTracker.getMetrics().contextMetrics;
+      const authoritativeTokens = resolveAuthoritativeTokens(
+        lastUsageCandidate ?? { messages: [] },
+        trackedMetrics ? {
+          inputTokens: trackedMetrics.inputTokens,
+          outputTokens: trackedMetrics.outputTokens,
+          reasoningTokens: 0,
+          totalTokens: trackedMetrics.totalTokens,
+        } : null,
+      );
+      usageTotals.promptTokens = authoritativeTokens.inputTokens;
+      usageTotals.completionTokens = authoritativeTokens.outputTokens;
+      usageTotals.reasoningTokens = authoritativeTokens.reasoningTokens;
+      usageTotals.totalTokens = authoritativeTokens.totalTokens;
     }
 
     yield {
@@ -572,7 +612,11 @@ async function* streamAgentCore(
     };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
-    yield { choices: [{ delta: { content: `\n\n[System Error: ${messageText}]\n` } }] };
+    yield {
+      type: "error",
+      content: `\n\n[System Error: ${messageText}]\n`,
+      error: messageText,
+    };
   }
 }
 
@@ -580,20 +624,19 @@ function resolveWorkerExecutionContext(
   agentWallet: string,
   message: string,
   options: ExecuteOptions,
-): { worker: OpenClawWorker; sessionKey: string; message: string } | null {
+): { worker: AgentWorker; sessionKey: string; message: string } | null {
   const worker = workers.get(agentWallet);
   if (!worker) {
     return null;
   }
 
-  worker.skills = loadSkills(worker);
   const sessionKey = parseSessionKey(agentWallet, options.threadId);
-  enforceSessionPermissions(sessionKey, options.sessionContext?.grantedPermissions);
+  enforceSessionPermissions(sessionKey, options.sessionContext?.sessionGrants);
 
   return {
     worker,
     sessionKey,
-    message: withSkillContext(message, worker.skills),
+    message,
   };
 }
 
@@ -676,6 +719,10 @@ function soulPath(agentWallet: string): string {
   return path.join(walletWorkspace(agentWallet), "SOUL.md");
 }
 
+function isLocalRuntimeHost(): boolean {
+  return resolveRuntimeHostMode() === "local";
+}
+
 function defaultDnaLock(config: AgentConfig): AgentDnaLock {
   const plugins = [...(config.plugins || [])].map((value) => value.trim().toLowerCase()).filter(Boolean).sort();
   return {
@@ -734,7 +781,7 @@ function verifyDnaLock(config: AgentConfig, lock: AgentDnaLock): void {
   }
 }
 
-function writeWorkerLog(worker: OpenClawWorker, level: "info" | "warn" | "error", message: string): void {
+function writeWorkerLog(worker: AgentWorker, level: "info" | "warn" | "error", message: string): void {
   fs.appendFileSync(worker.logsFile, `${new Date().toISOString()} [${level}] ${message}\n`, "utf8");
 }
 
@@ -815,12 +862,15 @@ function readSkillSpec(skillPath: string, source: SkillSpec["source"]): SkillSpe
   };
 }
 
-function loadSkills(worker: OpenClawWorker): Map<string, SkillSpec> {
+function loadSkills(worker: AgentWorker): Map<string, SkillSpec> {
+  if (isLocalRuntimeHost()) {
+    return new Map();
+  }
+
   const discovered = new Map<string, SkillSpec>();
   const roots: Array<{ root: string; source: SkillSpec["source"] }> = [
     { root: worker.workspaceSkillsRoot, source: "agent" },
-    { root: SHARED_SKILLS_ROOT, source: "shared" },
-    { root: BUNDLED_SKILLS_ROOT, source: "bundled" },
+    { root: RUNTIME_SKILLS_ROOT, source: "runtime" },
     { root: worker.generatedSkillsRoot, source: "generated" },
   ];
 
@@ -839,9 +889,9 @@ function loadSkills(worker: OpenClawWorker): Map<string, SkillSpec> {
 
 function skillsPrompt(skills: Map<string, SkillSpec>): string {
   const values = [...skills.values()].filter((skill) => skill.eligible);
-  if (values.length === 0) return "No eligible local skills are currently installed.";
+  if (values.length === 0) return "No eligible runtime skills are currently installed.";
   return [
-    "Eligible local skills (OpenClaw precedence: agent -> shared -> bundled -> generated):",
+    "Eligible runtime skills (precedence: agent -> runtime -> generated):",
     ...values.slice(0, 48).map((skill) => {
       const preview = skill.commands.slice(0, 3).join(", ");
       return `- ${skill.name} [${skill.key}]${preview ? ` commands: ${preview}` : ""}`;
@@ -856,10 +906,13 @@ function parseSessionKey(agentWallet: string, threadId?: string, explicit?: stri
 }
 
 function withSkillContext(message: string, skills: Map<string, SkillSpec>): string {
+  if (isLocalRuntimeHost()) {
+    return message;
+  }
   return `${skillsPrompt(skills)}\n\nUser message:\n${message}`;
 }
 
-function ensureWorkspaceFiles(config: AgentConfig): void {
+function ensureCloudWorkspaceFiles(config: AgentConfig): void {
   const root = walletWorkspace(config.agentWallet);
   ensureDir(root);
   ensureDir(path.join(root, "skills"));
@@ -912,6 +965,16 @@ function ensureWorkspaceFiles(config: AgentConfig): void {
   }
 }
 
+function ensureLocalWorkspace(config: AgentConfig): void {
+  const root = walletWorkspace(config.agentWallet);
+  if (!fileExists(root)) {
+    throw new Error(`Local agent workspace is missing for ${config.agentWallet}`);
+  }
+  if (!fileExists(dnaPath(config.agentWallet))) {
+    throw new Error(`Local agent DNA is missing for ${config.agentWallet}`);
+  }
+}
+
 function parseSubagentDepth(sessionKey: string): number {
   const match = sessionKey.match(/subagent:depth:(\d+)/i);
   if (!match) return 0;
@@ -919,7 +982,7 @@ function parseSubagentDepth(sessionKey: string): number {
   return Number.isFinite(value) ? value : 0;
 }
 
-async function runHeartbeat(worker: OpenClawWorker): Promise<void> {
+async function runHeartbeat(worker: AgentWorker): Promise<void> {
   const file = heartbeatPath(worker.runtime.id);
   if (!fileExists(file)) return;
   const prompt = fs.readFileSync(file, "utf8").trim();
@@ -928,7 +991,7 @@ async function runHeartbeat(worker: OpenClawWorker): Promise<void> {
   await worker.lanes.run(`agent:${worker.runtime.id}:session:main`, async () => {
     const result = await executeAgent(worker.runtime.id, prompt, {
       threadId: `heartbeat-${worker.runtime.id}`,
-      userId: worker.config.userId,
+      userAddress: worker.config.userAddress,
       workflowWallet: worker.config.workflowWallet,
       sessionContext: {
         sessionActive: true,
@@ -946,18 +1009,20 @@ async function runHeartbeat(worker: OpenClawWorker): Promise<void> {
   });
 }
 
-async function appendSkillAudit(worker: OpenClawWorker, record: SkillAuditRecord): Promise<void> {
+async function appendSkillAudit(worker: AgentWorker, record: SkillAuditRecord): Promise<void> {
+  if (isLocalRuntimeHost()) return;
   const auditPath = path.join(worker.generatedSkillsRoot, "audit.jsonl");
   ensureDir(path.dirname(auditPath));
   fs.appendFileSync(auditPath, `${JSON.stringify(record)}\n`, "utf8");
 }
 
-async function runReflection(worker: OpenClawWorker): Promise<void> {
+async function runReflection(worker: AgentWorker): Promise<void> {
+  if (isLocalRuntimeHost()) return;
   try {
     await searchMemoryLayers({
       query: "recent successful tool sequences and outcomes",
       agentWallet: worker.runtime.id,
-      userId: worker.config.userId,
+      userAddress: worker.config.userAddress,
       layers: ["patterns", "working", "scene"],
       limit: 5,
     });
@@ -1033,7 +1098,20 @@ async function runReflection(worker: OpenClawWorker): Promise<void> {
   }
 }
 
-function startBackgroundLoops(worker: OpenClawWorker): void {
+function startBackgroundLoops(worker: AgentWorker): void {
+  if (worker.heartbeatTimer) {
+    clearInterval(worker.heartbeatTimer);
+    worker.heartbeatTimer = null;
+  }
+  if (worker.reflectionTimer) {
+    clearInterval(worker.reflectionTimer);
+    worker.reflectionTimer = null;
+  }
+
+  if (isLocalRuntimeHost()) {
+    return;
+  }
+
   if (worker.heartbeatTimer) clearInterval(worker.heartbeatTimer);
   worker.heartbeatTimer = setInterval(() => {
     void runHeartbeat(worker).catch((error) => {
@@ -1049,7 +1127,7 @@ function startBackgroundLoops(worker: OpenClawWorker): void {
   }, DEFAULT_REFLECTION_MS);
 }
 
-function stopBackgroundLoops(worker: OpenClawWorker): void {
+function stopBackgroundLoops(worker: AgentWorker): void {
   if (worker.heartbeatTimer) {
     clearInterval(worker.heartbeatTimer);
     worker.heartbeatTimer = null;
@@ -1067,32 +1145,33 @@ function stopBackgroundLoops(worker: OpenClawWorker): void {
   worker.cronJobs.clear();
 }
 
-function toExecutionOptions(params: OpenClawExecutionParams): ExecuteOptions {
+function toExecutionOptions(params: ManagedAgentExecutionParams): ExecuteOptions {
   return {
     threadId: params.threadId,
-    userId: params.userId,
+    userAddress: params.userAddress,
     workflowWallet: params.workflowWallet,
     sessionContext: {
       sessionActive: true,
       sessionBudgetRemaining: Number.MAX_SAFE_INTEGER,
-      grantedPermissions: params.grantedPermissions || [],
-      permissionPolicy: params.permissionPolicy,
+      sessionGrants: params.sessionGrants,
+      cloudPermissions: params.cloudPermissions,
       backpackAccounts: params.backpackAccounts,
     },
   };
 }
 
-function normalizePermissions(grantedPermissions?: string[]): PermissionSet {
-  return new Set((grantedPermissions || []).map((item) => item.trim().toLowerCase()).filter(Boolean));
+type PermissionSet = Set<string>;
+
+function normalizePermissions(sessionGrants?: string[]): PermissionSet {
+  return new Set((sessionGrants || []).map((item) => item.trim().toLowerCase()).filter(Boolean));
 }
 
 function hasPermission(grants: PermissionSet, key: string): boolean {
-  if (grants.has("*") || grants.has(key)) return true;
-  return key.startsWith("fs.") && grants.has("filesystem");
+  return grants.has("*") || grants.has(key);
 }
 
-function enforceSessionPermissions(sessionKey: string, grantedPermissions?: string[]): void {
-  const grants = normalizePermissions(grantedPermissions);
+function enforceSessionPermissions(sessionKey: string, sessionGrants?: string[]): void {
+  const grants = normalizePermissions(sessionGrants);
   const requiredByPrefix = [
     { prefix: "cron:", permission: "runtime.cron" },
     { prefix: "subagent:", permission: "runtime.subagent" },
@@ -1105,23 +1184,29 @@ function enforceSessionPermissions(sessionKey: string, grantedPermissions?: stri
   }
 }
 
-function ensureWorker(agentWallet: string): OpenClawWorker {
+function ensureWorker(agentWallet: string): AgentWorker {
   const worker = workers.get(agentWallet);
   if (!worker) {
-    throw new Error(`OpenClaw worker not found for ${agentWallet}`);
+    throw new Error(`Managed agent worker not found for ${agentWallet}`);
   }
   return worker;
 }
 
-export async function createOpenClawAgent(config: AgentConfig): Promise<AgentInstance> {
+export async function createManagedAgent(config: AgentConfig): Promise<AgentInstance> {
   const existing = workers.get(config.agentWallet);
   if (existing) return existing.runtime;
 
-  ensureWorkspaceFiles(config);
+  if (isLocalRuntimeHost()) {
+    ensureLocalWorkspace(config);
+  } else {
+    ensureCloudWorkspaceFiles(config);
+  }
   const root = walletWorkspace(config.agentWallet);
-  ensureDir(root);
-  ensureDir(path.join(root, "skills"));
-  ensureDir(path.join(root, "skills", "generated"));
+  if (!isLocalRuntimeHost()) {
+    ensureDir(root);
+    ensureDir(path.join(root, "skills"));
+    ensureDir(path.join(root, "skills", "generated"));
+  }
 
   const dnaLock = readDnaLock(config);
   verifyDnaLock(config, dnaLock);
@@ -1136,11 +1221,11 @@ export async function createOpenClawAgent(config: AgentConfig): Promise<AgentIns
     fs.writeFileSync(logsFile, "", "utf8");
   }
 
-  const worker: OpenClawWorker = {
+  const worker: AgentWorker = {
     runtime,
     config,
     lanes: new SessionLaneLock(),
-    runtimeId: `openclaw-${config.agentWallet}-${Date.now()}`,
+    runtimeId: `compose-agent-${config.agentWallet}-${Date.now()}`,
     createdAt: Date.now(),
     workspaceRoot: root,
     workspaceSkillsRoot: path.join(root, "skills"),
@@ -1160,12 +1245,15 @@ export async function createOpenClawAgent(config: AgentConfig): Promise<AgentIns
   return runtime;
 }
 
-export function scheduleOpenClawCron(input: {
+export function scheduleManagedAgentCron(input: {
   agentWallet: string;
   id: string;
   everyMs: number;
   message: string;
 }): void {
+  if (isLocalRuntimeHost()) {
+    throw new Error("Managed cron scheduling is cloud-only");
+  }
   const worker = ensureWorker(input.agentWallet);
   const everyMs = Math.max(1_000, input.everyMs);
   const sessionKey = `${DEFAULT_CRON_SESSION_PREFIX}:${input.id}`;
@@ -1178,14 +1266,14 @@ export function scheduleOpenClawCron(input: {
     message: input.message,
     sessionKey,
     timer: setInterval(() => {
-      void executeOpenClawAgent({
+      void executeManagedAgent({
         agentWallet: input.agentWallet,
         model: worker.config.model || "",
         message: input.message,
         sessionKey,
-        userId: worker.config.userId,
+        userAddress: worker.config.userAddress,
         workflowWallet: worker.config.workflowWallet,
-        grantedPermissions: ["runtime.cron", "runtime.main"],
+        sessionGrants: ["runtime.cron", "runtime.main"],
       }).catch((error) => {
         writeWorkerLog(worker, "warn", `cron ${input.id} failed: ${error instanceof Error ? error.message : String(error)}`);
       });
@@ -1196,7 +1284,7 @@ export function scheduleOpenClawCron(input: {
   writeWorkerLog(worker, "info", `cron scheduled id=${input.id} everyMs=${everyMs}`);
 }
 
-export function unscheduleOpenClawCron(agentWallet: string, jobId: string): void {
+export function unscheduleManagedAgentCron(agentWallet: string, jobId: string): void {
   const worker = ensureWorker(agentWallet);
   const job = worker.cronJobs.get(jobId);
   if (!job) return;
@@ -1205,7 +1293,7 @@ export function unscheduleOpenClawCron(agentWallet: string, jobId: string): void
   writeWorkerLog(worker, "info", `cron unscheduled id=${jobId}`);
 }
 
-export async function executeOpenClawAgent(params: OpenClawExecutionParams): Promise<OpenClawExecutionResult> {
+export async function executeManagedAgent(params: ManagedAgentExecutionParams): Promise<ManagedAgentExecutionResult> {
   const worker = ensureWorker(params.agentWallet);
   worker.skills = loadSkills(worker);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
@@ -1214,7 +1302,7 @@ export async function executeOpenClawAgent(params: OpenClawExecutionParams): Pro
     throw new Error(`Subagent depth exceeded (${subDepth} > ${DEFAULT_SUBAGENT_MAX_DEPTH})`);
   }
 
-  enforceSessionPermissions(sessionKey, params.grantedPermissions);
+  enforceSessionPermissions(sessionKey, params.sessionGrants);
   const execution = await worker.lanes.run(sessionKey, async () => {
     return executeAgent(params.agentWallet, withSkillContext(params.message, worker.skills), toExecutionOptions(params));
   });
@@ -1241,7 +1329,7 @@ export async function executeOpenClawAgent(params: OpenClawExecutionParams): Pro
   };
 }
 
-export async function* streamOpenClawAgent(params: OpenClawExecutionParams): AsyncGenerator<unknown> {
+export async function* streamManagedAgent(params: ManagedAgentExecutionParams): AsyncGenerator<unknown> {
   const worker = ensureWorker(params.agentWallet);
   worker.skills = loadSkills(worker);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
@@ -1250,7 +1338,7 @@ export async function* streamOpenClawAgent(params: OpenClawExecutionParams): Asy
     throw new Error(`Subagent depth exceeded (${subDepth} > ${DEFAULT_SUBAGENT_MAX_DEPTH})`);
   }
 
-  enforceSessionPermissions(sessionKey, params.grantedPermissions);
+  enforceSessionPermissions(sessionKey, params.sessionGrants);
   const unlock = await worker.lanes.acquire(sessionKey);
   try {
     for await (const chunk of streamAgent(params.agentWallet, withSkillContext(params.message, worker.skills), toExecutionOptions(params))) {
@@ -1262,28 +1350,30 @@ export async function* streamOpenClawAgent(params: OpenClawExecutionParams): Asy
   }
 }
 
-export async function executeOpenClawSubagent(input: {
+export async function executeManagedSubagent(input: {
   agentWallet: string;
   model: string;
   message: string;
   parentSessionKey: string;
   subagentId: string;
   depth: number;
-  grantedPermissions?: string[];
-}): Promise<OpenClawExecutionResult> {
+  sessionGrants?: string[];
+  cloudPermissions?: string[];
+}): Promise<ManagedAgentExecutionResult> {
   if (input.depth > DEFAULT_SUBAGENT_MAX_DEPTH) {
     throw new Error(`Subagent depth exceeded (${input.depth} > ${DEFAULT_SUBAGENT_MAX_DEPTH})`);
   }
-  return executeOpenClawAgent({
+  return executeManagedAgent({
     agentWallet: input.agentWallet,
     model: input.model,
     message: input.message,
     sessionKey: `subagent:${input.subagentId}:depth:${input.depth}:parent:${input.parentSessionKey}`,
-    grantedPermissions: [...(input.grantedPermissions || []), "runtime.subagent", "runtime.main"],
+    sessionGrants: [...(input.sessionGrants || []), "runtime.subagent", "runtime.main"],
+    cloudPermissions: input.cloudPermissions,
   });
 }
 
-export function getOpenClawWorkerStatus(agentWallet: string): {
+export function getManagedAgentStatus(agentWallet: string): {
   running: boolean;
   runtimeId?: string;
   createdAt?: number;
@@ -1306,7 +1396,7 @@ export function getOpenClawWorkerStatus(agentWallet: string): {
   };
 }
 
-export function stopOpenClawAgent(agentWallet: string): void {
+export function stopManagedAgent(agentWallet: string): void {
   const worker = workers.get(agentWallet);
   if (!worker) return;
   stopBackgroundLoops(worker);
@@ -1314,7 +1404,7 @@ export function stopOpenClawAgent(agentWallet: string): void {
   workers.delete(agentWallet);
 }
 
-export function getOpenClawWorkerLogs(agentWallet: string, maxLines: number = 200): string[] {
+export function getManagedAgentLogs(agentWallet: string, maxLines: number = 200): string[] {
   const worker = workers.get(agentWallet);
   const logsPath = worker?.logsFile || path.join(walletWorkspace(agentWallet), "runtime.log");
   if (!fileExists(logsPath)) return [];
