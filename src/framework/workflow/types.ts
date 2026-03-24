@@ -191,7 +191,7 @@ export interface AgentCard {
     /** Model ID for inference (used to fetch contextWindow from API) */
     model: string;
     /** Agent runtime framework */
-    framework?: "eliza" | "langchain" | "openclaw";
+    framework?: "manowar";
     /** License price in USDC (6 decimals) */
     licensePrice: string;
     /** License supply cap (0 = infinite) */

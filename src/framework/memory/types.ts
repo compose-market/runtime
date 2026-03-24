@@ -332,7 +332,7 @@ export interface MemoryStats {
 export interface LayeredSearchParams {
     query: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     layers: Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors">;
     limit?: number;

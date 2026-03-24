@@ -63,7 +63,7 @@ export async function addMemory(params: MemoryAddParams): Promise<MemoryItem[]> 
         });
         await invalidateMemoryScope({
             agentWallet: params.agent_id,
-            userId: params.user_id,
+            userAddress: params.user_id,
             threadId: params.run_id,
         });
         return result as MemoryItem[];
@@ -98,7 +98,7 @@ export async function addKnowledge(params: KnowledgeAddParams): Promise<MemoryIt
         });
         await invalidateMemoryScope({
             agentWallet: params.agent_id,
-            userId: params.user_id,
+            userAddress: params.user_id,
         });
         return result as MemoryItem[];
     } catch (error) {

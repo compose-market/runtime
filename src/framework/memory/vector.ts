@@ -221,7 +221,7 @@ export async function indexVector(params: VectorIndexParams): Promise<{ vectorId
 
     await invalidateMemoryScope({
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userId,
         threadId: params.threadId,
     });
 

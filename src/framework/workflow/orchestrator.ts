@@ -44,7 +44,6 @@ import {
     failRun,
     type TrackedRun,
 } from "./run-tracker.js";
-import { isAgenticCoordinatorModel } from "./agentic.js";
 import type { TokenUsage } from "./types.js";
 import { createModel } from "../manowar.js";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
@@ -96,11 +95,6 @@ export class WorkflowOrchestrator {
         this.workflow = workflow;
         this.coordinatorModel = coordinatorModel;
         this.contextManager = new ContextWindowManager(coordinatorModel);
-
-        // Validate coordinator model against approved agentic models
-        if (!isAgenticCoordinatorModel(coordinatorModel)) {
-            console.warn(`[orchestrator] Model "${coordinatorModel}" is not in the approved agentic coordinator list. Performance may vary.`);
-        }
     }
 
     private emitRunState(

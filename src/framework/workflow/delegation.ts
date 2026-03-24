@@ -56,8 +56,8 @@ export interface DelegationOptions {
     threadId?: string;
     /** Workflow wallet */
     workflowWallet?: string;
-    /** Browser/device permissions granted in parent session */
-    grantedPermissions?: string[];
+    /** Backpack/browser cloud permissions granted in parent session */
+    cloudPermissions?: string[];
     /** Whether the parent request has an active authorized session */
     sessionActive?: boolean;
     /** Budget available to the parent request in USDC wei */
@@ -138,7 +138,7 @@ export async function callAgent(
                 message,
                 threadId: options.threadId,
                 workflowWallet: options.workflowWallet,
-                grantedPermissions: options.grantedPermissions || [],
+                ...(options.cloudPermissions ? { cloudPermissions: options.cloudPermissions } : {}),
                 composeRunId: options.composeRunId,
                 userId: options.userId,
             }),

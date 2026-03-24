@@ -39,7 +39,7 @@ export function resolveMemoryRedisConnectionConfig(env: NodeJS.ProcessEnv = proc
 
 export interface MemoryScope {
     agentWallet?: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
 }
 
@@ -48,13 +48,13 @@ function normalizeScopePart(value: string | undefined): string {
     return encodeURIComponent(value.trim().toLowerCase());
 }
 
-function buildScopeKey(scope: { agentWallet: string; userId?: string; threadId?: string }): string {
-    return `a:${normalizeScopePart(scope.agentWallet)}:u:${normalizeScopePart(scope.userId)}:t:${normalizeScopePart(scope.threadId)}`;
+function buildScopeKey(scope: { agentWallet: string; userAddress?: string; threadId?: string }): string {
+    return `a:${normalizeScopePart(scope.agentWallet)}:u:${normalizeScopePart(scope.userAddress)}:t:${normalizeScopePart(scope.threadId)}`;
 }
 
 function buildScopePattern(scope: MemoryScope): string {
     const agentPart = scope.agentWallet ? normalizeScopePart(scope.agentWallet) : "*";
-    const userPart = scope.userId ? normalizeScopePart(scope.userId) : "*";
+    const userPart = scope.userAddress ? normalizeScopePart(scope.userAddress) : "*";
     const threadPart = scope.threadId ? normalizeScopePart(scope.threadId) : "*";
     return `a:${agentPart}:u:${userPart}:t:${threadPart}`;
 }
@@ -85,7 +85,7 @@ export function getVectorQueryCacheKey(input: {
 export function getLayerQueryCacheKey(input: {
     query: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     layers: string[];
     limit?: number;

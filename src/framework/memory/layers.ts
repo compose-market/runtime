@@ -80,10 +80,10 @@ function summarizeArchive(record: MemoryArchive): Record<string, unknown> {
     };
 }
 
-export function buildWorkingLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userId" | "threadId">): Record<string, unknown> {
+export function buildWorkingLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userAddress" | "threadId">): Record<string, unknown> {
     const filter: Record<string, unknown> = { agentWallet: params.agentWallet };
-    if (params.userId) {
-        filter.userId = params.userId;
+    if (params.userAddress) {
+        filter.userId = params.userAddress;
     }
     if (params.threadId) {
         filter.threadId = params.threadId;
@@ -91,10 +91,10 @@ export function buildWorkingLayerFilter(params: Pick<LayeredSearchParams, "agent
     return filter;
 }
 
-export function buildSceneLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userId" | "threadId">): Record<string, unknown> {
+export function buildSceneLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userAddress" | "threadId">): Record<string, unknown> {
     const filter: Record<string, unknown> = { agentWallet: params.agentWallet };
-    if (params.userId) {
-        filter.userId = params.userId;
+    if (params.userAddress) {
+        filter.userId = params.userAddress;
     }
     if (params.threadId) {
         filter.threadId = params.threadId;
@@ -108,7 +108,7 @@ export async function searchMemoryLayers(params: LayeredSearchParams): Promise<L
     const cacheKey = getLayerQueryCacheKey({
         query: params.query,
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
         layers,
         limit,
@@ -157,7 +157,7 @@ export async function searchMemoryLayers(params: LayeredSearchParams): Promise<L
         const memories = await searchMemory({
             query: params.query,
             agent_id: params.agentWallet,
-            user_id: params.userId,
+            user_id: params.userAddress,
             run_id: params.threadId,
             limit,
             enable_graph: true,
@@ -196,7 +196,7 @@ export async function searchMemoryLayers(params: LayeredSearchParams): Promise<L
         const vectors = await searchVectors({
             query: params.query,
             agentWallet: params.agentWallet,
-            userId: params.userId,
+            userId: params.userAddress,
             threadId: params.threadId,
             limit,
             options: {

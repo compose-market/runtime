@@ -44,7 +44,7 @@ export async function storeTranscript(params: TranscriptStoreParams): Promise<{ 
 
     await invalidateMemoryScope({
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userId,
         threadId: params.threadId,
     });
 
