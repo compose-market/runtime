@@ -10,20 +10,26 @@ import type { Serialized } from "@langchain/core/load/serializable";
 import type { ChainValues } from "@langchain/core/utils/types";
 import { addMemory } from "../memory/mem0.js";
 
+function persistMemoryInBackground(payload: Parameters<typeof addMemory>[0], context: string): void {
+    addMemory(payload).catch((error: Error) => {
+        console.error(`[Mem0Handler] ${context} save failed:`, error);
+    });
+}
+
 export class Mem0CallbackHandler extends BaseCallbackHandler {
     name = "mem0_callback_handler";
     private agentWallet: string;
     private threadId: string;
-    private userId?: string;
+    private userAddress?: string;
     private workflowWallet?: string;
     private composeRunId?: string;
     private toolRunNames = new Map<string, string>();
 
-    constructor(agentWallet: string, threadId: string, userId?: string, workflowWallet?: string, composeRunId?: string) {
+    constructor(agentWallet: string, threadId: string, userAddress?: string, workflowWallet?: string, composeRunId?: string) {
         super();
         this.agentWallet = agentWallet;
         this.threadId = threadId;
-        this.userId = userId;
+        this.userAddress = userAddress;
         this.workflowWallet = workflowWallet;
         this.composeRunId = composeRunId;
     }
@@ -50,13 +56,13 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
 
         console.log(`[Mem0Handler] Capturing tool start: ${toolName}`);
 
-        await addMemory({
+        persistMemoryInBackground({
             messages: [
                 { role: "system", content: `Tool '${toolName}' started.` },
                 { role: "user", content: `Input: ${typeof input === 'string' ? input : JSON.stringify(input)}` }
             ],
             agent_id: this.agentWallet,
-            user_id: this.userId,
+            user_id: this.userAddress,
             run_id: this.threadId,
             metadata: {
                 type: "tool_execution",
@@ -65,7 +71,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 workflow_wallet: this.workflowWallet,
                 compose_run_id: this.composeRunId,
             }
-        });
+        }, "tool start");
     }
 
     /**
@@ -75,13 +81,13 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
         const toolName = this.toolRunNames.get(runId) || "unknown_tool";
         this.toolRunNames.delete(runId);
 
-        await addMemory({
+        persistMemoryInBackground({
             messages: [
                 { role: "system", content: `Tool '${toolName}' completed.` },
                 { role: "assistant", content: `Output: ${serializeToolPayload(output)}` },
             ],
             agent_id: this.agentWallet,
-            user_id: this.userId,
+            user_id: this.userAddress,
             run_id: this.threadId,
             metadata: {
                 type: "tool_output",
@@ -90,7 +96,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 workflow_wallet: this.workflowWallet,
                 compose_run_id: this.composeRunId,
             },
-        });
+        }, "tool end");
     }
 
     /**
@@ -103,12 +109,12 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
 
             if (content && typeof content === "string") {
                 console.log(`[Mem0Handler] Capturing chain output`);
-                await addMemory({
+                persistMemoryInBackground({
                     messages: [
                         { role: "assistant", content: content }
                     ],
                     agent_id: this.agentWallet,
-                    user_id: this.userId,
+                    user_id: this.userAddress,
                     run_id: this.threadId,
                     metadata: {
                         type: "agent_response",
@@ -116,7 +122,7 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                         workflow_wallet: this.workflowWallet,
                         compose_run_id: this.composeRunId,
                     }
-                });
+                }, "chain end");
             }
         }
     }
@@ -140,18 +146,17 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
             }
 
             if (userMsg) {
-                // Don't await this to avoid blocking latency
-                addMemory({
+                persistMemoryInBackground({
                     messages: [{ role: "user", content: userMsg }],
                     agent_id: this.agentWallet,
-                    user_id: this.userId,
+                    user_id: this.userAddress,
                     run_id: this.threadId,
                     metadata: {
                         type: "user_message",
                         workflow_wallet: this.workflowWallet,
                         compose_run_id: this.composeRunId,
                     }
-                }).catch((err: Error) => console.error("[Mem0Handler] Background save failed:", err));
+                }, "chain start");
             }
         }
     }

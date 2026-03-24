@@ -1,22 +1,22 @@
 /**
  * Agent Tool Factories
  * 
- * Creates LangChain tools by calling MCP service via HTTP for tool execution.
+ * Creates LangChain tools from the in-process GOAT and MCP runtimes.
  */
 
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { ComposeTool } from "../../types.js";
 import type { AgentWallet } from "../../agent-wallet.js";
-import { createHash } from "crypto";
 import { getAgentExecutionContext } from "./context.js";
 import { addMemory, searchMemory, searchMemoryLayers } from "../memory/index.js";
+import { shouldEnforceCloudPermissions } from "../mode.js";
 import { isLocalMeshPublicationAvailable, queueLocalMeshPublication } from "../../mesh/publication-queue.js";
+import { executeGoatTool, getPlugin } from "../../mcps/goat.js";
+import { executeServerTool, getServerTools } from "../../mcps/mcp.js";
 import {
     buildApiInternalHeaders,
     requireApiInternalUrl,
-    requireRuntimeInternalToken,
-    requireRuntimeServiceUrl,
 } from "../../auth.js";
 
 interface ToolExecutionContext {
@@ -24,19 +24,14 @@ interface ToolExecutionContext {
     getThreadId?: () => string | undefined;
 }
 
-type PermissionDecision = "allow" | "ask" | "deny";
-
-type PermissionKey =
-    | "shell"
-    | "fs.read"
-    | "fs.write"
-    | "fs.edit"
-    | "fs.delete"
+type CloudPermissionKey =
+    | "filesystem"
     | "camera"
     | "microphone"
-    | "network";
+    | "geolocation"
+    | "clipboard"
+    | "notifications";
 
-type PermissionPolicy = Partial<Record<PermissionKey, PermissionDecision>>;
 type BackpackConnectedAccount = {
     slug: string;
     name: string;
@@ -47,8 +42,7 @@ type BackpackConnectedAccount = {
 type AgentSessionContext = {
     sessionActive: boolean;
     sessionBudgetRemaining: number;
-    grantedPermissions?: string[];
-    permissionPolicy?: PermissionPolicy;
+    cloudPermissions?: string[];
     backpackAccounts?: BackpackConnectedAccount[];
 };
 type SessionContextProvider = AgentSessionContext | (() => AgentSessionContext | undefined) | undefined;
@@ -90,27 +84,6 @@ async function fetchWithRetry(url: string, init: RequestInit): Promise<Response>
     }
 
     throw (lastError instanceof Error ? lastError : new Error("Tool request failed after retries"));
-}
-
-function buildCorrelationHeaders(
-    context: ToolExecutionContext | undefined,
-    scope: string,
-    payload?: unknown,
-): Record<string, string> {
-    const currentContext = getAgentExecutionContext();
-    const composeRunId = context?.getComposeRunId?.() || currentContext?.composeRunId;
-    if (!composeRunId) {
-        return {};
-    }
-
-    const serialized = JSON.stringify(payload ?? {});
-    const hash = createHash("sha256").update(serialized).digest("hex").slice(0, 20);
-    const threadId = context?.getThreadId?.() || currentContext?.threadId || "thread";
-
-    return {
-        "x-compose-run-id": composeRunId,
-        "x-idempotency-key": `${composeRunId}:${threadId}:${scope}:${hash}`,
-    };
 }
 
 function resolveSessionContext(input: SessionContextProvider): AgentSessionContext | undefined {
@@ -172,81 +145,78 @@ function normalizeGrantedPermissions(values: string[] | undefined): Set<string> 
     return new Set((values || []).map((value) => value.trim().toLowerCase()).filter(Boolean));
 }
 
-function policyDecision(
-    policy: PermissionPolicy | undefined,
-    permission: PermissionKey,
-): PermissionDecision {
-    if (!policy) {
-        return "allow";
-    }
-    return policy[permission] || "deny";
+function isCloudPermissionKey(value: string): value is CloudPermissionKey {
+    return value === "filesystem"
+        || value === "camera"
+        || value === "microphone"
+        || value === "geolocation"
+        || value === "clipboard"
+        || value === "notifications";
 }
 
-function hasPermissionGrant(grants: Set<string>, permission: PermissionKey): boolean {
-    if (grants.has("*") || grants.has(permission)) {
-        return true;
-    }
-
-    if (permission.startsWith("fs.") && (grants.has("filesystem") || grants.has("fs"))) {
-        return true;
-    }
-
-    return false;
-}
-
-function resolveToolPermissions(toolName: string, toolDescription?: string): PermissionKey[] {
+function resolveToolPermissions(toolName: string, toolDescription?: string): CloudPermissionKey[] {
     const inferredConsent = inferConsentFromToolSemantics(toolName, toolDescription);
-    const permissions = new Set<PermissionKey>(["network"]);
-
-    if (inferredConsent === "filesystem") {
-        permissions.add("fs.read");
-    } else if (inferredConsent === "camera") {
-        permissions.add("camera");
-    } else if (inferredConsent === "microphone") {
-        permissions.add("microphone");
+    if (inferredConsent && isCloudPermissionKey(inferredConsent)) {
+        return [inferredConsent];
     }
 
-    const lower = `${toolName} ${toolDescription || ""}`.toLowerCase();
-    if (lower.includes("shell") || lower.includes("terminal") || lower.includes("command")) {
-        permissions.add("shell");
-    }
-    if (lower.includes("delete") || lower.includes("remove")) {
-        permissions.add("fs.delete");
-    } else if (lower.includes("write") || lower.includes("create")) {
-        permissions.add("fs.write");
-    } else if (lower.includes("edit") || lower.includes("update") || lower.includes("patch")) {
-        permissions.add("fs.edit");
-    } else if (lower.includes("read") || lower.includes("list") || lower.includes("search")) {
-        permissions.add("fs.read");
-    }
-
-    return [...permissions];
+    return [];
 }
 
-function enforceToolPermissions(input: {
+function buildConsentRequiredError(permission: CloudPermissionKey): Error {
+    return new Error(JSON.stringify({
+        code: "CONSENT_REQUIRED",
+        consentType: permission,
+        message: `Permission denied for ${permission} access. This feature requires your consent.`,
+    }));
+}
+
+async function fetchBackpackPermissions(userId: string): Promise<CloudPermissionKey[]> {
+    const response = await fetchWithRetry(
+        `${requireApiInternalUrl()}/api/backpack/permissions?userId=${encodeURIComponent(userId)}`,
+        {
+            headers: buildApiInternalHeaders(),
+        },
+    );
+
+    if (!response.ok) {
+        throw new Error(`Failed to load Backpack permissions (${response.status})`);
+    }
+
+    const payload = await response.json() as {
+        permissions?: Array<{ consentType?: string; granted?: boolean }>;
+    };
+
+    if (!Array.isArray(payload.permissions)) {
+        return [];
+    }
+
+    return payload.permissions
+        .filter((permission) => permission.granted && typeof permission.consentType === "string" && isCloudPermissionKey(permission.consentType))
+        .map((permission) => permission.consentType as CloudPermissionKey);
+}
+
+async function enforceToolPermissions(input: {
     toolName: string;
     toolDescription?: string;
-    grantedPermissions?: string[];
-    permissionPolicy?: PermissionPolicy;
-}): void {
-    // If no grants were explicitly provided, preserve backward compatibility.
-    if (!input.grantedPermissions) {
+    cloudPermissions?: string[];
+    userId?: string;
+}): Promise<void> {
+    if (!shouldEnforceCloudPermissions()) {
         return;
     }
 
-    const grants = normalizeGrantedPermissions(input.grantedPermissions);
     const required = resolveToolPermissions(input.toolName, input.toolDescription);
+    if (required.length === 0) {
+        return;
+    }
+
+    const availablePermissions = input.cloudPermissions || (input.userId ? await fetchBackpackPermissions(input.userId) : []);
+    const grants = normalizeGrantedPermissions(availablePermissions);
 
     for (const permission of required) {
-        const decision = policyDecision(input.permissionPolicy, permission);
-        if (decision === "deny") {
-            throw new Error(`Permission denied by policy: ${permission}`);
-        }
-        if (decision === "ask" && !hasPermissionGrant(grants, permission)) {
-            throw new Error(`Permission requires approval: ${permission}`);
-        }
-        if (decision === "allow" && !hasPermissionGrant(grants, permission)) {
-            throw new Error(`Permission grant missing: ${permission}`);
+        if (!grants.has(permission)) {
+            throw buildConsentRequiredError(permission);
         }
     }
 }
@@ -335,6 +305,9 @@ function inferConsentFromToolSemantics(toolName: string, toolDescription?: strin
     }
     if (text.includes("clipboard") && (text.includes("paste") || text.includes("copy"))) {
         return "clipboard";
+    }
+    if (text.includes("notification") || text.includes("notify") || text.includes("alert")) {
+        return "notifications";
     }
 
     return null;
@@ -451,22 +424,12 @@ export async function createAgentTools(
             console.log(`[createAgentTools] Normalized "${pluginId}" → source="${source}", id="${id}"`);
 
             if (source === "goat") {
-                const response = await fetchWithRetry(
-                    `${requireRuntimeServiceUrl()}/goat/plugins/${id}`,
-                    {
-                        method: "GET",
-                        headers: {
-                            authorization: `Bearer ${requireRuntimeInternalToken()}`,
-                            ...buildCorrelationHeaders(executionContext, `goat:plugin:${id}`),
-                        },
-                    },
-                );
-                if (!response.ok) {
+                const pluginData = await getPlugin(id);
+                if (!pluginData) {
                     console.warn(`[createAgentTools] GOAT plugin ${id} not found`);
                     continue;
                 }
 
-                const pluginData = await response.json();
                 const pluginTools = pluginData.tools || [];
 
                 // Create a LangChain tool for each GOAT tool
@@ -478,76 +441,43 @@ export async function createAgentTools(
                         schema: toolDef.parameters ? createZodSchema(toolDef.parameters) : z.object({}),
                         func: async (args: Record<string, unknown>) => {
                             const activeSessionContext = resolveSessionContext(sessionContext);
-                            enforceToolPermissions({
+                            await enforceToolPermissions({
                                 toolName: toolDef.name,
                                 toolDescription: toolDef.description,
-                                grantedPermissions: activeSessionContext?.grantedPermissions,
-                                permissionPolicy: activeSessionContext?.permissionPolicy,
+                                cloudPermissions: activeSessionContext?.cloudPermissions,
+                                userId,
                             });
 
-                            // Call MCP service to execute the tool
-                            const headers: Record<string, string> = {
-                                "Content-Type": "application/json",
-                                "authorization": `Bearer ${requireRuntimeInternalToken()}`,
-                            };
-
-                            // Pass chainId
-                            if (chainId) {
-                                headers["x-chain-id"] = chainId.toString();
-                            }
-
-                            Object.assign(
-                                headers,
-                                buildCorrelationHeaders(
-                                    executionContext,
-                                    `goat:tool:${id}:${toolDef.name}`,
-                                    args,
-                                ),
-                            );
-
-                            const execResponse = await fetchWithRetry(
-                                `${requireRuntimeServiceUrl()}/goat/plugins/${id}/tools/${toolDef.name}`,
-                                {
-                                    method: "POST",
-                                    headers,
-                                    body: JSON.stringify({ args }),
-                                }
-                            );
-
-                            if (!execResponse.ok) {
-                                const error = await execResponse.text();
+                            const result = await executeGoatTool(id, toolDef.name, args);
+                            if (!result.success) {
                                 throw new Error(
-                                    `GOAT tool "${toolDef.name}" failed (${execResponse.status}): ${error || "unknown error"}`,
+                                    `GOAT tool "${toolDef.name}" failed: ${result.error || "unknown error"}`,
                                 );
                             }
-
-                            const result = await execResponse.json();
                             return JSON.stringify(result.result);
                         },
                     });
                     tools.push(tool);
                 }
             } else if (source === "mcp") {
-                // Proxy Executor Pattern: One tool per MCP server to prevent context bloat
-                // Instead of binding 50+ individual tools, we bind ONE executor that routes to sub-tools
                 console.log(`[createAgentTools] Fetching tools for MCP server "${id}"`);
 
                 // Add timeout to prevent indefinite blocking on spawn failures
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
 
-                let response: Response;
+                let serverData: Awaited<ReturnType<typeof getServerTools>>;
                 try {
-                    response = await fetchWithRetry(
-                        `${requireRuntimeServiceUrl()}/mcp/servers/${id}/tools`,
-                        {
-                            signal: controller.signal,
-                            headers: {
-                                authorization: `Bearer ${requireRuntimeInternalToken()}`,
-                                ...buildCorrelationHeaders(executionContext, `mcp:tools:${id}`),
-                            },
-                        },
-                    );
+                    serverData = await Promise.race([
+                        getServerTools(id),
+                        new Promise<never>((_, reject) => {
+                            controller.signal.addEventListener("abort", () => {
+                                const error = new Error("MCP tools fetch aborted");
+                                error.name = "AbortError";
+                                reject(error);
+                            });
+                        }),
+                    ]);
                 } catch (err: any) {
                     if (err.name === 'AbortError') {
                         console.warn(`[createAgentTools] ✗ MCP server "${id}" timed out after 10s, skipping`);
@@ -558,13 +488,6 @@ export async function createAgentTools(
                 } finally {
                     clearTimeout(timeoutId);
                 }
-
-                if (!response.ok) {
-                    console.warn(`[createAgentTools] ✗ MCP server "${id}" returned ${response.status}`);
-                    continue;
-                }
-
-                const serverData = await response.json();
                 const serverTools = serverData.tools || [];
 
                 if (serverTools.length === 0) {
@@ -574,91 +497,47 @@ export async function createAgentTools(
 
                 console.log(`[createAgentTools] ✓ Found MCP server "${id}" with ${serverTools.length} tools`);
 
-                // Build tool list description for the model (compact format)
-                const toolDescriptions = serverTools.map((t: any) =>
-                    `${t.name}${t.description ? ` - ${t.description.slice(0, 80)}` : ""}`
-                ).join("; ");
+                for (const toolDef of serverTools) {
+                    const toolName = reserveToolName(toolDef.name, usedToolNames);
+                    const tool = new DynamicStructuredTool({
+                        name: toolName,
+                        description: toolDef.description || `Execute ${toolDef.name} on MCP server ${id}`,
+                        schema: toolDef.inputSchema ? createZodSchema(toolDef.inputSchema) : z.object({}),
+                        func: async (args: Record<string, unknown>) => {
+                            const activeSessionContext = resolveSessionContext(sessionContext);
+                            await enforceToolPermissions({
+                                toolName: toolDef.name,
+                                toolDescription: toolDef.description || `MCP tool on server ${id}`,
+                                cloudPermissions: activeSessionContext?.cloudPermissions,
+                                userId,
+                            });
 
-                // Create SINGLE Proxy Executor for this MCP server
-                const mcpExecutorName = `mcp_${id.replace(/[^a-zA-Z0-9]/g, "_")}`;
+                            const toolKey = `${id}:${toolDef.name}`;
 
-                const mcpExecutor = new DynamicStructuredTool({
-                    name: mcpExecutorName,
-                    description: `Execute tools on MCP server "${id}". Available tools: ${toolDescriptions}`,
-                    schema: z.object({
-                        tool: z.string().describe("Name of the tool to execute (from the available tools list)"),
-                        args: z.object({}).passthrough().describe("Arguments object to pass to the tool"),
-                    }),
-                    func: async (input: { tool: string; args: Record<string, unknown> }) => {
-                        const activeSessionContext = resolveSessionContext(sessionContext);
-                        enforceToolPermissions({
-                            toolName: input.tool,
-                            toolDescription: `MCP tool on server ${id}`,
-                            grantedPermissions: activeSessionContext?.grantedPermissions,
-                            permissionPolicy: activeSessionContext?.permissionPolicy,
-                        });
-
-                        const toolKey = `${id}:${input.tool}`;
-
-                        // Check if this tool is marked as failed - avoid repeated failing calls
-                        const failCheck = isToolFailed(toolKey);
-                        if (failCheck.failed) {
-                            throw new Error(
-                                `Tool "${input.tool}" is temporarily unavailable: ${failCheck.reason || "recent failures"}`,
-                            );
-                        }
-
-                        // Route to MCP service for actual tool execution
-                        const headers: Record<string, string> = {
-                            "Content-Type": "application/json",
-                            "authorization": `Bearer ${requireRuntimeInternalToken()}`,
-                        };
-                        Object.assign(
-                            headers,
-                            buildCorrelationHeaders(
-                                executionContext,
-                                `mcp:tool:${id}:${input.tool}`,
-                                input.args,
-                            ),
-                        );
-
-                        console.log(`[MCP Executor] ${mcpExecutorName} -> ${input.tool}(${JSON.stringify(input.args)})`);
-
-                        try {
-                            const execResponse = await fetchWithRetry(
-                                `${requireRuntimeServiceUrl()}/mcp/servers/${id}/tools/${input.tool}`,
-                                {
-                                    method: "POST",
-                                    headers,
-                                    body: JSON.stringify({ args: input.args }),
-                                }
-                            );
-
-                            if (!execResponse.ok) {
-                                const error = await execResponse.text();
-                                if (isRetryableToolFailure(execResponse.status, error)) {
-                                    markToolFailed(toolKey, error || `status ${execResponse.status}`);
-                                }
+                            const failCheck = isToolFailed(toolKey);
+                            if (failCheck.failed) {
                                 throw new Error(
-                                    `MCP tool "${input.tool}" failed (${execResponse.status}): ${error || "unknown error"}`,
+                                    `Tool "${toolDef.name}" is temporarily unavailable: ${failCheck.reason || "recent failures"}`,
                                 );
                             }
 
-                            clearToolFailure(toolKey);
-                            const result = await execResponse.json();
-                            return JSON.stringify(result.result);
-                        } catch (err: any) {
-                            const errorMessage = err instanceof Error ? err.message : String(err);
-                            if (isRetryableToolFailure(503, errorMessage)) {
-                                markToolFailed(toolKey, errorMessage);
-                            }
-                            throw new Error(`MCP tool "${input.tool}" failed: ${errorMessage}`);
-                        }
-                    },
-                });
+                            console.log(`[MCP Tool] ${toolName} -> ${toolDef.name}(${JSON.stringify(args)})`);
 
-                tools.push(mcpExecutor);
-                console.log(`[createAgentTools] ✓ Created proxy executor "${mcpExecutorName}" for ${serverTools.length} tools`);
+                            try {
+                                const result = await executeServerTool(id, toolDef.name, args);
+                                clearToolFailure(toolKey);
+                                return JSON.stringify(result);
+                            } catch (err: any) {
+                                const errorMessage = err instanceof Error ? err.message : String(err);
+                                if (isRetryableToolFailure(503, errorMessage)) {
+                                    markToolFailed(toolKey, errorMessage);
+                                }
+                                throw new Error(`MCP tool "${toolDef.name}" failed: ${errorMessage}`);
+                            }
+                        },
+                    });
+                    tools.push(tool);
+                }
             }
         } catch (error) {
             console.error(`[createAgentTools] Failed to load plugin ${pluginId}:`, error);
@@ -762,11 +641,11 @@ function createBackpackTools(input: {
         schema: z.object({}),
         func: async () => {
             const activeSessionContext = resolveSessionContext(input.sessionContext);
-            enforceToolPermissions({
+            await enforceToolPermissions({
                 toolName: "backpack_list_accounts",
                 toolDescription: "List connected Backpack accounts",
-                grantedPermissions: activeSessionContext?.grantedPermissions,
-                permissionPolicy: activeSessionContext?.permissionPolicy,
+                cloudPermissions: activeSessionContext?.cloudPermissions,
+                userId: input.userId,
             });
 
             const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userId);
@@ -786,11 +665,11 @@ function createBackpackTools(input: {
         }),
         func: async ({ toolkit, limit }: { toolkit: string; limit?: number }) => {
             const activeSessionContext = resolveSessionContext(input.sessionContext);
-            enforceToolPermissions({
+            await enforceToolPermissions({
                 toolName: "backpack_list_actions",
                 toolDescription: `List Backpack actions for ${toolkit}`,
-                grantedPermissions: activeSessionContext?.grantedPermissions,
-                permissionPolicy: activeSessionContext?.permissionPolicy,
+                cloudPermissions: activeSessionContext?.cloudPermissions,
+                userId: input.userId,
             });
 
             const actions = await fetchBackpackToolkitActions(toolkit, limit || 40);
@@ -817,11 +696,11 @@ function createBackpackTools(input: {
             text?: string;
         }) => {
             const activeSessionContext = resolveSessionContext(input.sessionContext);
-            enforceToolPermissions({
+            await enforceToolPermissions({
                 toolName: action,
                 toolDescription: `Execute Backpack action on ${toolkit}`,
-                grantedPermissions: activeSessionContext?.grantedPermissions,
-                permissionPolicy: activeSessionContext?.permissionPolicy,
+                cloudPermissions: activeSessionContext?.cloudPermissions,
+                userId: input.userId,
             });
 
             const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userId);
@@ -866,11 +745,10 @@ function createMeshPublicationTools(input: {
             }),
             func: async ({ reason }: { reason?: string }) => {
                 const activeSessionContext = resolveSessionContext(input.sessionContext);
-                enforceToolPermissions({
+                await enforceToolPermissions({
                     toolName: "publish_mesh_state",
                     toolDescription: "Anchor current local state and publish updated mesh manifest",
-                    grantedPermissions: activeSessionContext?.grantedPermissions,
-                    permissionPolicy: activeSessionContext?.permissionPolicy,
+                    cloudPermissions: activeSessionContext?.cloudPermissions,
                 });
 
                 const result = await queueLocalMeshPublication({
@@ -944,7 +822,7 @@ export function createMem0Tools(agentId: string, userId?: string, workflowWallet
             const results = await searchMemoryLayers({
                 query,
                 agentWallet: agentId,
-                userId,
+                userAddress: userId,
                 threadId: context?.threadId,
                 layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || ["working", "scene", "graph", "patterns", "archives"],
                 limit: 5,
