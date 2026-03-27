@@ -1,7 +1,7 @@
 import type { UploadResult } from "@filoz/synapse-sdk";
-import type { Hex } from "viem";
 import { createComposePieceMetadata, loadMeshSynapseConfig } from "./config.js";
 import { createMeshStorageContext } from "./control-plane.js";
+import { markHaiAnchor } from "./hai.js";
 import type { MeshSynapseAnchorRequest, MeshSynapseAnchorResponse } from "./types.js";
 
 function assertCompleteUpload(uploadResult: UploadResult): void {
@@ -64,6 +64,20 @@ export async function anchorMeshState(
   const pieceCid = typeof uploadResult.pieceCid === "string"
     ? uploadResult.pieceCid
     : uploadResult.pieceCid.toString();
+  const anchoredAt = Date.now();
+
+  await markHaiAnchor({
+    agentWallet: request.agentWallet,
+    userAddress: request.userAddress,
+    deviceId: request.deviceId,
+    updateNumber: request.updateNumber,
+    path: request.path,
+    stateRootHash: request.stateRootHash,
+    pieceCid,
+    anchoredAt,
+    payerAddress: storage.payerAddress,
+    sessionKeyExpiresAt: storage.sessionKeyExpiresAt,
+  });
 
   return {
     haiId: request.haiId,
@@ -73,7 +87,7 @@ export async function anchorMeshState(
     latestAlias,
     stateRootHash: request.stateRootHash,
     pdpPieceCid: pieceCid,
-    pdpAnchoredAt: Date.now(),
+    pdpAnchoredAt: anchoredAt,
     payloadSize: uploadResult.size,
     providerId: primaryCopy?.providerId?.toString() ?? storage.context.provider.id.toString(),
     dataSetId: primaryCopy?.dataSetId?.toString() ?? storage.context.dataSetId?.toString() ?? null,

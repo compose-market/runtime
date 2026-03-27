@@ -14,9 +14,23 @@ function normalizeAddress(rawAddress: string): string {
     return rawAddress.replace(/^https?:\/\//, "").replace(/\/$/, "");
 }
 
-function getRuntimeRootDirectory(): string {
-    const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-    return path.resolve(currentDirectory, "..", "..");
+export function getRuntimeRootDirectory(): string {
+    let currentDirectory = path.dirname(fileURLToPath(import.meta.url));
+
+    while (true) {
+        const packageJsonPath = path.join(currentDirectory, "package.json");
+        if (fs.existsSync(packageJsonPath)) {
+            return currentDirectory;
+        }
+
+        const parentDirectory = path.dirname(currentDirectory);
+        if (parentDirectory === currentDirectory) {
+            break;
+        }
+        currentDirectory = parentDirectory;
+    }
+
+    throw new Error("Unable to locate runtime package.json from Temporal module path");
 }
 
 function readPackageMetadata(): { name: string; version: string } {

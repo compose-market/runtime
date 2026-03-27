@@ -292,7 +292,7 @@ export async function optimizeWithGraph(
     context: {
         goal: string;
         agentId?: string;
-        userId?: string;
+        userAddress?: string;
         actionType?: string;
     }
 ): Promise<{ success: boolean; entitiesExtracted: number; relationsCreated: number }> {
@@ -302,7 +302,7 @@ export async function optimizeWithGraph(
             { role: "assistant", content },
         ],
         agent_id: workflowId, // workflowId is already "workflow-<walletAddress>"
-        user_id: context.userId,
+        user_id: context.userAddress,
         run_id: runId,
         metadata: {
             type: "graph_optimization",
@@ -341,7 +341,7 @@ export async function performSafeWipe(
         agentSummaries: Record<string, string>;
         messageCount?: number;
     },
-    userId?: string
+    userAddress?: string
 ): Promise<{
     summary: string;
     marker: string;
@@ -397,7 +397,7 @@ Create a summary that:
                 { role: "assistant", content: summary },
             ],
             agent_id: workflowId, // workflowId is already "workflow-<walletAddress>"
-            user_id: userId,
+            user_id: userAddress,
             run_id: runId,
             metadata: {
                 type: "context_wipe_summary",

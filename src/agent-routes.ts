@@ -15,19 +15,20 @@ import {
     resolveAgent,
     resolveAgentInstance,
     markAgentExecuted,
-    uploadAgentKnowledge,
-    listAgentKnowledgeKeys,
 } from "./framework/runtime.js";
 import {
     executeResponses,
-    streamAgent,
+    type ExecutionResult,
 } from "./framework/manowar.js";
-import { createComposeRunId, executeAgentRun, getAgentRunState } from "./temporal/service.js";
+import { createComposeRunId, executeAgentRun, getAgentRunState, startAgentRun } from "./temporal/service.js";
 import { extractRuntimeSessionHeaders } from "./auth.js";
 
 const router = Router();
 const JSON_KEEPALIVE_INTERVAL_MS = 5000; // 5 seconds - keeps proxies alive, prevents 504s
 const AGENT_WARMUP_TIMEOUT_MS = 12000;
+const AGENT_STREAM_POLL_INTERVAL_MS = 1000;
+const AGENT_STREAM_STATE_MISS_LIMIT = 8;
+const AGENT_STREAM_POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
 // =============================================================================
 // Middleware
@@ -82,12 +83,12 @@ const ChatSchema = z.object({
     threadId: z.string().optional(),
     composeRunId: z.string().optional(),
     workflowWallet: z.string().optional(), // Wallet address of the orchestrating workflow (if any)
-    userId: z.string().optional(),
+    userAddress: z.string().optional(),
     attachment: z.object({
         type: z.string().min(1, "attachment.type is required"),
     }).passthrough().optional(),
-    grantedPermissions: z.array(z.string()).optional(), // Permissions granted by user (from Backpack)
-    permissionPolicy: z.record(z.string(), z.enum(["allow", "ask", "deny"])).optional(),
+    sessionGrants: z.array(z.string()).optional(), // Runtime session capability grants
+    cloudPermissions: z.array(z.string()).optional(), // Backpack/browser cloud permissions
     backpackAccounts: z.array(z.object({
         slug: z.string(),
         name: z.string(),
@@ -111,80 +112,6 @@ async function resolveAgentForRequest(identifier: string): Promise<ReturnType<ty
 
     return undefined;
 }
-
-// =============================================================================
-// Knowledge Management
-// =============================================================================
-
-const KnowledgeUploadSchema = z.object({
-    key: z.string().min(1, "key is required"),
-    content: z.string().min(1, "content is required"),
-    metadata: z.record(z.string(), z.unknown()).optional(),
-});
-
-/**
- * POST /agent/:id/knowledge
- * Upload knowledge to an agent's knowledge base
- */
-router.post(
-    "/:walletAddress/knowledge",
-    asyncHandler(async (req: Request, res: Response) => {
-        const identifier = getParam(req.params.walletAddress);
-        const agent = await resolveAgentForRequest(identifier);
-
-        if (!agent) {
-            res.status(404).json({ error: `Agent ${identifier} not found` });
-            return;
-        }
-
-        const parseResult = KnowledgeUploadSchema.safeParse(req.body);
-        if (!parseResult.success) {
-            res.status(400).json({
-                error: "Invalid request body",
-                details: parseResult.error.issues,
-            });
-            return;
-        }
-
-        const { key, content, metadata } = parseResult.data;
-
-        const success = await uploadAgentKnowledge(identifier, key, content, metadata);
-
-        res.json({
-            success,
-            agentId: agent.agentId.toString(),
-            walletAddress: agent.walletAddress,
-            key,
-            contentLength: content.length,
-        });
-    })
-);
-
-/**
- * GET /agent/:id/knowledge
- * List all knowledge items for an agent
- */
-router.get(
-    "/:walletAddress/knowledge",
-    asyncHandler(async (req: Request, res: Response) => {
-        const identifier = getParam(req.params.walletAddress);
-        const agent = await resolveAgentForRequest(identifier);
-
-        if (!agent) {
-            res.status(404).json({ error: `Agent ${identifier} not found` });
-            return;
-        }
-
-        const keys = await listAgentKnowledgeKeys(identifier);
-
-        res.json({
-            agentId: agent.agentId.toString(),
-            walletAddress: agent.walletAddress,
-            count: keys.length,
-            keys,
-        });
-    })
-);
 
 // =============================================================================
 // Agent Execution
@@ -222,17 +149,17 @@ router.post(
             threadId,
             workflowWallet,
             attachment,
-            grantedPermissions,
-            permissionPolicy,
+            sessionGrants,
+            cloudPermissions,
             backpackAccounts,
-            userId: bodyUserId,
+            userAddress: bodyUserId,
         } = parseResult.data;
         const { sessionActive, sessionBudgetRemaining, sessionUserAddress } = extractRuntimeSessionHeaders(req);
         if (bodyUserId && sessionUserAddress && bodyUserId.toLowerCase() !== sessionUserAddress.toLowerCase()) {
-            res.status(400).json({ error: "userId does not match authenticated session user" });
+            res.status(400).json({ error: "userAddress does not match authenticated session user" });
             return;
         }
-        const userId = sessionUserAddress || bodyUserId;
+        const userAddress = sessionUserAddress || bodyUserId;
 
         let instance = resolveAgentInstance(identifier);
         if (!instance) {
@@ -265,22 +192,21 @@ router.post(
         res.setHeader("x-compose-run-id", composeRunId);
 
         try {
-            console.log(`[agent] Executing ${agent.name} (${identifier}) run=${composeRunId}: "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${workflowWallet || 'none'}, Session: ${sessionActive}]`);
-
+            console.log(`[agent] Executing ${agent.name} (${identifier}) run=${composeRunId}: "${message.slice(0, 50)}..." [User: ${userAddress || 'anon'}, MW: ${workflowWallet || 'none'}, Session: ${sessionActive}]`);
             const result = await executeAgentRun({
                 composeRunId,
                 agentWallet: agent.walletAddress,
                 message,
                 options: {
                     threadId,
-                    userId,
+                    userAddress,
                     workflowWallet,
                     attachment,
                     sessionContext: {
                         sessionActive,
                         sessionBudgetRemaining,
-                        grantedPermissions: grantedPermissions || [],
-                        permissionPolicy,
+                        sessionGrants,
+                        cloudPermissions,
                         backpackAccounts,
                     },
                 },
@@ -345,20 +271,21 @@ router.post(
             threadId,
             composeRunId: requestedRunId,
             workflowWallet,
-            grantedPermissions,
-            permissionPolicy,
+            attachment,
+            sessionGrants,
+            cloudPermissions,
             backpackAccounts,
-            userId: bodyUserId,
+            userAddress: bodyUserId,
         } = parseResult.data;
         const composeRunId = requestedRunId || createComposeRunId();
         res.setHeader("x-compose-run-id", composeRunId);
 
         const runtimeSession = extractRuntimeSessionHeaders(req);
         if (bodyUserId && runtimeSession.sessionUserAddress && bodyUserId.toLowerCase() !== runtimeSession.sessionUserAddress.toLowerCase()) {
-            res.status(400).json({ error: "userId does not match authenticated session user" });
+            res.status(400).json({ error: "userAddress does not match authenticated session user" });
             return;
         }
-        const userId = runtimeSession.sessionUserAddress || bodyUserId;
+        const userAddress = runtimeSession.sessionUserAddress || bodyUserId;
         const sessionActive = runtimeSession.sessionActive;
         const sessionBudgetRemaining = runtimeSession.sessionBudgetRemaining;
 
@@ -400,28 +327,84 @@ router.post(
         }, JSON_KEEPALIVE_INTERVAL_MS);
         res.on("close", () => clearInterval(heartbeat));
 
-        console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}]`);
+        const effectiveThreadId = threadId || `thread-${agent.walletAddress}`;
+
+        console.log(`[agent] Streaming ${agent.name} (${identifier}) run=${composeRunId}: "${message.slice(0, 50)}..." [User: ${userAddress || 'anon'}]`);
 
         try {
             async function writeEvent(event: unknown): Promise<void> {
                 res.write(`data: ${safeStringify(event)}\n\n`);
             }
 
-            for await (const event of streamAgent(instance!.id, message, {
-                threadId,
-                userId,
-                workflowWallet,
+            await writeEvent({
+                type: "thinking_start",
+                message: "Thinking...",
+            });
+
+            const handle = await startAgentRun({
                 composeRunId,
-                sessionContext: {
-                    sessionActive,
-                    sessionBudgetRemaining,
-                    grantedPermissions: grantedPermissions || [],
-                    permissionPolicy,
-                    backpackAccounts,
+                agentWallet: agent.walletAddress,
+                message,
+                options: {
+                    threadId,
+                    userAddress,
+                    workflowWallet,
+                    attachment,
+                    sessionContext: {
+                        sessionActive,
+                        sessionBudgetRemaining,
+                        sessionGrants,
+                        cloudPermissions,
+                        backpackAccounts,
+                    },
+                },
+            });
+
+            let missingStateCount = 0;
+            const pollStartedAt = Date.now();
+            while (true) {
+                const state = await getAgentRunState(agent.walletAddress, effectiveThreadId, composeRunId);
+                if (!state) {
+                    missingStateCount += 1;
+                    const pollTimedOut = Date.now() - pollStartedAt >= AGENT_STREAM_POLL_TIMEOUT_MS;
+                    if (missingStateCount >= AGENT_STREAM_STATE_MISS_LIMIT || pollTimedOut) {
+                        throw new Error(pollTimedOut ? "Agent run state polling timed out" : "Agent run state unavailable");
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, AGENT_STREAM_POLL_INTERVAL_MS));
+                    continue;
                 }
-            })) {
-                await writeEvent(event);
+
+                missingStateCount = 0;
+                if (state.status === "success" || state.status === "error" || state.status === "cancelled") {
+                    break;
+                }
+                if (Date.now() - pollStartedAt >= AGENT_STREAM_POLL_TIMEOUT_MS) {
+                    throw new Error("Agent run state polling timed out");
+                }
+                await new Promise((resolve) => setTimeout(resolve, AGENT_STREAM_POLL_INTERVAL_MS));
             }
+
+            const result = await handle.result() as ExecutionResult;
+            await writeEvent({ type: "thinking_end" });
+
+            if (!result.success) {
+                throw new Error(result.error || "Agent execution failed");
+            }
+
+            if (typeof result.output === "string" && result.output.length > 0) {
+                await writeEvent({
+                    choices: [{ delta: { content: result.output } }],
+                });
+            }
+
+            await writeEvent({
+                type: "done",
+                model: agent.model,
+                usage: result.usage,
+                promptTokens: result.promptTokens,
+                completionTokens: result.completionTokens,
+                totalTokens: result.usage?.total_tokens,
+            });
         } catch (err) {
             res.write(`data: ${safeStringify({ type: "error", content: String(err) })}\n\n`);
         }

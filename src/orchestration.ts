@@ -46,11 +46,14 @@ import {
     consolidateAgentMemories,
     createMemoryArchive,
     extractExecutionPatterns,
+    getEmbedding,
     getAllMemories,
+    getMemoryVectorsCollection,
     getMemoryStats,
     getTranscriptBySessionId,
     getTranscriptByThreadId,
     hybridVectorSearch,
+    indexMemoryContent,
     indexVector,
     promotePatternToSkill,
     rerankDocuments,
@@ -63,6 +66,12 @@ import {
     validateExtractedPattern,
 } from "./framework/memory/index.js";
 import { extractRuntimeSessionHeaders, isRuntimeInternalRequest } from "./auth.js";
+import {
+    indexWorkspaceDocuments,
+    normalizeKnowledgeLimit,
+    normalizeWorkspaceDocuments,
+    searchWorkspaceDocuments,
+} from "./framework/knowledge/index.js";
 
 const activeRunIds = new Map<string, string>();
 const SSE_HEARTBEAT_INTERVAL_MS = 10000;
@@ -130,6 +139,56 @@ type RouteRegistrar = {
     delete: (...args: any[]) => unknown;
 };
 
+export function registerWorkspaceRoutes(app: Pick<RouteRegistrar, "post">): void {
+    app.post("/api/workspace/index", asyncHandler(async (req: Request, res: Response) => {
+        const runtimeSession = extractRuntimeSessionHeaders(req);
+        const agentWallet = typeof req.body?.agentWallet === "string" ? req.body.agentWallet.trim() : "";
+        const documents = normalizeWorkspaceDocuments(req.body?.documents);
+
+        if (!runtimeSession.sessionActive || !runtimeSession.sessionUserAddress) {
+            res.status(401).json({ error: "An active session is required for workspace access" });
+            return;
+        }
+
+        if (!agentWallet || documents.length === 0) {
+            res.status(400).json({ error: "agentWallet and documents are required" });
+            return;
+        }
+
+        const result = await indexWorkspaceDocuments({
+            agentWallet,
+            userAddress: runtimeSession.sessionUserAddress,
+            documents,
+        });
+        res.json(result);
+    }));
+
+    app.post("/api/workspace/search", asyncHandler(async (req: Request, res: Response) => {
+        const runtimeSession = extractRuntimeSessionHeaders(req);
+        const agentWallet = typeof req.body?.agentWallet === "string" ? req.body.agentWallet.trim() : "";
+        const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+        const limit = normalizeKnowledgeLimit(req.body?.limit);
+
+        if (!runtimeSession.sessionActive || !runtimeSession.sessionUserAddress) {
+            res.status(401).json({ error: "An active session is required for workspace access" });
+            return;
+        }
+
+        if (!agentWallet || !query) {
+            res.status(400).json({ error: "agentWallet and query are required" });
+            return;
+        }
+
+        const results = await searchWorkspaceDocuments({
+            agentWallet,
+            userAddress: runtimeSession.sessionUserAddress,
+            query,
+            limit,
+        });
+        res.json({ results });
+    }));
+}
+
 export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     app.use("/agent", agentRoutes);
 
@@ -183,7 +242,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             sessionActive: runtimeSession.sessionActive,
             sessionBudgetRemaining: runtimeSession.sessionBudgetRemaining,
             resourceUrlBase: `${req.protocol}://${req.get("host")}`,
-            userId: runtimeSession.sessionUserAddress,
+            userAddress: runtimeSession.sessionUserAddress,
         };
 
         // Execute workflow with orchestrator
@@ -216,7 +275,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
                     payment: paymentContext,
                     coordinatorModel: registeredWorkflow.coordinatorModel,
                     workflowCardUri: registeredWorkflow.workflowCardUri,
-                    userId: runtimeSession.sessionUserAddress,
+                    userAddress: runtimeSession.sessionUserAddress,
                     threadId: requestedThreadId,
                     workflowWallet: registeredWorkflow.walletAddress,
                 }),
@@ -260,21 +319,21 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
 
     app.get("/api/workflow/:walletAddress/triggers", asyncHandler(async (req: Request, res: Response) => {
         const workflowWallet = getParam(req.params.walletAddress);
-        const userId = req.headers["x-session-user-address"] as string | undefined;
-        const triggers = await retrieveTriggers(workflowWallet, userId);
+        const userAddress = req.headers["x-session-user-address"] as string | undefined;
+        const triggers = await retrieveTriggers(workflowWallet, userAddress);
         res.json({ triggers });
     }));
 
     app.post("/api/workflow/:walletAddress/triggers", asyncHandler(async (req: Request, res: Response) => {
         const workflowWallet = getParam(req.params.walletAddress);
-        const userId = req.headers["x-session-user-address"] as string | undefined;
+        const userAddress = req.headers["x-session-user-address"] as string | undefined;
         const trigger = req.body as TriggerDefinition;
         if (!trigger?.id || !trigger?.name || !trigger?.type) {
             res.status(400).json({ error: "Invalid trigger payload" });
             return;
         }
         trigger.workflowWallet = workflowWallet;
-        const memoryId = await storeTrigger(trigger, userId);
+        const memoryId = await storeTrigger(trigger, userAddress);
         trigger.memoryId = memoryId || trigger.memoryId;
 
         if (trigger.enabled && trigger.cronExpression) {
@@ -289,10 +348,10 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     app.put("/api/workflow/:walletAddress/triggers/:triggerId", asyncHandler(async (req: Request, res: Response) => {
         const workflowWallet = getParam(req.params.walletAddress);
         const triggerId = getParam(req.params.triggerId);
-        const userId = req.headers["x-session-user-address"] as string | undefined;
+        const userAddress = req.headers["x-session-user-address"] as string | undefined;
         const updates = req.body as Partial<TriggerDefinition>;
 
-        const triggers = await retrieveTriggers(workflowWallet, userId);
+        const triggers = await retrieveTriggers(workflowWallet, userAddress);
         const existing = triggers.find(t => t.id === triggerId);
         if (!existing) {
             res.status(404).json({ error: "Trigger not found" });
@@ -300,8 +359,8 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         }
 
         const updated: TriggerDefinition = { ...existing, ...updates, id: triggerId, workflowWallet };
-        await deleteTriggerFromMemory(triggerId, workflowWallet, userId);
-        const memoryId = await storeTrigger(updated, userId);
+        await deleteTriggerFromMemory(triggerId, workflowWallet, userAddress);
+        const memoryId = await storeTrigger(updated, userAddress);
         updated.memoryId = memoryId || updated.memoryId;
 
         if (updated.enabled && updated.cronExpression) {
@@ -318,8 +377,8 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     app.delete("/api/workflow/:walletAddress/triggers/:triggerId", asyncHandler(async (req: Request, res: Response) => {
         const workflowWallet = getParam(req.params.walletAddress);
         const triggerId = getParam(req.params.triggerId);
-        const userId = req.headers["x-session-user-address"] as string | undefined;
-        const ok = await deleteTriggerFromMemory(triggerId, workflowWallet, userId);
+        const userAddress = req.headers["x-session-user-address"] as string | undefined;
+        const ok = await deleteTriggerFromMemory(triggerId, workflowWallet, userAddress);
         res.json({ success: ok });
     }));
 
@@ -328,9 +387,9 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     // ============================================================================
 
     app.post("/api/memory/add", asyncHandler(async (req: Request, res: Response) => {
-        const { messages, agentWallet, agent_id, userId, user_id, runId, run_id, metadata, enableGraph, enable_graph } = req.body || {};
+        const { messages, agentWallet, agent_id, userAddress, user_id, runId, run_id, metadata, enableGraph, enable_graph } = req.body || {};
         const agentId = agentWallet || agent_id;
-        const user = userId || user_id;
+        const user = userAddress || user_id;
         const run = runId || run_id;
         const enableGraphValue = enableGraph ?? enable_graph ?? true;
 
@@ -352,9 +411,9 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     app.post("/api/memory/search", asyncHandler(async (req: Request, res: Response) => {
-        const { query, agentWallet, agent_id, userId, user_id, runId, run_id, limit, filters, enableGraph, enable_graph, rerank } = req.body || {};
+        const { query, agentWallet, agent_id, userAddress, user_id, runId, run_id, limit, filters, enableGraph, enable_graph, rerank } = req.body || {};
         const agentId = agentWallet || agent_id;
-        const user = userId || user_id;
+        const user = userAddress || user_id;
         const run = runId || run_id;
 
         if (typeof query !== "string" || !agentId) {
@@ -378,11 +437,11 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
 
     app.get("/api/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
         const agentWallet = getParam(req.params.agentWallet);
-        const userId = typeof req.query.userId === "string" ? req.query.userId : undefined;
+        const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
 
         const memories = await getAllMemories({
             agent_id: agentWallet,
-            user_id: userId,
+            user_id: userAddress,
             enable_graph: true,
         });
 
@@ -394,7 +453,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             query,
             queryEmbedding,
             agentWallet,
-            userId,
+            userAddress,
             threadId,
             limit,
             threshold,
@@ -410,7 +469,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
                 query,
                 queryEmbedding,
                 agentWallet,
-                userId,
+                userAddress,
                 threadId,
                 limit: typeof limit === "number" ? limit : 10,
                 threshold: typeof threshold === "number" ? threshold : undefined,
@@ -423,7 +482,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         const results = await searchVectors({
             query,
             agentWallet,
-            userId,
+            userAddress,
             threadId,
             limit: typeof limit === "number" ? limit : 10,
             threshold: typeof threshold === "number" ? threshold : undefined,
@@ -439,7 +498,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     app.post("/api/memory/vector-index", asyncHandler(async (req: Request, res: Response) => {
-        const { content, embedding, agentWallet, userId, threadId, source, metadata } = req.body || {};
+        const { content, embedding, agentWallet, userAddress, threadId, source, metadata } = req.body || {};
         const validSources = new Set(["session", "knowledge", "pattern", "archive", "fact"]);
 
         if (
@@ -457,7 +516,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             content,
             embedding,
             agentWallet,
-            userId,
+            userAddress,
             threadId,
             source: source as "session" | "knowledge" | "pattern" | "archive" | "fact",
             metadata,
@@ -467,7 +526,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     app.post("/api/memory/transcript-store", asyncHandler(async (req: Request, res: Response) => {
-        const { sessionId, threadId, agentWallet, userId, messages, tokenCount, summary, summaryEmbedding, metadata } = req.body || {};
+        const { sessionId, threadId, agentWallet, userAddress, messages, tokenCount, summary, summaryEmbedding, metadata } = req.body || {};
         if (!sessionId || !threadId || !agentWallet || !Array.isArray(messages) || typeof tokenCount !== "number") {
             res.status(400).json({ error: "sessionId, threadId, agentWallet, messages, and tokenCount are required" });
             return;
@@ -477,7 +536,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             sessionId,
             threadId,
             agentWallet,
-            userId,
+            userAddress,
             messages,
             tokenCount,
             summary,
@@ -516,9 +575,9 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     app.post("/api/memory/layers/search", asyncHandler(async (req: Request, res: Response) => {
-        const { query, agentWallet, agent_id, userId, user_id, threadId, thread_id, layers, limit } = req.body || {};
+        const { query, agentWallet, agent_id, userAddress, user_id, threadId, thread_id, layers, limit } = req.body || {};
         const wallet = agentWallet || agent_id;
-        const user = userId || user_id;
+        const user = userAddress || user_id;
         const thread = threadId || thread_id;
 
         if (typeof query !== "string" || typeof wallet !== "string") {
@@ -529,7 +588,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         const result = await searchMemoryLayers({
             query,
             agentWallet: wallet,
-            userId: user,
+            userAddress: user,
             threadId: thread,
             layers: Array.isArray(layers) ? layers : ["working", "scene", "graph", "patterns", "archives", "vectors"],
             limit: typeof limit === "number" ? limit : 5,
@@ -707,7 +766,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             sessionActive: runtimeSession.sessionActive,
             sessionBudgetRemaining: runtimeSession.sessionBudgetRemaining,
             resourceUrlBase: `${req.protocol}://${req.get("host")}`,
-            userId: runtimeSession.sessionUserAddress,
+            userAddress: runtimeSession.sessionUserAddress,
         };
 
         // Set up SSE response for long-running workflows
@@ -760,7 +819,7 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
                 workflowCardUri: registeredWorkflow.workflowCardUri,
                 continuous: Boolean(continuous),
                 maxLoopIterations: Boolean(continuous) ? 5 : undefined,
-                userId: req.headers["x-session-user-address"] as string | undefined,
+                userAddress: req.headers["x-session-user-address"] as string | undefined,
                 threadId,
                 workflowWallet: registeredWorkflow.walletAddress,
             }),
@@ -1036,75 +1095,6 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         res.json({
             context: contextText || "No prior context found.",
             memoryCount: memories.length,
-        });
-    }));
-
-    // ============================================================================
-    // Local Agent Self-Learning API
-    // ============================================================================
-
-    app.get("/api/local/skills/recommended", asyncHandler(async (req: Request, res: Response) => {
-        const { agentWallet, task } = req.query;
-
-        if (!agentWallet) {
-            res.status(400).json({ error: "agentWallet is required" });
-            return;
-        }
-
-        const recentMemories = await searchGraphMemory({
-            query: task as string || "agent capabilities tools",
-            agent_id: agentWallet as string,
-            limit: 5,
-        });
-
-        const recommendedSkills = recentMemories.map((m) => ({
-            id: m.id,
-            name: m.memory.slice(0, 50),
-            relevance: "high",
-        }));
-
-        res.json({
-            agentWallet,
-            recommendedSkills,
-            basedOn: "execution_history",
-        });
-    }));
-
-    app.post("/api/local/skills/learn", asyncHandler(async (req: Request, res: Response) => {
-        const { agentWallet, userAddress, task, outcome, toolSequence } = req.body || {};
-
-        if (!agentWallet) {
-            res.status(400).json({ error: "agentWallet is required" });
-            return;
-        }
-
-        const runId = `learn-${Date.now()}`;
-
-        const messages = [
-            { role: "user", content: `Task: ${task}` },
-            { role: "assistant", content: `Completed with: ${outcome}\nTools used: ${(toolSequence || []).join(" → ")}` },
-        ];
-
-        await addGraphMemory({
-            messages,
-            agent_id: agentWallet,
-            user_id: userAddress,
-            run_id: runId,
-            metadata: {
-                type: "execution_learning",
-                task,
-                outcome,
-                toolSequence: toolSequence || [],
-                timestamp: Date.now(),
-            },
-        });
-
-        console.log(`[Self-Learning] Agent ${agentWallet} learned from task: ${task}`);
-
-        res.json({
-            success: true,
-            task,
-            learned: true,
         });
     }));
 

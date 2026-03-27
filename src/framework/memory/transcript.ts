@@ -9,7 +9,7 @@ export interface TranscriptStoreParams {
     threadId: string;
     agentWallet: string;
     messages: SessionTranscript["messages"];
-    userId?: string;
+    userAddress?: string;
     summary?: string;
     summaryEmbedding?: number[];
     tokenCount: number;
@@ -26,7 +26,7 @@ export async function storeTranscript(params: TranscriptStoreParams): Promise<{ 
                 sessionId: params.sessionId,
                 threadId: params.threadId,
                 agentWallet: params.agentWallet,
-                userId: params.userId,
+                userAddress: params.userAddress,
                 messages: params.messages,
                 summary: params.summary,
                 summaryEmbedding: params.summaryEmbedding,
@@ -44,7 +44,7 @@ export async function storeTranscript(params: TranscriptStoreParams): Promise<{ 
 
     await invalidateMemoryScope({
         agentWallet: params.agentWallet,
-        userAddress: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
     });
 
@@ -68,13 +68,13 @@ export function shouldIndexSessionTranscript(messages: SessionTranscript["messag
 export async function indexSessionTranscript(params: {
     sessionId: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId: string;
     messages: SessionTranscript["messages"];
     modelUsed: string;
     totalTokens: number;
 }): Promise<{ indexed: boolean; messageCount: number; vectorCount: number }> {
-    const { sessionId, agentWallet, userId, threadId, messages, modelUsed, totalTokens } = params;
+    const { sessionId, agentWallet, userAddress, threadId, messages, modelUsed, totalTokens } = params;
 
     if (!shouldIndexSessionTranscript(messages)) {
         return { indexed: false, messageCount: messages.length, vectorCount: 0 };
@@ -84,7 +84,7 @@ export async function indexSessionTranscript(params: {
         sessionId,
         threadId,
         agentWallet,
-        userId,
+        userAddress,
         messages,
         tokenCount: totalTokens,
         metadata: {
@@ -105,7 +105,7 @@ export async function indexSessionTranscript(params: {
         const result = await indexMemoryContent({
             content: message.content,
             agentWallet,
-            userId,
+            userAddress,
             threadId,
             source: "session",
             metadata: {

@@ -133,7 +133,7 @@ interface AgentMetadata {
     plugins?: Array<{ registryId: string; name: string; origin: string }>;
     skills?: string[];
     model?: string;
-    framework?: "langchain" | "openclaw" | "eliza";
+    framework?: "manowar";
 }
 
 // =============================================================================
@@ -428,7 +428,7 @@ export async function buildWorkflowWorkflow(chainId: number, workflowId: number)
                     agentCardUri: agentData.agentCardUri,
                     creator: "0x0000000000000000000000000000000000000000",
                     model: metadata.model,
-                    framework: metadata.framework || "langchain",
+                    framework: metadata.framework || "manowar",
                     plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
                     systemPrompt: (metadata as any).systemPrompt,
                 });

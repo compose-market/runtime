@@ -273,7 +273,7 @@ export async function parseTriggerFromNL(
  */
 export async function storeTrigger(
     trigger: TriggerDefinition,
-    _userId?: string
+    _userAddress?: string
 ): Promise<string | null> {
     try {
         const normalized = normalizeTrigger(trigger);
@@ -297,7 +297,7 @@ export async function storeTrigger(
  */
 export async function retrieveTriggers(
     workflowWallet: string,
-    _userId?: string
+    _userAddress?: string
 ): Promise<TriggerDefinition[]> {
     try {
         const wallet = workflowWallet;
@@ -320,7 +320,7 @@ export async function retrieveTriggers(
 export async function deleteTriggerFromMemory(
     triggerId: string,
     workflowWallet: string,
-    _userId?: string
+    _userAddress?: string
 ): Promise<boolean> {
     try {
         const wallet = workflowWallet;

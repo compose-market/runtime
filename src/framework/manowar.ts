@@ -1,5 +1,5 @@
 import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
+import { HumanMessage } from "@langchain/core/messages";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -15,13 +15,6 @@ import {
   requireApiInternalToken,
   requireApiInternalUrl,
 } from "../auth.js";
-import {
-  extractExecutionPatterns,
-  getPatternsCollection,
-  promotePatternToSkill,
-  searchMemoryLayers,
-  validateExtractedPattern,
-} from "./memory/index.js";
 import {
   AgentMemoryTracker,
   extractTokens,
@@ -107,46 +100,6 @@ type StreamUsageTotals = {
 };
 
 type SessionUnlock = () => void;
-interface AgentDnaLock {
-  agentWallet: string;
-  modelId: string;
-  chainId?: number;
-  agentCardCid: string;
-  mcpToolsHash: string;
-  dnaHash?: string;
-  lockedAt?: number;
-}
-
-interface SkillRequirement {
-  bins: string[];
-  anyBins: string[];
-  env: string[];
-  config: string[];
-  os: string[];
-}
-
-interface SkillSpec {
-  key: string;
-  source: "agent" | "runtime" | "generated";
-  path: string;
-  name: string;
-  description: string;
-  commands: string[];
-  requirements: SkillRequirement;
-  eligible: boolean;
-  missing: string[];
-  revision: string;
-}
-
-interface SkillAuditRecord {
-  at: string;
-  revision: string;
-  action: "created" | "updated" | "rollback";
-  skillPath: string;
-  patternId?: string;
-  confidence?: number;
-  notes?: string;
-}
 
 interface WorkerCronJob {
   id: string;
@@ -156,21 +109,14 @@ interface WorkerCronJob {
   timer: NodeJS.Timeout | null;
 }
 
-interface AgentWorker {
+interface CloudAgentWorker {
   runtime: AgentInstance;
   config: AgentConfig;
   lanes: SessionLaneLock;
   runtimeId: string;
   createdAt: number;
-  workspaceRoot: string;
-  workspaceSkillsRoot: string;
-  generatedSkillsRoot: string;
   logsFile: string;
-  dnaLock: AgentDnaLock;
-  heartbeatTimer: NodeJS.Timeout | null;
-  reflectionTimer: NodeJS.Timeout | null;
   cronJobs: Map<string, WorkerCronJob>;
-  skills: Map<string, SkillSpec>;
 }
 
 export interface ManagedAgentExecutionParams {
@@ -200,21 +146,14 @@ export interface ManagedAgentExecutionResult {
   skillsRevision: string;
 }
 
-export interface AgentResponsesRequest extends Record<string, unknown> { }
-export interface AgentResponsesResult extends Record<string, unknown> { }
-
-const HEARTBEAT_OK = "HEARTBEAT_OK";
-const DEFAULT_HEARTBEAT_MS = 30_000;
-const DEFAULT_REFLECTION_MS = 10 * 60_000;
-const DEFAULT_CRON_SESSION_PREFIX = "cron";
-const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
-const LOCAL_BASE_DIR = String(process.env.COMPOSE_LOCAL_BASE_DIR || "").trim();
-const DEFAULT_WORKSPACE_ROOT = process.env.COMPOSE_AGENT_WORKSPACE_ROOT
-  || (LOCAL_BASE_DIR ? path.join(LOCAL_BASE_DIR, "agents") : path.resolve(process.cwd(), "data", "compose-agents"));
-const RUNTIME_SKILLS_ROOT = process.env.COMPOSE_RUNTIME_SKILLS_ROOT || path.resolve(process.cwd(), "skills");
+export interface AgentResponsesRequest extends Record<string, unknown> {}
+export interface AgentResponsesResult extends Record<string, unknown> {}
 
 const agents = new Map<string, AgentInstance>();
-const workers = new Map<string, AgentWorker>();
+const workers = new Map<string, CloudAgentWorker>();
+const DEFAULT_CRON_SESSION_PREFIX = "cron";
+const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
+const DEFAULT_CLOUD_WORKER_ROOT = path.resolve(process.cwd(), "data", "cloud-agents");
 
 class SessionLaneLock {
   private tails = new Map<string, Promise<void>>();
@@ -319,7 +258,13 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   );
   const model = createModel(config.model, config.temperature ?? 0.7);
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
-  const executor = createAgentGraph(model, composeTools, checkpointDir, config.systemPrompt, () => buildDynamicSystemContext(config));
+  const executor = createAgentGraph(
+    model,
+    composeTools,
+    checkpointDir,
+    config.systemPrompt,
+    () => buildDynamicSystemContext(config),
+  );
   const instance: AgentInstance = {
     id,
     name: config.name,
@@ -357,17 +302,79 @@ function normalizeMessageContent(content: unknown): string {
     return content;
   }
   if (Array.isArray(content)) {
-    return content.map((part: any) => {
-      if (typeof part === "string") return part;
-      if (part.type === "text") return part.text || "";
-      if (part.text) return part.text;
-      return JSON.stringify(part);
-    }).join("");
+    return content
+      .map((part: any) => {
+        if (typeof part === "string") return part;
+        if (part.type === "text") return part.text || "";
+        if (part.text) return part.text;
+        return JSON.stringify(part);
+      })
+      .join("");
   }
   if (content) {
     return JSON.stringify(content);
   }
   return "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function extractTextFromStructuredOutput(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => extractTextFromStructuredOutput(entry))
+      .filter((entry) => entry.length > 0)
+      .join("");
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return "";
+  }
+
+  if (typeof record.text === "string" && record.text.length > 0) {
+    return record.text;
+  }
+
+  const nestedContent = normalizeMessageContent(record.content);
+  if (nestedContent.length > 0) {
+    return nestedContent;
+  }
+
+  const nestedOutput = extractTextFromStructuredOutput(record.output);
+  if (nestedOutput.length > 0) {
+    return nestedOutput;
+  }
+
+  return extractTextFromStructuredOutput(record.tool_outputs);
+}
+
+function resolveMessageText(message: unknown): string {
+  const record = asRecord(message);
+  if (!record) {
+    return "";
+  }
+
+  const directContent = normalizeMessageContent(record.content);
+  if (directContent.length > 0) {
+    return directContent;
+  }
+
+  const additionalKwargs = asRecord(record.additional_kwargs);
+  const responseMetadata = asRecord(record.response_metadata);
+
+  return (
+    extractTextFromStructuredOutput(additionalKwargs?.tool_outputs) ||
+    extractTextFromStructuredOutput(responseMetadata?.output) ||
+    extractTextFromStructuredOutput(additionalKwargs?.output) ||
+    ""
+  );
 }
 
 async function buildHumanMessage(message: string, options: ExecuteOptions): Promise<HumanMessage> {
@@ -418,40 +425,48 @@ async function executeAgentCore(
         userAddress,
         workflowWallet,
       },
-      async () => agent.executor.invoke({
-        messages: [humanMessage],
-      }, {
-        configurable: {
-          thread_id: threadId,
-          recursionDepth: 0,
-          maxRecursionDepth: maxRecursionLimit,
-          startTime: Date.now(),
-        },
-        callbacks: [mem0Handler, usageTracker],
-        recursionLimit: maxRecursionLimit,
-      }),
+      async () =>
+        agent.executor.invoke(
+          {
+            messages: [humanMessage],
+          },
+          {
+            configurable: {
+              thread_id: threadId,
+              recursionDepth: 0,
+              maxRecursionDepth: maxRecursionLimit,
+              startTime: Date.now(),
+            },
+            callbacks: [mem0Handler, usageTracker],
+            recursionLimit: maxRecursionLimit,
+          },
+        ),
     );
 
-    const messages = Array.isArray((result as { messages?: unknown[] }).messages) ? (result as { messages: any[] }).messages : [];
+    const messages = Array.isArray((result as { messages?: unknown[] }).messages)
+      ? (result as { messages: any[] }).messages
+      : [];
     const lastMessage = messages[messages.length - 1];
     const trackedMetrics = usageTracker.getMetrics().contextMetrics;
     const extractedTokens = resolveAuthoritativeTokens(
       result,
-      trackedMetrics ? {
-        inputTokens: trackedMetrics.inputTokens,
-        outputTokens: trackedMetrics.outputTokens,
-        reasoningTokens: 0,
-        totalTokens: trackedMetrics.totalTokens,
-      } : null,
+      trackedMetrics
+        ? {
+            inputTokens: trackedMetrics.inputTokens,
+            outputTokens: trackedMetrics.outputTokens,
+            reasoningTokens: 0,
+            totalTokens: trackedMetrics.totalTokens,
+          }
+        : null,
     );
 
     return {
       success: true,
       messages: messages.map((item: any) => ({
         role: item._getType?.() || "unknown",
-        content: normalizeMessageContent(item.content),
+        content: resolveMessageText(item),
       })),
-      output: normalizeMessageContent(lastMessage?.content),
+      output: resolveMessageText(lastMessage),
       usage: {
         prompt_tokens: extractedTokens.inputTokens,
         completion_tokens: extractedTokens.outputTokens,
@@ -502,19 +517,23 @@ async function* streamAgentCore(
         userAddress,
         workflowWallet,
       },
-      async () => agent.executor.streamEvents({
-        messages: [humanMessage],
-      }, {
-        configurable: {
-          thread_id: threadId,
-          recursionDepth: 0,
-          maxRecursionDepth: maxRecursionLimit,
-          startTime: Date.now(),
-        },
-        callbacks: [mem0Handler, usageTracker],
-        recursionLimit: maxRecursionLimit,
-        version: "v2",
-      }),
+      async () =>
+        agent.executor.streamEvents(
+          {
+            messages: [humanMessage],
+          },
+          {
+            configurable: {
+              thread_id: threadId,
+              recursionDepth: 0,
+              maxRecursionDepth: maxRecursionLimit,
+              startTime: Date.now(),
+            },
+            callbacks: [mem0Handler, usageTracker],
+            recursionLimit: maxRecursionLimit,
+            version: "v2",
+          },
+        ),
     );
 
     for await (const event of eventStream) {
@@ -583,12 +602,14 @@ async function* streamAgentCore(
       const trackedMetrics = usageTracker.getMetrics().contextMetrics;
       const authoritativeTokens = resolveAuthoritativeTokens(
         lastUsageCandidate ?? { messages: [] },
-        trackedMetrics ? {
-          inputTokens: trackedMetrics.inputTokens,
-          outputTokens: trackedMetrics.outputTokens,
-          reasoningTokens: 0,
-          totalTokens: trackedMetrics.totalTokens,
-        } : null,
+        trackedMetrics
+          ? {
+              inputTokens: trackedMetrics.inputTokens,
+              outputTokens: trackedMetrics.outputTokens,
+              reasoningTokens: 0,
+              totalTokens: trackedMetrics.totalTokens,
+            }
+          : null,
       );
       usageTotals.promptTokens = authoritativeTokens.inputTokens;
       usageTotals.completionTokens = authoritativeTokens.outputTokens;
@@ -620,26 +641,6 @@ async function* streamAgentCore(
   }
 }
 
-function resolveWorkerExecutionContext(
-  agentWallet: string,
-  message: string,
-  options: ExecuteOptions,
-): { worker: AgentWorker; sessionKey: string; message: string } | null {
-  const worker = workers.get(agentWallet);
-  if (!worker) {
-    return null;
-  }
-
-  const sessionKey = parseSessionKey(agentWallet, options.threadId);
-  enforceSessionPermissions(sessionKey, options.sessionContext?.sessionGrants);
-
-  return {
-    worker,
-    sessionKey,
-    message,
-  };
-}
-
 export async function executeAgent(
   agentWallet: string,
   message: string,
@@ -650,13 +651,15 @@ export async function executeAgent(
     throw new Error(`Agent ${agentWallet} not found`);
   }
 
-  const executionContext = resolveWorkerExecutionContext(agentWallet, message, options);
+  const executionContext = resolveManagedExecutionContext(agentWallet, message, options);
   if (!executionContext) {
     return executeAgentCore(agent, message, options);
   }
 
   const { worker, sessionKey, message: runtimeMessage } = executionContext;
-  const execution = await worker.lanes.run(sessionKey, async () => executeAgentCore(agent, runtimeMessage, options));
+  const execution = await worker.lanes.run(sessionKey, async () =>
+    executeAgentCore(agent, runtimeMessage, options),
+  );
   writeWorkerLog(worker, execution.success ? "info" : "warn", `session=${sessionKey} success=${execution.success}`);
   return execution;
 }
@@ -671,7 +674,7 @@ export async function* streamAgent(
     throw new Error(`Agent ${agentWallet} not found`);
   }
 
-  const executionContext = resolveWorkerExecutionContext(agentWallet, message, options);
+  const executionContext = resolveManagedExecutionContext(agentWallet, message, options);
   if (!executionContext) {
     yield* streamAgentCore(agent, message, options);
     return;
@@ -703,461 +706,27 @@ function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-function walletWorkspace(agentWallet: string): string {
-  return path.join(DEFAULT_WORKSPACE_ROOT, agentWallet.toLowerCase());
-}
-
-function heartbeatPath(agentWallet: string): string {
-  return path.join(walletWorkspace(agentWallet), "HEARTBEAT.md");
-}
-
-function dnaPath(agentWallet: string): string {
-  return path.join(walletWorkspace(agentWallet), "DNA.md");
-}
-
-function soulPath(agentWallet: string): string {
-  return path.join(walletWorkspace(agentWallet), "SOUL.md");
-}
-
 function isLocalRuntimeHost(): boolean {
   return resolveRuntimeHostMode() === "local";
 }
 
-function defaultDnaLock(config: AgentConfig): AgentDnaLock {
-  const plugins = [...(config.plugins || [])].map((value) => value.trim().toLowerCase()).filter(Boolean).sort();
-  return {
-    agentWallet: config.agentWallet.toLowerCase(),
-    modelId: config.model || "",
-    chainId: config.chainId,
-    agentCardCid: "unknown",
-    mcpToolsHash: sha256Hex(plugins.join("|")),
-    lockedAt: Date.now(),
-  };
+function cloudWorkerRoot(agentWallet: string): string {
+  return path.join(DEFAULT_CLOUD_WORKER_ROOT, agentWallet.toLowerCase());
 }
 
-function parseMarkdownKeyValue(input: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const raw of input.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const idx = line.indexOf(":");
-    if (idx <= 0) continue;
-    out[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
-  }
-  return out;
+function cloudWorkerLogPath(agentWallet: string): string {
+  return path.join(cloudWorkerRoot(agentWallet), "runtime.log");
 }
 
-function readDnaLock(config: AgentConfig): AgentDnaLock {
-  const file = dnaPath(config.agentWallet);
-  if (!fileExists(file)) {
-    return defaultDnaLock(config);
-  }
-  const parsed = parseMarkdownKeyValue(fs.readFileSync(file, "utf8"));
-  return {
-    agentWallet: (parsed.agentwallet || config.agentWallet).toLowerCase(),
-    modelId: parsed.modelid || config.model || "",
-    chainId: parsed.chainid ? Number(parsed.chainid) : config.chainId,
-    agentCardCid: parsed.agentcardcid || "unknown",
-    mcpToolsHash: parsed.mcptoolshash || defaultDnaLock(config).mcpToolsHash,
-    dnaHash: parsed.dnahash || undefined,
-    lockedAt: parsed.lockedat ? Number(parsed.lockedat) : Date.now(),
-  };
-}
-
-function verifyDnaLock(config: AgentConfig, lock: AgentDnaLock): void {
-  const expectedWallet = config.agentWallet.toLowerCase();
-  if (lock.agentWallet !== expectedWallet) {
-    throw new Error(`DNA lock wallet mismatch: expected ${expectedWallet}, got ${lock.agentWallet}`);
-  }
-  if (config.model && lock.modelId && config.model !== lock.modelId) {
-    throw new Error(`DNA lock model mismatch: expected ${config.model}, got ${lock.modelId}`);
-  }
-  if (typeof config.chainId === "number" && typeof lock.chainId === "number" && config.chainId !== lock.chainId) {
-    throw new Error(`DNA lock chain mismatch: expected ${config.chainId}, got ${lock.chainId}`);
-  }
-  const plugins = [...(config.plugins || [])].map((value) => value.trim().toLowerCase()).filter(Boolean).sort();
-  if (lock.mcpToolsHash !== sha256Hex(plugins.join("|"))) {
-    throw new Error(`DNA lock MCP hash mismatch for ${config.agentWallet}`);
-  }
-}
-
-function writeWorkerLog(worker: AgentWorker, level: "info" | "warn" | "error", message: string): void {
+function writeWorkerLog(worker: CloudAgentWorker, level: "info" | "warn" | "error", message: string): void {
+  ensureDir(path.dirname(worker.logsFile));
   fs.appendFileSync(worker.logsFile, `${new Date().toISOString()} [${level}] ${message}\n`, "utf8");
-}
-
-function hasCommand(binary: string): boolean {
-  return (process.env.PATH || "").split(path.delimiter).filter(Boolean).some((entry) => fileExists(path.join(entry, binary)));
-}
-
-function evaluateSkillEligibility(requirements: SkillRequirement, skillDir: string): { eligible: boolean; missing: string[] } {
-  const missing: string[] = [];
-  for (const bin of requirements.bins) {
-    if (!hasCommand(bin)) missing.push(`bin:${bin}`);
-  }
-  if (requirements.anyBins.length > 0 && !requirements.anyBins.some((bin) => hasCommand(bin))) {
-    missing.push(`anyBins:${requirements.anyBins.join("|")}`);
-  }
-  for (const envKey of requirements.env) {
-    if (!process.env[envKey]) missing.push(`env:${envKey}`);
-  }
-  for (const configFile of requirements.config) {
-    if (!fileExists(path.join(skillDir, configFile))) missing.push(`config:${configFile}`);
-  }
-  if (requirements.os.length > 0) {
-    const current = process.platform.toLowerCase();
-    if (!requirements.os.some((item) => current.includes(item.toLowerCase()))) {
-      missing.push(`os:${requirements.os.join("|")}`);
-    }
-  }
-  return { eligible: missing.length === 0, missing };
-}
-
-function readSkillSpec(skillPath: string, source: SkillSpec["source"]): SkillSpec | null {
-  if (!fileExists(skillPath)) return null;
-  const text = fs.readFileSync(skillPath, "utf8");
-  const lines = text.split(/\r?\n/);
-  let name = path.basename(path.dirname(skillPath));
-  let description = "";
-  const commands: string[] = [];
-  const requirements: SkillRequirement = { bins: [], anyBins: [], env: [], config: [], os: [] };
-
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (line.startsWith("# ") && name === path.basename(path.dirname(skillPath))) {
-      name = line.slice(2).trim() || name;
-      continue;
-    }
-    const lower = line.toLowerCase();
-    if (lower.startsWith("description:")) {
-      description = line.slice("description:".length).trim();
-    } else if (lower.startsWith("bins:")) {
-      requirements.bins.push(...line.slice(5).split(",").map((item) => item.trim()).filter(Boolean));
-    } else if (lower.startsWith("anybins:")) {
-      requirements.anyBins.push(...line.slice(8).split(",").map((item) => item.trim()).filter(Boolean));
-    } else if (lower.startsWith("env:")) {
-      requirements.env.push(...line.slice(4).split(",").map((item) => item.trim()).filter(Boolean));
-    } else if (lower.startsWith("config:")) {
-      requirements.config.push(...line.slice(7).split(",").map((item) => item.trim()).filter(Boolean));
-    } else if (lower.startsWith("os:")) {
-      requirements.os.push(...line.slice(3).split(",").map((item) => item.trim().toLowerCase()).filter(Boolean));
-    } else if (line.startsWith("`") && line.endsWith("`")) {
-      commands.push(line.slice(1, -1));
-    } else if (line.startsWith("- `") && line.endsWith("`")) {
-      commands.push(line.slice(3, -1));
-    }
-  }
-
-  const eligibility = evaluateSkillEligibility(requirements, path.dirname(skillPath));
-  return {
-    key: `${source}:${path.basename(path.dirname(skillPath)).toLowerCase()}`,
-    source,
-    path: skillPath,
-    name,
-    description,
-    commands,
-    requirements,
-    eligible: eligibility.eligible,
-    missing: eligibility.missing,
-    revision: sha256Hex(text),
-  };
-}
-
-function loadSkills(worker: AgentWorker): Map<string, SkillSpec> {
-  if (isLocalRuntimeHost()) {
-    return new Map();
-  }
-
-  const discovered = new Map<string, SkillSpec>();
-  const roots: Array<{ root: string; source: SkillSpec["source"] }> = [
-    { root: worker.workspaceSkillsRoot, source: "agent" },
-    { root: RUNTIME_SKILLS_ROOT, source: "runtime" },
-    { root: worker.generatedSkillsRoot, source: "generated" },
-  ];
-
-  for (const { root, source } of roots) {
-    if (!fileExists(root)) continue;
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const spec = readSkillSpec(path.join(root, entry.name, "SKILL.md"), source);
-      if (spec && !discovered.has(spec.key)) {
-        discovered.set(spec.key, spec);
-      }
-    }
-  }
-  return discovered;
-}
-
-function skillsPrompt(skills: Map<string, SkillSpec>): string {
-  const values = [...skills.values()].filter((skill) => skill.eligible);
-  if (values.length === 0) return "No eligible runtime skills are currently installed.";
-  return [
-    "Eligible runtime skills (precedence: agent -> runtime -> generated):",
-    ...values.slice(0, 48).map((skill) => {
-      const preview = skill.commands.slice(0, 3).join(", ");
-      return `- ${skill.name} [${skill.key}]${preview ? ` commands: ${preview}` : ""}`;
-    }),
-  ].join("\n");
 }
 
 function parseSessionKey(agentWallet: string, threadId?: string, explicit?: string): string {
   if (explicit && explicit.trim().length > 0) return explicit.trim();
   if (threadId?.trim()) return `agent:${agentWallet}:session:${threadId.trim()}`;
   return `agent:${agentWallet}:session:main`;
-}
-
-function withSkillContext(message: string, skills: Map<string, SkillSpec>): string {
-  if (isLocalRuntimeHost()) {
-    return message;
-  }
-  return `${skillsPrompt(skills)}\n\nUser message:\n${message}`;
-}
-
-function ensureCloudWorkspaceFiles(config: AgentConfig): void {
-  const root = walletWorkspace(config.agentWallet);
-  ensureDir(root);
-  ensureDir(path.join(root, "skills"));
-  ensureDir(path.join(root, "skills", "generated"));
-  const defaults = [
-    {
-      file: dnaPath(config.agentWallet),
-      content: [
-        "# DNA",
-        `agentWallet: ${config.agentWallet.toLowerCase()}`,
-        `modelId: ${config.model || ""}`,
-        `chainId: ${config.chainId || ""}`,
-        "agentCardCid: unknown",
-        `mcpToolsHash: ${defaultDnaLock(config).mcpToolsHash}`,
-        "dnaHash: ",
-        `lockedAt: ${Date.now()}`,
-        "",
-      ].join("\n"),
-    },
-    {
-      file: soulPath(config.agentWallet),
-      content: "# SOUL\n\nMutable behavior and persona notes for this local deployment.\n",
-    },
-    {
-      file: heartbeatPath(config.agentWallet),
-      content: "# HEARTBEAT\n\nKeep checks lightweight. Reply exactly HEARTBEAT_OK when no action is needed.\n",
-    },
-    {
-      file: path.join(root, "AGENTS.md"),
-      content: "# AGENTS\n\nPer-agent local instructions and workflow policies.\n",
-    },
-    {
-      file: path.join(root, "TOOLS.md"),
-      content: "# TOOLS\n\nImmutable MCP/GOAT tool identities are derived from DNA.md.\n",
-    },
-    {
-      file: path.join(root, "IDENTITY.md"),
-      content: `# IDENTITY\n\nagentWallet: ${config.agentWallet.toLowerCase()}\n`,
-    },
-    {
-      file: path.join(root, "USER.md"),
-      content: "# USER\n\nPer-user local preferences and policies.\n",
-    },
-  ];
-
-  for (const item of defaults) {
-    if (!fileExists(item.file)) {
-      fs.writeFileSync(item.file, item.content, "utf8");
-    }
-  }
-}
-
-function ensureLocalWorkspace(config: AgentConfig): void {
-  const root = walletWorkspace(config.agentWallet);
-  if (!fileExists(root)) {
-    throw new Error(`Local agent workspace is missing for ${config.agentWallet}`);
-  }
-  if (!fileExists(dnaPath(config.agentWallet))) {
-    throw new Error(`Local agent DNA is missing for ${config.agentWallet}`);
-  }
-}
-
-function parseSubagentDepth(sessionKey: string): number {
-  const match = sessionKey.match(/subagent:depth:(\d+)/i);
-  if (!match) return 0;
-  const value = Number(match[1]);
-  return Number.isFinite(value) ? value : 0;
-}
-
-async function runHeartbeat(worker: AgentWorker): Promise<void> {
-  const file = heartbeatPath(worker.runtime.id);
-  if (!fileExists(file)) return;
-  const prompt = fs.readFileSync(file, "utf8").trim();
-  if (!prompt) return;
-
-  await worker.lanes.run(`agent:${worker.runtime.id}:session:main`, async () => {
-    const result = await executeAgent(worker.runtime.id, prompt, {
-      threadId: `heartbeat-${worker.runtime.id}`,
-      userAddress: worker.config.userAddress,
-      workflowWallet: worker.config.workflowWallet,
-      sessionContext: {
-        sessionActive: true,
-        sessionBudgetRemaining: Number.MAX_SAFE_INTEGER,
-      },
-    });
-    if (!result.success) {
-      writeWorkerLog(worker, "warn", `heartbeat failed: ${result.error || "unknown"}`);
-      return;
-    }
-    const output = result.output?.trim() || "";
-    if (output && output !== HEARTBEAT_OK) {
-      writeWorkerLog(worker, "warn", `heartbeat alert: ${output.slice(0, 240)}`);
-    }
-  });
-}
-
-async function appendSkillAudit(worker: AgentWorker, record: SkillAuditRecord): Promise<void> {
-  if (isLocalRuntimeHost()) return;
-  const auditPath = path.join(worker.generatedSkillsRoot, "audit.jsonl");
-  ensureDir(path.dirname(auditPath));
-  fs.appendFileSync(auditPath, `${JSON.stringify(record)}\n`, "utf8");
-}
-
-async function runReflection(worker: AgentWorker): Promise<void> {
-  if (isLocalRuntimeHost()) return;
-  try {
-    await searchMemoryLayers({
-      query: "recent successful tool sequences and outcomes",
-      agentWallet: worker.runtime.id,
-      userAddress: worker.config.userAddress,
-      layers: ["patterns", "working", "scene"],
-      limit: 5,
-    });
-    await extractExecutionPatterns({
-      agentWallet: worker.runtime.id,
-      timeRange: {
-        start: Date.now() - 7 * 24 * 60 * 60 * 1000,
-        end: Date.now(),
-      },
-      confidenceThreshold: 0.25,
-    });
-
-    const patternsCollection = await getPatternsCollection();
-    const patterns = await patternsCollection
-      .find({ agentWallet: worker.runtime.id })
-      .sort({ updatedAt: -1, successRate: -1 })
-      .limit(6)
-      .toArray();
-
-    for (const pattern of patterns as any[]) {
-      const validation = await validateExtractedPattern({ patternId: pattern.patternId });
-      if (!validation.valid) continue;
-
-      const promoted = await promotePatternToSkill({
-        patternId: pattern.patternId,
-        skillName: `learned-${pattern.patternId.slice(0, 8)}`,
-        validationData: validation,
-      });
-      if (!promoted.promoted || !promoted.skillId) continue;
-
-      const skillDir = path.join(worker.generatedSkillsRoot, promoted.skillId);
-      ensureDir(skillDir);
-      const skillPath = path.join(skillDir, "SKILL.md");
-      const skillContents = [
-        `# ${promoted.skillId}`,
-        `description: Auto-generated from pattern ${pattern.patternId}`,
-        "env:",
-        "bins:",
-        "os:",
-        "",
-        "## Commands",
-        ...validation.toolSequence.map((tool: string) => `- \`${tool}\``),
-        "",
-      ].join("\n");
-
-      if (fileExists(skillPath)) {
-        const previous = fs.readFileSync(skillPath, "utf8");
-        const backup = `${skillPath}.${Date.now()}.bak`;
-        fs.writeFileSync(backup, previous, "utf8");
-        await appendSkillAudit(worker, {
-          at: new Date().toISOString(),
-          revision: sha256Hex(previous),
-          action: "rollback",
-          skillPath: backup,
-          notes: "pre-update backup",
-        });
-      }
-
-      fs.writeFileSync(skillPath, skillContents, "utf8");
-      await appendSkillAudit(worker, {
-        at: new Date().toISOString(),
-        revision: sha256Hex(skillContents),
-        action: "created",
-        skillPath,
-        patternId: pattern.patternId,
-        confidence: validation.confidence,
-      });
-    }
-
-    worker.skills = loadSkills(worker);
-  } catch (error) {
-    writeWorkerLog(worker, "warn", `reflection skipped: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-function startBackgroundLoops(worker: AgentWorker): void {
-  if (worker.heartbeatTimer) {
-    clearInterval(worker.heartbeatTimer);
-    worker.heartbeatTimer = null;
-  }
-  if (worker.reflectionTimer) {
-    clearInterval(worker.reflectionTimer);
-    worker.reflectionTimer = null;
-  }
-
-  if (isLocalRuntimeHost()) {
-    return;
-  }
-
-  if (worker.heartbeatTimer) clearInterval(worker.heartbeatTimer);
-  worker.heartbeatTimer = setInterval(() => {
-    void runHeartbeat(worker).catch((error) => {
-      writeWorkerLog(worker, "error", `heartbeat loop error: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  }, DEFAULT_HEARTBEAT_MS);
-
-  if (worker.reflectionTimer) clearInterval(worker.reflectionTimer);
-  worker.reflectionTimer = setInterval(() => {
-    void runReflection(worker).catch((error) => {
-      writeWorkerLog(worker, "error", `reflection loop error: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  }, DEFAULT_REFLECTION_MS);
-}
-
-function stopBackgroundLoops(worker: AgentWorker): void {
-  if (worker.heartbeatTimer) {
-    clearInterval(worker.heartbeatTimer);
-    worker.heartbeatTimer = null;
-  }
-  if (worker.reflectionTimer) {
-    clearInterval(worker.reflectionTimer);
-    worker.reflectionTimer = null;
-  }
-  for (const job of worker.cronJobs.values()) {
-    if (job.timer) {
-      clearInterval(job.timer);
-      job.timer = null;
-    }
-  }
-  worker.cronJobs.clear();
-}
-
-function toExecutionOptions(params: ManagedAgentExecutionParams): ExecuteOptions {
-  return {
-    threadId: params.threadId,
-    userAddress: params.userAddress,
-    workflowWallet: params.workflowWallet,
-    sessionContext: {
-      sessionActive: true,
-      sessionBudgetRemaining: Number.MAX_SAFE_INTEGER,
-      sessionGrants: params.sessionGrants,
-      cloudPermissions: params.cloudPermissions,
-      backpackAccounts: params.backpackAccounts,
-    },
-  };
 }
 
 type PermissionSet = Set<string>;
@@ -1184,7 +753,46 @@ function enforceSessionPermissions(sessionKey: string, sessionGrants?: string[])
   }
 }
 
-function ensureWorker(agentWallet: string): AgentWorker {
+function resolveManagedExecutionContext(
+  agentWallet: string,
+  message: string,
+  options: ExecuteOptions,
+): { worker: CloudAgentWorker; sessionKey: string; message: string } | null {
+  if (isLocalRuntimeHost()) {
+    return null;
+  }
+
+  const worker = workers.get(agentWallet);
+  if (!worker) {
+    return null;
+  }
+
+  const sessionKey = parseSessionKey(agentWallet, options.threadId);
+  enforceSessionPermissions(sessionKey, options.sessionContext?.sessionGrants);
+
+  return {
+    worker,
+    sessionKey,
+    message,
+  };
+}
+
+function toExecutionOptions(params: ManagedAgentExecutionParams): ExecuteOptions {
+  return {
+    threadId: params.threadId,
+    userAddress: params.userAddress,
+    workflowWallet: params.workflowWallet,
+    sessionContext: {
+      sessionActive: true,
+      sessionBudgetRemaining: Number.MAX_SAFE_INTEGER,
+      sessionGrants: params.sessionGrants,
+      cloudPermissions: params.cloudPermissions,
+      backpackAccounts: params.backpackAccounts,
+    },
+  };
+}
+
+function ensureWorker(agentWallet: string): CloudAgentWorker {
   const worker = workers.get(agentWallet);
   if (!worker) {
     throw new Error(`Managed agent worker not found for ${agentWallet}`);
@@ -1192,56 +800,52 @@ function ensureWorker(agentWallet: string): AgentWorker {
   return worker;
 }
 
+function stopCronJobs(worker: CloudAgentWorker): void {
+  for (const job of worker.cronJobs.values()) {
+    if (job.timer) {
+      clearInterval(job.timer);
+      job.timer = null;
+    }
+  }
+  worker.cronJobs.clear();
+}
+
+function parseSubagentDepth(sessionKey: string): number {
+  const match = sessionKey.match(/subagent:depth:(\d+)/i);
+  if (!match) return 0;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : 0;
+}
+
 export async function createManagedAgent(config: AgentConfig): Promise<AgentInstance> {
-  const existing = workers.get(config.agentWallet);
-  if (existing) return existing.runtime;
-
   if (isLocalRuntimeHost()) {
-    ensureLocalWorkspace(config);
-  } else {
-    ensureCloudWorkspaceFiles(config);
-  }
-  const root = walletWorkspace(config.agentWallet);
-  if (!isLocalRuntimeHost()) {
-    ensureDir(root);
-    ensureDir(path.join(root, "skills"));
-    ensureDir(path.join(root, "skills", "generated"));
+    throw new Error("Managed cloud agents are cloud-only");
   }
 
-  const dnaLock = readDnaLock(config);
-  verifyDnaLock(config, dnaLock);
+  const existing = workers.get(config.agentWallet);
+  if (existing) {
+    return existing.runtime;
+  }
 
-  const runtime = await createAgent({
-    ...config,
-    systemPrompt: `${config.systemPrompt || `You are ${config.name}.`}\n\nRuntime invariants:\n- DNA lock is immutable at runtime\n- MCP/tool identity cannot mutate from skills\n- Self-learning may only add local skills`,
-  });
-
-  const logsFile = path.join(root, "runtime.log");
+  const runtime = await createAgent(config);
+  const logsFile = cloudWorkerLogPath(config.agentWallet);
+  ensureDir(path.dirname(logsFile));
   if (!fileExists(logsFile)) {
     fs.writeFileSync(logsFile, "", "utf8");
   }
 
-  const worker: AgentWorker = {
+  const worker: CloudAgentWorker = {
     runtime,
     config,
     lanes: new SessionLaneLock(),
-    runtimeId: `compose-agent-${config.agentWallet}-${Date.now()}`,
+    runtimeId: `compose-cloud-agent-${config.agentWallet}-${Date.now()}`,
     createdAt: Date.now(),
-    workspaceRoot: root,
-    workspaceSkillsRoot: path.join(root, "skills"),
-    generatedSkillsRoot: path.join(root, "skills", "generated"),
     logsFile,
-    dnaLock,
-    heartbeatTimer: null,
-    reflectionTimer: null,
     cronJobs: new Map(),
-    skills: new Map(),
   };
 
-  worker.skills = loadSkills(worker);
-  startBackgroundLoops(worker);
   workers.set(config.agentWallet, worker);
-  writeWorkerLog(worker, "info", `worker started runtimeId=${worker.runtimeId} skills=${worker.skills.size}`);
+  writeWorkerLog(worker, "info", `cloud worker started runtimeId=${worker.runtimeId}`);
   return runtime;
 }
 
@@ -1254,11 +858,14 @@ export function scheduleManagedAgentCron(input: {
   if (isLocalRuntimeHost()) {
     throw new Error("Managed cron scheduling is cloud-only");
   }
+
   const worker = ensureWorker(input.agentWallet);
   const everyMs = Math.max(1_000, input.everyMs);
   const sessionKey = `${DEFAULT_CRON_SESSION_PREFIX}:${input.id}`;
   const existing = worker.cronJobs.get(input.id);
-  if (existing?.timer) clearInterval(existing.timer);
+  if (existing?.timer) {
+    clearInterval(existing.timer);
+  }
 
   const job: WorkerCronJob = {
     id: input.id,
@@ -1287,15 +894,22 @@ export function scheduleManagedAgentCron(input: {
 export function unscheduleManagedAgentCron(agentWallet: string, jobId: string): void {
   const worker = ensureWorker(agentWallet);
   const job = worker.cronJobs.get(jobId);
-  if (!job) return;
-  if (job.timer) clearInterval(job.timer);
+  if (!job) {
+    return;
+  }
+  if (job.timer) {
+    clearInterval(job.timer);
+  }
   worker.cronJobs.delete(jobId);
   writeWorkerLog(worker, "info", `cron unscheduled id=${jobId}`);
 }
 
 export async function executeManagedAgent(params: ManagedAgentExecutionParams): Promise<ManagedAgentExecutionResult> {
+  if (isLocalRuntimeHost()) {
+    throw new Error("Managed cloud execution is cloud-only");
+  }
+
   const worker = ensureWorker(params.agentWallet);
-  worker.skills = loadSkills(worker);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
   const subDepth = sessionKey.includes("subagent") ? parseSubagentDepth(sessionKey) : (params.subagentDepth || 0);
   if (subDepth > DEFAULT_SUBAGENT_MAX_DEPTH) {
@@ -1303,11 +917,11 @@ export async function executeManagedAgent(params: ManagedAgentExecutionParams): 
   }
 
   enforceSessionPermissions(sessionKey, params.sessionGrants);
-  const execution = await worker.lanes.run(sessionKey, async () => {
-    return executeAgent(params.agentWallet, withSkillContext(params.message, worker.skills), toExecutionOptions(params));
-  });
+  const execution = await worker.lanes.run(sessionKey, async () =>
+    executeAgentCore(worker.runtime, params.message, toExecutionOptions(params)),
+  );
 
-  writeWorkerLog(worker, execution.success ? "info" : "warn", `session=${sessionKey} success=${execution.success}`);
+  writeWorkerLog(worker, execution.success ? "info" : "warn", `managed session=${sessionKey} success=${execution.success}`);
   return {
     success: execution.success,
     output: execution.output,
@@ -1323,15 +937,16 @@ export async function executeManagedAgent(params: ManagedAgentExecutionParams): 
         name: `tool-${idx + 1}`,
         content: messageItem.content,
       })),
-    skillsRevision: sha256Hex(
-      [...worker.skills.values()].map((item) => `${item.key}:${item.revision}:${item.eligible}`).sort().join("|"),
-    ),
+    skillsRevision: "cloud-managed",
   };
 }
 
 export async function* streamManagedAgent(params: ManagedAgentExecutionParams): AsyncGenerator<unknown> {
+  if (isLocalRuntimeHost()) {
+    throw new Error("Managed cloud streaming is cloud-only");
+  }
+
   const worker = ensureWorker(params.agentWallet);
-  worker.skills = loadSkills(worker);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
   const subDepth = sessionKey.includes("subagent") ? parseSubagentDepth(sessionKey) : (params.subagentDepth || 0);
   if (subDepth > DEFAULT_SUBAGENT_MAX_DEPTH) {
@@ -1341,10 +956,8 @@ export async function* streamManagedAgent(params: ManagedAgentExecutionParams): 
   enforceSessionPermissions(sessionKey, params.sessionGrants);
   const unlock = await worker.lanes.acquire(sessionKey);
   try {
-    for await (const chunk of streamAgent(params.agentWallet, withSkillContext(params.message, worker.skills), toExecutionOptions(params))) {
-      yield chunk;
-    }
-    writeWorkerLog(worker, "info", `stream completed session=${sessionKey}`);
+    yield* streamAgentCore(worker.runtime, params.message, toExecutionOptions(params));
+    writeWorkerLog(worker, "info", `managed stream completed session=${sessionKey}`);
   } finally {
     unlock();
   }
@@ -1363,6 +976,7 @@ export async function executeManagedSubagent(input: {
   if (input.depth > DEFAULT_SUBAGENT_MAX_DEPTH) {
     throw new Error(`Subagent depth exceeded (${input.depth} > ${DEFAULT_SUBAGENT_MAX_DEPTH})`);
   }
+
   return executeManagedAgent({
     agentWallet: input.agentWallet,
     model: input.model,
@@ -1378,36 +992,38 @@ export function getManagedAgentStatus(agentWallet: string): {
   runtimeId?: string;
   createdAt?: number;
   cronJobs?: string[];
-  skills?: Array<{ key: string; eligible: boolean; source: string; revision: string }>;
 } {
   const worker = workers.get(agentWallet);
-  if (!worker) return { running: false };
+  if (!worker) {
+    return { running: false };
+  }
+
   return {
     running: true,
     runtimeId: worker.runtimeId,
     createdAt: worker.createdAt,
     cronJobs: [...worker.cronJobs.keys()],
-    skills: [...worker.skills.values()].map((item) => ({
-      key: item.key,
-      eligible: item.eligible,
-      source: item.source,
-      revision: item.revision,
-    })),
   };
 }
 
 export function stopManagedAgent(agentWallet: string): void {
   const worker = workers.get(agentWallet);
-  if (!worker) return;
-  stopBackgroundLoops(worker);
-  writeWorkerLog(worker, "info", "worker stopped");
+  if (!worker) {
+    return;
+  }
+
+  stopCronJobs(worker);
+  writeWorkerLog(worker, "info", "cloud worker stopped");
   workers.delete(agentWallet);
 }
 
 export function getManagedAgentLogs(agentWallet: string, maxLines: number = 200): string[] {
   const worker = workers.get(agentWallet);
-  const logsPath = worker?.logsFile || path.join(walletWorkspace(agentWallet), "runtime.log");
-  if (!fileExists(logsPath)) return [];
+  const logsPath = worker?.logsFile || cloudWorkerLogPath(agentWallet);
+  if (!fileExists(logsPath)) {
+    return [];
+  }
+
   const lines = fs.readFileSync(logsPath, "utf8").split(/\r?\n/).filter(Boolean);
   return lines.length <= maxLines ? lines : lines.slice(lines.length - maxLines);
 }
@@ -1426,7 +1042,11 @@ function extractApiErrorMessage(status: number, body: unknown): string {
   if (body && typeof body === "object") {
     const record = body as Record<string, unknown>;
     if (typeof record.error === "string") return record.error;
-    if (record.error && typeof record.error === "object" && typeof (record.error as Record<string, unknown>).message === "string") {
+    if (
+      record.error &&
+      typeof record.error === "object" &&
+      typeof (record.error as Record<string, unknown>).message === "string"
+    ) {
       return (record.error as Record<string, unknown>).message as string;
     }
   }

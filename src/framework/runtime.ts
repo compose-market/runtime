@@ -5,14 +5,12 @@
  * Previously split across agent-registry.ts and workflow-registry.ts.
  * 
  * Key features:
- * - Agent: LangChain runtime instances, wallet derivation, knowledge persistence
+ * - Agent: LangChain runtime instances and wallet derivation
  * - Workflow: Workflow metadata, agent coordination
  * - Uses wallet address as primary identifier
- * - Persists knowledge to Pinata IPFS
  */
 import {
     createAgent,
-    createOpenClawAgent,
     type AgentConfig,
     type AgentInstance,
 } from "./manowar.js";
@@ -29,42 +27,6 @@ interface PinataUploadResponse {
     IpfsHash: string;
     PinSize: number;
     Timestamp: string;
-}
-
-/**
- * Upload JSON data to Pinata IPFS
- */
-async function uploadJSONToPinata<T extends object>(
-    data: T,
-    name: string,
-    keyvalues: Record<string, string>
-): Promise<string> {
-    if (!PINATA_JWT) {
-        console.warn("[runtime] Pinata not configured, using memory-only storage");
-        return "";
-    }
-
-    const response = await fetch(`${requirePinataApiUrl()}/pinning/pinJSONToIPFS`, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${PINATA_JWT}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            pinataContent: data,
-            pinataMetadata: { name, keyvalues },
-            pinataOptions: { cidVersion: 1 },
-        }),
-    });
-
-    if (!response.ok) {
-        const error = await response.text();
-        console.error(`[runtime] Pinata upload failed: ${error}`);
-        return "";
-    }
-
-    const result: PinataUploadResponse = await response.json();
-    return result.IpfsHash;
 }
 
 /**
@@ -177,7 +139,7 @@ export interface RegisteredAgent {
     /** LLM model to use */
     model: string;
     /** Framework to use for execution */
-    framework: "langchain" | "openclaw" | "eliza";
+    framework: "manowar";
     /** Plugin/capability IDs */
     plugins: string[];
     /** System prompt */
@@ -188,8 +150,6 @@ export interface RegisteredAgent {
     createdAt: Date;
     /** Last execution timestamp */
     lastExecutedAt?: Date;
-    /** Knowledge CID on Pinata (for persistence) */
-    knowledgeCid?: string;
 }
 
 export interface RegisterAgentParams {
@@ -203,22 +163,9 @@ export interface RegisterAgentParams {
     agentCardUri: string;
     creator: string;
     model?: string;
-    framework?: "langchain" | "openclaw" | "eliza";
+    framework?: "manowar";
     plugins?: string[];
     systemPrompt?: string;
-}
-
-export interface KnowledgeItem {
-    key: string;
-    content: string;
-    metadata?: Record<string, unknown>;
-    uploadedAt: string;
-}
-
-interface AgentKnowledgeStore {
-    walletAddress: string;
-    items: KnowledgeItem[];
-    lastUpdated: string;
 }
 
 interface ApiAgentPlugin {
@@ -233,7 +180,7 @@ interface ApiAgentCard {
     walletTimestamp?: number;
     chain: number;
     model: string;
-    framework: "langchain" | "openclaw" | "eliza";
+    framework: "manowar";
     plugins: ApiAgentPlugin[];
     creator: string;
     cid: string;
@@ -331,9 +278,6 @@ const agentInstances = new Map<string, AgentInstance>();
 
 /** Agent ID to wallet address mapping (for backward compatibility) */
 const agentIdToWallet = new Map<string, string>();
-
-/** In-memory knowledge cache */
-const knowledgeCache = new Map<string, KnowledgeItem[]>();
 
 /** Registered workflows by wallet address (ONLY lookup method) */
 const registeredWorkflows = new Map<string, RegisteredWorkflow>();
@@ -485,11 +429,7 @@ async function ensureAgentRuntimeInternal(walletAddress: string, incomingConfig?
 
     const warmupPromise = (async () => {
         try {
-            const framework = registeredAgents.get(walletAddress)?.framework || "langchain";
-            const instance =
-                framework === "openclaw"
-                    ? await createOpenClawAgent(config)
-                    : await createAgent(config);
+            const instance = await createAgent(config);
             agentInstances.set(walletAddress, instance);
             const registered = registeredAgents.get(walletAddress);
             if (registered) {
@@ -555,12 +495,6 @@ export async function registerAgent(
     const runtimeConfig = buildRuntimeConfig(walletAddress, wallet, params);
     agentRuntimeConfigs.set(walletAddress, runtimeConfig);
 
-    const requestedFramework = (params.framework || (runtimeConfig as any)?.framework) as string | undefined;
-    const normalizedFramework: RegisteredAgent["framework"] =
-        requestedFramework === "openclaw" || requestedFramework === "eliza"
-            ? requestedFramework
-            : "langchain";
-
     const registered: RegisteredAgent = {
         chainId: params.chainId,
         agentId,
@@ -571,7 +505,7 @@ export async function registerAgent(
         agentCardUri: params.agentCardUri,
         creator: params.creator,
         model: runtimeConfig.model || params.model || "unknown",
-        framework: normalizedFramework,
+        framework: "manowar",
         plugins: runtimeConfig.plugins || [],
         systemPrompt: params.systemPrompt,
         walletAddress,
@@ -581,18 +515,14 @@ export async function registerAgent(
     registeredAgents.set(walletAddress, registered);
     agentIdToWallet.set(agentId.toString(), walletAddress);
 
-    if (normalizedFramework) {
-        const warmupPromise = ensureAgentRuntimeInternal(walletAddress, runtimeConfig);
-        if (waitForRuntime) {
-            await warmupPromise;
-        }
+    const warmupPromise = ensureAgentRuntimeInternal(walletAddress, runtimeConfig);
+    if (waitForRuntime) {
+        await warmupPromise;
+    }
 
-        const readyInstance = agentInstances.get(walletAddress);
-        if (readyInstance) {
-            registered.instanceId = readyInstance.id;
-        }
-    } else {
-        agentRuntimeWarmupErrors.delete(walletAddress);
+    const readyInstance = agentInstances.get(walletAddress);
+    if (readyInstance) {
+        registered.instanceId = readyInstance.id;
     }
 
     return registeredAgents.get(walletAddress)!;
@@ -600,12 +530,6 @@ export async function registerAgent(
 
 export async function registerAgentWithWarmup(params: RegisterAgentParams): Promise<RegisterAgentWarmupResult> {
     const agent = await registerAgent(params, { waitForRuntime: false });
-    if (agent.framework === "openclaw") {
-        return {
-            agent,
-            status: "ready",
-        };
-    }
     const ready = Boolean(agentInstances.get(agent.walletAddress));
     return {
         agent,
@@ -651,7 +575,7 @@ function assertApiAgentCard(card: ApiAgentCard, walletAddress: string): asserts 
     if (!card.model || typeof card.model !== "string") {
         throw new Error(`Agent metadata.model is required for ${walletAddress}`);
     }
-    if (!card.framework || !["langchain", "openclaw", "eliza"].includes(card.framework)) {
+    if (!card.framework || card.framework !== "manowar") {
         throw new Error(`Agent metadata.framework is required for ${walletAddress}`);
     }
     if (!Array.isArray(card.plugins)) {
@@ -889,104 +813,7 @@ export function unregisterAgent(identifier: string): boolean {
     agentRuntimeWarmupErrors.delete(agent.walletAddress);
     agentRuntimeConfigs.delete(agent.walletAddress);
     agentIdToWallet.delete(agent.agentId.toString());
-    knowledgeCache.delete(agent.walletAddress);
     return registeredAgents.delete(agent.walletAddress);
-}
-
-// =============================================================================
-// Agent Knowledge Management (Pinata Persistence)
-// =============================================================================
-
-/**
- * Upload knowledge item to agent's knowledge store
- * Persists to Pinata IPFS for long-term storage
- */
-export async function uploadAgentKnowledge(
-    identifier: string,
-    key: string,
-    content: string,
-    metadata?: Record<string, unknown>
-): Promise<boolean> {
-    const agent = resolveAgent(identifier);
-    if (!agent) {
-        console.error(`[runtime] Agent not found: ${identifier}`);
-        return false;
-    }
-
-    const item: KnowledgeItem = {
-        key,
-        content,
-        metadata,
-        uploadedAt: new Date().toISOString(),
-    };
-
-    // Update in-memory cache
-    const existing = knowledgeCache.get(agent.walletAddress) || [];
-    const updated = existing.filter(i => i.key !== key); // Remove old version
-    updated.push(item);
-    knowledgeCache.set(agent.walletAddress, updated);
-
-    // Persist to Pinata
-    const store: AgentKnowledgeStore = {
-        walletAddress: agent.walletAddress,
-        items: updated,
-        lastUpdated: new Date().toISOString(),
-    };
-
-    const cid = await uploadJSONToPinata(store, `${agent.name}-knowledge`, {
-        type: "agent-knowledge",
-        walletAddress: agent.walletAddress,
-        agentId: agent.agentId.toString(),
-    });
-
-    if (cid) {
-        agent.knowledgeCid = cid;
-        console.log(`[runtime] Knowledge saved to Pinata: ${cid}`);
-    }
-
-    return true;
-}
-
-/**
- * Get all knowledge items for an agent
- */
-export async function getAgentKnowledge(identifier: string): Promise<KnowledgeItem[]> {
-    const agent = resolveAgent(identifier);
-    if (!agent) return [];
-
-    // Check cache first
-    const cached = knowledgeCache.get(agent.walletAddress);
-    if (cached) return cached;
-
-    // Try to load from Pinata
-    if (agent.knowledgeCid) {
-        const store = await fetchFromPinata<AgentKnowledgeStore>(agent.knowledgeCid);
-        if (store?.items) {
-            knowledgeCache.set(agent.walletAddress, store.items);
-            return store.items;
-        }
-    }
-
-    return [];
-}
-
-/**
- * List knowledge keys for an agent
- */
-export async function listAgentKnowledgeKeys(identifier: string): Promise<string[]> {
-    const items = await getAgentKnowledge(identifier);
-    return items.map(i => i.key);
-}
-
-/**
- * Get specific knowledge item
- */
-export async function getAgentKnowledgeItem(
-    identifier: string,
-    key: string
-): Promise<KnowledgeItem | undefined> {
-    const items = await getAgentKnowledge(identifier);
-    return items.find(i => i.key === key);
 }
 
 // =============================================================================

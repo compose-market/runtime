@@ -3,11 +3,18 @@ import type { StorageContext } from "@filoz/synapse-sdk/storage";
 import * as SessionKey from "@filoz/synapse-core/session-key";
 import { http } from "viem";
 import { privateKeyToAccount, toAccount } from "viem/accounts";
-import { createComposeDatasetMetadata, loadMeshSynapseConfig, resolveSynapseChain } from "./config.js";
+import {
+  createStateDatasetMetadata,
+  loadMeshSynapseConfig,
+  resolveSynapseChain,
+} from "./config.js";
 import type {
   LocalSynapseProvisionResponse,
+  MeshSessionRequest,
   MeshSynapseAnchorRequest,
 } from "./types.js";
+
+type ProvisionableRequest = MeshSessionRequest;
 
 function normalizeSynapseExpiryMs(value: number): number {
   if (!Number.isFinite(value) || value <= 0) {
@@ -16,7 +23,7 @@ function normalizeSynapseExpiryMs(value: number): number {
   return Math.floor(value / 1000) * 1000;
 }
 
-function buildSessionHeaders(request: MeshSynapseAnchorRequest): Record<string, string> {
+function buildSessionHeaders(request: ProvisionableRequest): Record<string, string> {
   return {
     Authorization: `Bearer ${request.composeKeyToken}`,
     "Content-Type": "application/json",
@@ -25,7 +32,7 @@ function buildSessionHeaders(request: MeshSynapseAnchorRequest): Record<string, 
   };
 }
 
-function apiUrl(request: MeshSynapseAnchorRequest): string {
+function apiUrl(request: ProvisionableRequest): string {
   return request.apiUrl.replace(/\/+$/, "");
 }
 
@@ -39,7 +46,7 @@ function minSessionExpiryMs(sessionKey: SessionKey.SessionKey<"Secp256k1">): num
 }
 
 function buildSessionKey(
-  request: MeshSynapseAnchorRequest,
+  request: ProvisionableRequest,
   payerAddress: `0x${string}`,
 ) {
   const config = loadMeshSynapseConfig();
@@ -67,7 +74,7 @@ function createReadOnlyPayerAccount(address: `0x${string}`) {
 }
 
 async function requestProvision(
-  request: MeshSynapseAnchorRequest,
+  request: ProvisionableRequest,
   options?: {
     depositAmount?: bigint;
   },
@@ -102,7 +109,7 @@ export interface ProvisionedSynapseClient {
 }
 
 export async function ensureProvisionedSynapseClient(
-  request: MeshSynapseAnchorRequest,
+  request: ProvisionableRequest,
   options?: {
     depositAmount?: bigint;
   },
@@ -179,7 +186,7 @@ export async function createMeshStorageContext(
   const config = loadMeshSynapseConfig();
   const context = await provisioned.synapse.storage.createContext({
     withCDN: true,
-    metadata: createComposeDatasetMetadata(config),
+    metadata: createStateDatasetMetadata(config),
   });
 
   return {

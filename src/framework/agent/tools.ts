@@ -9,9 +9,11 @@ import { z } from "zod";
 import type { ComposeTool } from "../../types.js";
 import type { AgentWallet } from "../../agent-wallet.js";
 import { getAgentExecutionContext } from "./context.js";
+import { searchKnowledge } from "../knowledge/index.js";
 import { addMemory, searchMemory, searchMemoryLayers } from "../memory/index.js";
 import { shouldEnforceCloudPermissions } from "../mode.js";
 import { isLocalMeshPublicationAvailable, queueLocalMeshPublication } from "../../mesh/publication-queue.js";
+import { resolveLocalBaseDir, writeLocalSkillDocument } from "../../mesh/workspace.js";
 import { executeGoatTool, getPlugin } from "../../mcps/goat.js";
 import { executeServerTool, getServerTools } from "../../mcps/mcp.js";
 import {
@@ -42,6 +44,7 @@ type BackpackConnectedAccount = {
 type AgentSessionContext = {
     sessionActive: boolean;
     sessionBudgetRemaining: number;
+    sessionGrants?: string[];
     cloudPermissions?: string[];
     backpackAccounts?: BackpackConnectedAccount[];
 };
@@ -91,6 +94,47 @@ function resolveSessionContext(input: SessionContextProvider): AgentSessionConte
         return input();
     }
     return input;
+}
+
+function createKnowledgeTools(input: {
+    agentWallet?: AgentWallet;
+    userAddress?: string;
+}): DynamicStructuredTool[] {
+    if (!input.agentWallet) {
+        return [];
+    }
+
+    return [
+        new DynamicStructuredTool({
+            name: "search_knowledge",
+            description: "Search the agent identity knowledge from the creator and, when a user is present, the private workspace knowledge for this specific user-agent pair. This does not inject documents by default; use it only when you need reference material.",
+            schema: z.object({
+                query: z.string().min(1).describe("Knowledge question or retrieval query"),
+                scope: z.enum(["identity", "workspace", "all"]).optional().describe("Limit search to creator identity knowledge, private workspace knowledge, or both"),
+                limit: z.number().int().min(1).max(8).optional().describe("Maximum number of knowledge hits to return"),
+            }),
+            func: async ({ query, scope, limit }: {
+                query: string;
+                scope?: "identity" | "workspace" | "all";
+                limit?: number;
+            }) => {
+                const results = await searchKnowledge({
+                    agentWallet: input.agentWallet!.address,
+                    userAddress: input.userAddress,
+                    query,
+                    scope,
+                    limit,
+                });
+                if (results.length === 0) {
+                    return "No relevant knowledge found.";
+                }
+
+                return results
+                    .map((item) => `[Knowledge ${item.scope} | score=${item.score.toFixed(2)}]\n${item.content}`)
+                    .join("\n\n");
+            },
+        }),
+    ];
 }
 
 // =============================================================================
@@ -171,9 +215,9 @@ function buildConsentRequiredError(permission: CloudPermissionKey): Error {
     }));
 }
 
-async function fetchBackpackPermissions(userId: string): Promise<CloudPermissionKey[]> {
+async function fetchBackpackPermissions(userAddress: string): Promise<CloudPermissionKey[]> {
     const response = await fetchWithRetry(
-        `${requireApiInternalUrl()}/api/backpack/permissions?userId=${encodeURIComponent(userId)}`,
+        `${requireApiInternalUrl()}/api/backpack/permissions?userAddress=${encodeURIComponent(userAddress)}`,
         {
             headers: buildApiInternalHeaders(),
         },
@@ -200,7 +244,7 @@ async function enforceToolPermissions(input: {
     toolName: string;
     toolDescription?: string;
     cloudPermissions?: string[];
-    userId?: string;
+    userAddress?: string;
 }): Promise<void> {
     if (!shouldEnforceCloudPermissions()) {
         return;
@@ -211,7 +255,7 @@ async function enforceToolPermissions(input: {
         return;
     }
 
-    const availablePermissions = input.cloudPermissions || (input.userId ? await fetchBackpackPermissions(input.userId) : []);
+    const availablePermissions = input.cloudPermissions || (input.userAddress ? await fetchBackpackPermissions(input.userAddress) : []);
     const grants = normalizeGrantedPermissions(availablePermissions);
 
     for (const permission of required) {
@@ -238,15 +282,9 @@ function isRetryableToolFailure(status: number, errorText: string): boolean {
 // Dynamic Consent Detection
 // =============================================================================
 
-/**
- * Infer consent type needed from error message or tool semantics.
- * Agent proactively understands what permissions are needed.
- * No hardcoded server names - works with any of 8000+ MCP servers.
- */
 function inferConsentFromError(errorText: string): string | null {
     const lowerError = errorText.toLowerCase();
 
-    // Filesystem indicators
     if (lowerError.includes("eacces") ||
         lowerError.includes("permission denied") ||
         lowerError.includes("file") && (lowerError.includes("access") || lowerError.includes("read") || lowerError.includes("write")) ||
@@ -255,28 +293,24 @@ function inferConsentFromError(errorText: string): string | null {
         return "filesystem";
     }
 
-    // Camera indicators
     if (lowerError.includes("camera") ||
         lowerError.includes("video") && lowerError.includes("capture") ||
         lowerError.includes("notreadableerror") && lowerError.includes("video")) {
         return "camera";
     }
 
-    // Microphone indicators
     if (lowerError.includes("microphone") ||
         lowerError.includes("audio") && lowerError.includes("recording") ||
         lowerError.includes("notreadableerror") && lowerError.includes("audio")) {
         return "microphone";
     }
 
-    // Location indicators
     if (lowerError.includes("geolocation") ||
         lowerError.includes("location") && lowerError.includes("denied") ||
         lowerError.includes("gps")) {
         return "geolocation";
     }
 
-    // Clipboard indicators
     if (lowerError.includes("clipboard") && lowerError.includes("denied")) {
         return "clipboard";
     }
@@ -284,10 +318,6 @@ function inferConsentFromError(errorText: string): string | null {
     return null;
 }
 
-/**
- * Infer consent type from tool name/description (proactive check).
- * Agent can check this BEFORE execution to prompt user upfront.
- */
 function inferConsentFromToolSemantics(toolName: string, toolDescription?: string): string | null {
     const text = `${toolName} ${toolDescription || ""}`.toLowerCase();
 
@@ -379,7 +409,7 @@ export async function createAgentTools(
     sessionContext?: SessionContextProvider,
     executionContext?: ToolExecutionContext,
     chainId?: number,
-    userId?: string,
+    userAddress?: string,
 ): Promise<DynamicStructuredTool[]> {
     const tools: DynamicStructuredTool[] = [];
     const usedToolNames = new Set<string>();
@@ -389,8 +419,18 @@ export async function createAgentTools(
         usedToolNames.add(tool.name);
     }
 
-    if (userId) {
-        for (const tool of createBackpackTools({ userId, sessionContext, executionContext })) {
+    for (const tool of createKnowledgeTools({ agentWallet, userAddress })) {
+        tools.push(tool);
+        usedToolNames.add(tool.name);
+    }
+
+    for (const tool of createLocalSkillTools({ agentWallet, sessionContext })) {
+        tools.push(tool);
+        usedToolNames.add(tool.name);
+    }
+
+    if (userAddress) {
+        for (const tool of createBackpackTools({ userAddress, sessionContext, executionContext })) {
             tools.push(tool);
             usedToolNames.add(tool.name);
         }
@@ -445,7 +485,7 @@ export async function createAgentTools(
                                 toolName: toolDef.name,
                                 toolDescription: toolDef.description,
                                 cloudPermissions: activeSessionContext?.cloudPermissions,
-                                userId,
+                                userAddress,
                             });
 
                             const result = await executeGoatTool(id, toolDef.name, args);
@@ -509,7 +549,7 @@ export async function createAgentTools(
                                 toolName: toolDef.name,
                                 toolDescription: toolDef.description || `MCP tool on server ${id}`,
                                 cloudPermissions: activeSessionContext?.cloudPermissions,
-                                userId,
+                                userAddress,
                             });
 
                             const toolKey = `${id}:${toolDef.name}`;
@@ -548,9 +588,9 @@ export async function createAgentTools(
     return tools;
 }
 
-async function fetchBackpackConnections(userId: string): Promise<BackpackConnectedAccount[]> {
+async function fetchBackpackConnections(userAddress: string): Promise<BackpackConnectedAccount[]> {
     const response = await fetchWithRetry(
-        `${requireApiInternalUrl()}/api/backpack/connections?userId=${encodeURIComponent(userId)}`,
+        `${requireApiInternalUrl()}/api/backpack/connections?userAddress=${encodeURIComponent(userAddress)}`,
         {
             headers: buildApiInternalHeaders(),
         },
@@ -601,7 +641,7 @@ async function fetchBackpackToolkitActions(toolkit: string, limit = 40): Promise
 }
 
 async function executeBackpackAction(input: {
-    userId: string;
+    userAddress: string;
     toolkit: string;
     action: string;
     params?: Record<string, unknown>;
@@ -631,7 +671,7 @@ async function executeBackpackAction(input: {
 }
 
 function createBackpackTools(input: {
-    userId: string;
+    userAddress: string;
     sessionContext?: SessionContextProvider;
     executionContext?: ToolExecutionContext;
 }): DynamicStructuredTool[] {
@@ -645,10 +685,10 @@ function createBackpackTools(input: {
                 toolName: "backpack_list_accounts",
                 toolDescription: "List connected Backpack accounts",
                 cloudPermissions: activeSessionContext?.cloudPermissions,
-                userId: input.userId,
+                userAddress: input.userAddress,
             });
 
-            const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userId);
+            const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userAddress);
             if (accounts.length === 0) {
                 return "No Backpack accounts are connected for this user.";
             }
@@ -669,7 +709,7 @@ function createBackpackTools(input: {
                 toolName: "backpack_list_actions",
                 toolDescription: `List Backpack actions for ${toolkit}`,
                 cloudPermissions: activeSessionContext?.cloudPermissions,
-                userId: input.userId,
+                userAddress: input.userAddress,
             });
 
             const actions = await fetchBackpackToolkitActions(toolkit, limit || 40);
@@ -700,17 +740,17 @@ function createBackpackTools(input: {
                 toolName: action,
                 toolDescription: `Execute Backpack action on ${toolkit}`,
                 cloudPermissions: activeSessionContext?.cloudPermissions,
-                userId: input.userId,
+                userAddress: input.userAddress,
             });
 
-            const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userId);
+            const accounts = activeSessionContext?.backpackAccounts || await fetchBackpackConnections(input.userAddress);
             const account = accounts.find((item) => item.slug === toolkit && item.connected);
             if (!account) {
                 throw new Error(`No connected Backpack account found for toolkit "${toolkit}"`);
             }
 
             const result = await executeBackpackAction({
-                userId: input.userId,
+                userAddress: input.userAddress,
                 toolkit,
                 action,
                 params,
@@ -762,7 +802,49 @@ function createMeshPublicationTools(input: {
     ];
 }
 
-export function createMem0Tools(agentId: string, userId?: string, workflowWallet?: string): DynamicStructuredTool[] {
+function createLocalSkillTools(input: {
+    agentWallet?: AgentWallet;
+    sessionContext?: SessionContextProvider;
+}): DynamicStructuredTool[] {
+    const baseDir = resolveLocalBaseDir();
+    if (!baseDir || !input.agentWallet) {
+        return [];
+    }
+    const agentWallet = input.agentWallet.address;
+
+    return [
+        new DynamicStructuredTool({
+            name: "save_local_skill",
+            description: "Persist a reusable skill only in this agent's local workspace on the user's device.",
+            schema: z.object({
+                skillName: z.string().min(1).max(120).describe("Human-readable local skill name"),
+                skillMarkdown: z.string().min(1).describe("SKILL.md content or skill body to persist locally"),
+            }),
+            func: async ({ skillName, skillMarkdown }: { skillName: string; skillMarkdown: string }) => {
+                const activeSessionContext = resolveSessionContext(input.sessionContext);
+                const grants = new Set(
+                    (activeSessionContext?.sessionGrants || [])
+                        .map((item) => item.trim().toLowerCase())
+                        .filter(Boolean),
+                );
+
+                if (grants.size > 0 && !grants.has("*") && !grants.has("fs.write") && !grants.has("fs.edit")) {
+                    throw new Error("Permission denied for local skill persistence");
+                }
+
+                const result = await writeLocalSkillDocument(baseDir, {
+                    agentWallet,
+                    skillName,
+                    skillMarkdown,
+                });
+
+                return JSON.stringify(result);
+            },
+        }),
+    ];
+}
+
+export function createMem0Tools(agentId: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
     const context = getAgentExecutionContext();
 
     const searchKnowledge = new DynamicStructuredTool({
@@ -777,7 +859,7 @@ export function createMem0Tools(agentId: string, userId?: string, workflowWallet
             const items = await searchMemory({
                 query,
                 agent_id: agentId,
-                user_id: userId,
+                user_id: userAddress,
                 run_id: context?.threadId,
                 limit: 8,
                 enable_graph: true,
@@ -797,7 +879,7 @@ export function createMem0Tools(agentId: string, userId?: string, workflowWallet
             const saved = await addMemory({
                 messages: [{ role: "user", content }],
                 agent_id: agentId,
-                user_id: userId,
+                user_id: userAddress,
                 run_id: context?.threadId,
                 enable_graph: true,
                 metadata: {
@@ -822,7 +904,7 @@ export function createMem0Tools(agentId: string, userId?: string, workflowWallet
             const results = await searchMemoryLayers({
                 query,
                 agentWallet: agentId,
-                userAddress: userId,
+                userAddress: userAddress,
                 threadId: context?.threadId,
                 layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || ["working", "scene", "graph", "patterns", "archives"],
                 limit: 5,
@@ -836,10 +918,10 @@ export function createMem0Tools(agentId: string, userId?: string, workflowWallet
 
 export interface EnhancedMemoryToolsConfig {
     agentId: string;
-    userId?: string;
+    userAddress?: string;
     workflowWallet?: string;
 }
 
 export function createEnhancedMemoryTools(config: EnhancedMemoryToolsConfig): DynamicStructuredTool[] {
-    return createMem0Tools(config.agentId, config.userId, config.workflowWallet);
+    return createMem0Tools(config.agentId, config.userAddress, config.workflowWallet);
 }

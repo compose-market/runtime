@@ -7,8 +7,6 @@ import { createPublicClient, http, type PublicClient } from "viem";
 import {
     avalancheFuji,
     avalanche,
-    cronosTestnet,
-    cronos,
     arbitrumSepolia,
     arbitrum,
     bscTestnet,
@@ -19,9 +17,6 @@ export const CHAIN_IDS = {
     // Avalanche
     avalancheFuji: 43113,
     avalanche: 43114,
-    // Cronos
-    cronosTestnet: 338,
-    cronos: 25,
     // Arbitrum
     arbitrumSepolia: 421614,
     arbitrum: 42161,
@@ -35,8 +30,6 @@ export type ChainId = typeof CHAIN_IDS[keyof typeof CHAIN_IDS];
 const CHAIN_MAP: Record<number, any> = {
     [CHAIN_IDS.avalancheFuji]: avalancheFuji,
     [CHAIN_IDS.avalanche]: avalanche,
-    [CHAIN_IDS.cronosTestnet]: cronosTestnet,
-    [CHAIN_IDS.cronos]: cronos,
     [CHAIN_IDS.arbitrumSepolia]: arbitrumSepolia,
     [CHAIN_IDS.arbitrum]: arbitrum,
     [CHAIN_IDS.bscTestnet]: bscTestnet,
@@ -46,8 +39,6 @@ const CHAIN_MAP: Record<number, any> = {
 const RPC_ENV_MAP: Record<number, string> = {
     [CHAIN_IDS.avalancheFuji]: "AVALANCHE_FUJI_RPC",
     [CHAIN_IDS.avalanche]: "AVALANCHE_MAINNET_RPC",
-    [CHAIN_IDS.cronosTestnet]: "CRONOS_TESTNET_RPC",
-    [CHAIN_IDS.cronos]: "CRONOS_MAINNET_RPC",
     [CHAIN_IDS.arbitrumSepolia]: "ARBITRUM_SEPOLIA_RPC",
     [CHAIN_IDS.arbitrum]: "ARBITRUM_MAINNET_RPC",
     [CHAIN_IDS.bscTestnet]: "BSC_TESTNET_RPC",

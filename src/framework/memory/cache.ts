@@ -66,7 +66,7 @@ export function createContentHash(content: string): string {
 export function getVectorQueryCacheKey(input: {
     query: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     limit?: number;
     threshold?: number;
@@ -102,7 +102,7 @@ export function getLayerQueryCacheKey(input: {
 export function getGraphQueryCacheKey(input: {
     query: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     limit?: number;
     rerank?: boolean;

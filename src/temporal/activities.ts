@@ -12,7 +12,8 @@ import {
 } from "./constants.js";
 import { getTemporalClient } from "./client.js";
 import type { ExecuteAgentWorkflowInput, ExecuteWorkflowWorkflowInput, WorkflowWorkflowResult, ProgressSignalPayload } from "./types.js";
-import { buildRuntimeInternalHeaders, requireRuntimeServiceUrl } from "../auth.js";
+import { executeServerTool } from "../mcps/mcp.js";
+import { executeGoatTool } from "../mcps/goat.js";
 
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 30000; // Optimized: 30s instead of 5s (6x cost reduction)
 const APPROVAL_MAX_WAIT_MS = 60 * 60 * 1000;
@@ -422,24 +423,7 @@ export async function executeMcpToolActivity(
     });
 
     try {
-        const response = await fetch(
-            `${requireRuntimeServiceUrl()}/mcp/servers/${input.serverId}/tools/${input.toolName}`,
-            {
-                method: "POST",
-                headers: buildRuntimeInternalHeaders({
-                    "Content-Type": "application/json",
-                    "x-compose-run-id": input.composeRunId,
-                }),
-                body: JSON.stringify({ args: input.args }),
-            },
-        );
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`MCP tool execution failed: ${response.status} - ${errorText}`);
-        }
-
-        const data = await response.json();
+        const result = await executeServerTool(input.serverId, input.toolName, input.args);
         const executionTimeMs = Date.now() - startTime;
 
         Context.current().heartbeat({
@@ -451,7 +435,7 @@ export async function executeMcpToolActivity(
 
         return {
             success: true,
-            result: data.result,
+            result,
             executionTimeMs,
         };
     } catch (error) {
@@ -497,24 +481,10 @@ export async function executeGoatToolActivity(
     });
 
     try {
-        const response = await fetch(
-            `${requireRuntimeServiceUrl()}/goat/plugins/${input.pluginId}/tools/${input.toolName}`,
-            {
-                method: "POST",
-                headers: buildRuntimeInternalHeaders({
-                    "Content-Type": "application/json",
-                    "x-compose-run-id": input.composeRunId,
-                }),
-                body: JSON.stringify({ args: input.args }),
-            },
-        );
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`GOAT tool execution failed: ${response.status} - ${errorText}`);
+        const result = await executeGoatTool(input.pluginId, input.toolName, input.args);
+        if (!result.success) {
+            throw new Error(result.error || `GOAT tool execution failed: ${input.toolName}`);
         }
-
-        const data = await response.json();
         const executionTimeMs = Date.now() - startTime;
 
         Context.current().heartbeat({
@@ -526,7 +496,7 @@ export async function executeGoatToolActivity(
 
         return {
             success: true,
-            result: data.result,
+            result: result.result,
             executionTimeMs,
         };
     } catch (error) {

@@ -1,15 +1,13 @@
 /**
  * Framework Module
- *
  * `manowar` is the single runtime surface for agent execution.
- * It subsumes the old LangChain/OpenClaw split while preserving
- * agent-card framework metadata for registration and UX.
  */
 
 export * as manowar from "./manowar.js";
+export * as knowledge from "./knowledge/index.js";
 export * as runtime from "./runtime.js";
 
-export type FrameworkType = "eliza" | "langchain" | "openclaw";
+export type FrameworkType = "manowar";
 
 export interface FrameworkInfo {
   id: FrameworkType;
@@ -21,24 +19,10 @@ export interface FrameworkInfo {
 
 export const FRAMEWORKS: FrameworkInfo[] = [
   {
-    id: "eliza",
-    name: "ElizaOS",
-    description: "Agent framework with 200+ plugins for blockchain, social, AI, and more",
-    features: ["200+ plugins", "Natural language actions", "Multi-chain support", "Social integrations"],
-    status: "active",
-  },
-  {
-    id: "langchain",
-    name: "LangChain",
-    description: "LangGraph-backed agent runtime surfaced through Manowar",
-    features: ["LangGraph agents", "Built-in memory", "RAG support", "Tool calling"],
-    status: "active",
-  },
-  {
-    id: "openclaw",
-    name: "OpenClaw",
-    description: "Continuous skills-first runtime surfaced through Manowar",
-    features: ["Infinite memory", "800+ connectors access", "Web access", "Self-learning"],
+    id: "manowar",
+    name: "Manowar",
+    description: "Unified runtime for agent execution across chat, streaming, mesh, and skills",
+    features: ["Unified execution", "Built-in memory", "Tool calling", "Mesh integration"],
     status: "active",
   },
 ];

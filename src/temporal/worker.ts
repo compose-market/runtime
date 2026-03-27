@@ -13,6 +13,7 @@ import {
     getTemporalDeploymentMetadata,
     getTemporalDeploymentVersion,
     getTemporalNamespace,
+    getRuntimeRootDirectory,
     isTemporalConfigured,
 } from "./client.js";
 import { getEncryptionStatus } from "./encryption.js";
@@ -78,8 +79,7 @@ function resolveWorkflowsPath(): string {
 
 function resolveWorkflowBundle(): { codePath: string } | undefined {
     // Production optimization: use pre-built workflow bundle if available
-    const currentDir = path.dirname(fileURLToPath(import.meta.url));
-    const bundlePath = path.join(currentDir, "..", "..", "dist", "workflow-bundle.js");
+    const bundlePath = path.join(getRuntimeRootDirectory(), "dist", "workflow-bundle.js");
 
     if (process.env.NODE_ENV === "production" && fs.existsSync(bundlePath)) {
         console.log(`[temporal/worker] Using pre-built workflow bundle: ${bundlePath}`);

@@ -116,7 +116,7 @@ export async function searchMemory(params: MemorySearchParams): Promise<MemoryIt
     const cacheKey = getGraphQueryCacheKey({
         query: params.query,
         agentWallet: params.agent_id || "unknown",
-        userId: params.user_id,
+        userAddress: params.user_id,
         threadId: params.run_id,
         limit: params.limit,
         rerank: params.rerank,

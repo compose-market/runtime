@@ -79,7 +79,7 @@ export interface SearchResult {
     score: number;
     source: MemoryVector["source"];
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     decayScore: number;
     accessCount: number;
@@ -89,7 +89,7 @@ export interface SearchResult {
 export interface HybridSearchParams {
     query: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     limit?: number;
     threshold?: number;
@@ -214,7 +214,7 @@ export interface SessionMemory {
     _id?: ObjectId;
     sessionId: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     workingMemory: {
         context: string[];
@@ -231,7 +231,7 @@ export interface MemoryVector {
     _id?: ObjectId;
     vectorId: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     content: string;
     embedding: number[];
@@ -249,7 +249,7 @@ export interface SessionTranscript {
     sessionId: string;
     threadId: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     messages: Array<{
         role: "user" | "assistant" | "system" | "tool";
         content: string;
@@ -273,7 +273,7 @@ export const MEMORY_VECTOR_INDEXES: { key: { [key: string]: IndexDirection }; na
     { key: { vectorId: 1 }, name: "idx_vector_id" },
     { key: { agentWallet: 1, createdAt: -1 }, name: "idx_vector_wallet_created" },
     { key: { agentWallet: 1, threadId: 1 }, name: "idx_vector_wallet_thread" },
-    { key: { userId: 1 }, name: "idx_vector_user" },
+    { key: { userAddress: 1 }, name: "idx_vector_user" },
     { key: { source: 1 }, name: "idx_vector_source" },
     { key: { decayScore: -1 }, name: "idx_vector_decay" },
     { key: { lastAccessedAt: -1 }, name: "idx_vector_last_accessed" },
@@ -284,7 +284,7 @@ export const TRANSCRIPT_INDEXES: { key: { [key: string]: IndexDirection }; name:
     { key: { threadId: 1 }, name: "idx_transcript_thread_id" },
     { key: { agentWallet: 1 }, name: "idx_transcript_wallet" },
     { key: { agentWallet: 1, createdAt: -1 }, name: "idx_transcript_wallet_created" },
-    { key: { userId: 1 }, name: "idx_transcript_user" },
+    { key: { userAddress: 1 }, name: "idx_transcript_user" },
 ];
 
 export const PATTERN_INDEXES: { key: { [key: string]: IndexDirection }; name: string }[] = [

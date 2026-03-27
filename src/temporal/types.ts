@@ -34,14 +34,14 @@ export interface ExecuteAgentWorkflowInput {
     message: string;
     options: {
         threadId?: string;
-        userId?: string;
+        userAddress?: string;
         workflowWallet?: string;
         attachment?: Record<string, unknown>;
         sessionContext?: {
             sessionActive: boolean;
             sessionBudgetRemaining: number;
-            grantedPermissions?: string[];
-            permissionPolicy?: Record<string, "allow" | "ask" | "deny">;
+            sessionGrants?: string[];
+            cloudPermissions?: string[];
             backpackAccounts?: Array<{
                 slug: string;
                 name: string;

@@ -56,7 +56,17 @@ export function resolveAuthoritativeTokens(
         }
     }
 
-    throw (lastError instanceof Error ? lastError : new Error("authoritative usage is required"));
+    console.warn(
+        "[LangSmith] No authoritative usage found for response; defaulting token totals to zero.",
+        lastError instanceof Error ? lastError.message : String(lastError ?? "unknown"),
+    );
+    return {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 0,
+        source: "direct_fields",
+    };
 }
 
 export interface MemoryRetrievalMetrics {

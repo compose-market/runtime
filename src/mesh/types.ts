@@ -1,4 +1,25 @@
-export interface MeshSynapseAnchorRequest {
+export type MeshSharedArtifactKind = "learning" | "report" | "resource" | "ticket";
+export type MeshSignedRequestAction = "compose.state.read.v1";
+
+export interface MeshSignedRequestEnvelope {
+  version: 1;
+  kind: "compose.mesh.request.v1";
+  action: MeshSignedRequestAction;
+  collection: "compose";
+  requesterHaiId: string;
+  requesterAgentWallet: `0x${string}`;
+  requesterUserAddress: `0x${string}`;
+  requesterDeviceId: string;
+  requesterPeerId: string;
+  targetPath: string;
+  targetPieceCid?: string | null;
+  targetDataSetId?: string | null;
+  targetPieceId?: string | null;
+  signedAt: number;
+  signature: string;
+}
+
+export interface MeshSessionRequest {
   apiUrl: string;
   composeKeyToken: string;
   userAddress: `0x${string}`;
@@ -6,15 +27,18 @@ export interface MeshSynapseAnchorRequest {
   deviceId: string;
   chainId: number;
   targetSynapseExpiry: number;
+  sessionKeyPrivateKey: `0x${string}`;
+  payerAddress?: `0x${string}` | null;
+  sessionKeyExpiresAt?: number | null;
+}
+
+export interface MeshSynapseAnchorRequest extends MeshSessionRequest {
   haiId: string;
   updateNumber: number;
   path: string;
   canonicalSnapshotJson: string;
   stateRootHash: `0x${string}`;
   envelopeJson: string;
-  sessionKeyPrivateKey: `0x${string}`;
-  payerAddress?: `0x${string}` | null;
-  sessionKeyExpiresAt?: number | null;
 }
 
 export interface MeshSynapseAnchorResponse {
@@ -36,6 +60,68 @@ export interface MeshSynapseAnchorResponse {
   source: string;
 }
 
+export interface MeshSynapseReadRequest extends MeshSessionRequest {
+  updateNumber: number;
+  stateRootHash: `0x${string}`;
+  haiId: string;
+  artifactKind: MeshSharedArtifactKind;
+  path: string;
+  fileName: string;
+  rootCid: string;
+  pieceCid: string;
+  dataSetId: string;
+  pieceId: string;
+  signedRequestJson: string;
+}
+
+export interface MeshSharedArtifactPinRequest extends MeshSessionRequest {
+  signedRequestJson: string;
+  haiId: string;
+  artifactKind: MeshSharedArtifactKind;
+  artifactNumber: number;
+  path: string;
+  payloadJson: string;
+  publisherAddress?: `0x${string}` | null;
+  accessPriceUsdc?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  copies?: number;
+}
+
+export interface MeshSharedArtifactPinResponse {
+  haiId: string;
+  artifactKind: MeshSharedArtifactKind;
+  artifactNumber: number;
+  path: string;
+  fileName: string;
+  latestAlias: string;
+  rootCid: string;
+  pieceCid: string;
+  payloadSize: number;
+  copyCount: number;
+  providerId: string;
+  dataSetId: string | null;
+  pieceId: string | null;
+  retrievalUrl: string | null;
+  payerAddress: `0x${string}`;
+  sessionKeyExpiresAt: number;
+  source: string;
+  collection: "knowledge";
+}
+
+export interface MeshSharedArtifactReadRequest extends MeshSessionRequest {
+}
+
+export interface MeshSharedArtifactReadResponse {
+  haiId: string;
+  artifactKind: MeshSharedArtifactKind;
+  path: string;
+  fileName: string;
+  rootCid: string;
+  payloadJson: string;
+  collection: "learnings";
+}
+
 export interface LocalSynapseProvisionResponse {
   success: true;
   payerAddress: `0x${string}`;
@@ -44,6 +130,6 @@ export interface LocalSynapseProvisionResponse {
   availableFunds: string;
   depositAmount: string;
   depositExecuted: boolean;
-  network: "calibration" | "mainnet" | "devnet";
+  network: "calibration" | "mainnet";
   source: string;
 }

@@ -51,7 +51,7 @@ export interface DelegationOptions {
     /** Idempotency key to deduplicate retries */
     idempotencyKey?: string;
     /** End user wallet context for nested agent execution */
-    userId?: string;
+    userAddress?: string;
     /** Thread/session context from orchestrator request */
     threadId?: string;
     /** Workflow wallet */
@@ -126,7 +126,7 @@ export async function callAgent(
             method: "POST",
             headers: buildEmbeddedRuntimeHeaders({
                 "Content-Type": "application/json",
-                ...(options.userId ? { "x-session-user-address": options.userId } : {}),
+                ...(options.userAddress ? { "x-session-user-address": options.userAddress } : {}),
                 ...(typeof options.sessionActive === "boolean"
                     ? { "x-session-active": options.sessionActive ? "true" : "false" }
                     : {}),
@@ -140,7 +140,7 @@ export async function callAgent(
                 workflowWallet: options.workflowWallet,
                 ...(options.cloudPermissions ? { cloudPermissions: options.cloudPermissions } : {}),
                 composeRunId: options.composeRunId,
-                userId: options.userId,
+                userAddress: options.userAddress,
             }),
             signal: controller.signal,
         });

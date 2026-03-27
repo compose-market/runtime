@@ -5,20 +5,37 @@ import path from "node:path";
 const REQUEST_POLL_INTERVAL_MS = 250;
 const DEFAULT_WAIT_TIMEOUT_MS = 90_000;
 
-export interface MeshPublicationQueueRequest {
+export type MeshPublicationQueueKind = "manifest.publish" | "learning.pin";
+
+interface MeshPublicationQueueBaseRequest {
   requestId: string;
+  kind: MeshPublicationQueueKind;
   agentWallet: `0x${string}`;
   requestedAt: number;
+}
+
+export interface MeshPublicationQueueRequest extends MeshPublicationQueueBaseRequest {
   reason?: string;
+  title?: string;
+  summary?: string;
+  content?: string;
+  accessPriceUsdc?: string;
 }
 
 export interface MeshPublicationQueueResult {
   requestId: string;
+  kind?: MeshPublicationQueueKind;
   success: boolean;
   error?: string;
   haiId?: string;
   updateNumber?: number;
+  artifactKind?: "learning" | "report" | "resource" | "ticket";
+  artifactNumber?: number;
   path?: string;
+  latestAlias?: string;
+  rootCid?: string;
+  pieceCid?: string;
+  collection?: "learnings";
   stateRootHash?: string;
   pdpPieceCid?: string;
   pdpAnchoredAt?: number;
@@ -61,13 +78,13 @@ export function isLocalMeshPublicationAvailable(env: NodeJS.ProcessEnv = process
   return env.RUNTIME_HOST_MODE === "local" && String(env.COMPOSE_LOCAL_BASE_DIR || "").trim().length > 0;
 }
 
-export async function queueLocalMeshPublication(input: {
-  agentWallet: `0x${string}`;
-  reason?: string;
-}, options?: {
-  env?: NodeJS.ProcessEnv;
-  timeoutMs?: number;
-}): Promise<MeshPublicationQueueResult> {
+async function queueLocalMeshRequest(
+  request: MeshPublicationQueueRequest,
+  options?: {
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+  },
+): Promise<MeshPublicationQueueResult> {
   const env = options?.env || process.env;
   if (!isLocalMeshPublicationAvailable(env)) {
     throw new Error("Local mesh publication is only available inside the local runtime host");
@@ -75,14 +92,6 @@ export async function queueLocalMeshPublication(input: {
 
   const baseDir = normalizeBaseDir(env.COMPOSE_LOCAL_BASE_DIR);
   const timeoutMs = options?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
-  const request: MeshPublicationQueueRequest = {
-    requestId: `mesh-publish-${randomUUID()}`,
-    agentWallet: input.agentWallet.toLowerCase() as `0x${string}`,
-    requestedAt: Date.now(),
-    ...(input.reason && input.reason.trim().length > 0
-      ? { reason: input.reason.trim() }
-      : {}),
-  };
 
   await mkdir(requestDir(baseDir), { recursive: true });
   await mkdir(resultDir(baseDir), { recursive: true });
@@ -111,4 +120,44 @@ export async function queueLocalMeshPublication(input: {
   }
 
   throw new Error(`Timed out waiting for local mesh publication result after ${timeoutMs}ms`);
+}
+
+export async function queueLocalMeshPublication(input: {
+  agentWallet: `0x${string}`;
+  reason?: string;
+}, options?: {
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+}): Promise<MeshPublicationQueueResult> {
+  return queueLocalMeshRequest({
+    requestId: `mesh-publish-${randomUUID()}`,
+    kind: "manifest.publish",
+    agentWallet: input.agentWallet.toLowerCase() as `0x${string}`,
+    requestedAt: Date.now(),
+    ...(input.reason && input.reason.trim().length > 0
+      ? { reason: input.reason.trim() }
+      : {}),
+    }, options);
+  }
+  
+  export async function queueLocalMeshLearning(input: {
+    agentWallet: `0x${string}`;
+    title: string;
+    summary: string;
+    content: string;
+    accessPriceUsdc?: string;
+  }, options?: {
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+  }): Promise<MeshPublicationQueueResult> {
+    return queueLocalMeshRequest({
+      requestId: `mesh-learning-${randomUUID()}`,
+      kind: "learning.pin",
+      agentWallet: input.agentWallet.toLowerCase() as `0x${string}`,
+      requestedAt: Date.now(),
+      title: input.title.trim(),
+      summary: input.summary.trim(),
+      content: input.content.trim(),
+      ...(input.accessPriceUsdc?.trim() ? { accessPriceUsdc: input.accessPriceUsdc.trim() } : {}),
+  }, options);
 }

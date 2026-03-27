@@ -120,7 +120,7 @@ async function ensureIndexes(targetDb: Db): Promise<void> {
                             similarity: "cosine",
                         },
                         agentWallet: { type: "token" },
-                        userId: { type: "token" },
+                        userAddress: { type: "token" },
                         threadId: { type: "token" },
                         source: { type: "token" },
                         decayScore: { type: "number" },

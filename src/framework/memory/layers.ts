@@ -83,7 +83,7 @@ function summarizeArchive(record: MemoryArchive): Record<string, unknown> {
 export function buildWorkingLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userAddress" | "threadId">): Record<string, unknown> {
     const filter: Record<string, unknown> = { agentWallet: params.agentWallet };
     if (params.userAddress) {
-        filter.userId = params.userAddress;
+        filter.userAddress = params.userAddress;
     }
     if (params.threadId) {
         filter.threadId = params.threadId;
@@ -94,7 +94,7 @@ export function buildWorkingLayerFilter(params: Pick<LayeredSearchParams, "agent
 export function buildSceneLayerFilter(params: Pick<LayeredSearchParams, "agentWallet" | "userAddress" | "threadId">): Record<string, unknown> {
     const filter: Record<string, unknown> = { agentWallet: params.agentWallet };
     if (params.userAddress) {
-        filter.userId = params.userAddress;
+        filter.userAddress = params.userAddress;
     }
     if (params.threadId) {
         filter.threadId = params.threadId;
@@ -196,7 +196,7 @@ export async function searchMemoryLayers(params: LayeredSearchParams): Promise<L
         const vectors = await searchVectors({
             query: params.query,
             agentWallet: params.agentWallet,
-            userId: params.userAddress,
+            userAddress: params.userAddress,
             threadId: params.threadId,
             limit,
             options: {

@@ -4,7 +4,7 @@ export interface AgentExecutionContext {
     composeRunId?: string;
     threadId?: string;
     agentWallet?: string;
-    userId?: string;
+    userAddress?: string;
     workflowWallet?: string;
 }
 

@@ -540,7 +540,7 @@ ${this.workflowCard?.agents?.map((agentCard: { name: string; model: string; plug
                         {
                             composeRunId: runId,
                             idempotencyKey: `${runId}:${nextStep.stepNumber}:${nextStep.agentName}`,
-                            userId: options.userId,
+                            userAddress: options.userAddress,
                             threadId: options.threadId,
                             workflowWallet: walletAddress,
                             sessionActive: options.payment?.sessionActive ?? false,

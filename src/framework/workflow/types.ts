@@ -422,7 +422,7 @@ export interface PaymentContext {
     /** Resource URL base for x402 */
     resourceUrlBase: string;
     /** Authenticated user address (if known) */
-    userId?: string;
+    userAddress?: string;
 }
 
 // =============================================================================
@@ -535,7 +535,7 @@ export interface ExecutorOptions {
     /** Attachment URL (image, document, etc.) to include in context */
     attachmentUrl?: string;
     /** End-user identity for nested standalone-agent delegation */
-    userId?: string;
+    userAddress?: string;
     /** Conversation thread identifier propagated to delegated agents */
     threadId?: string;
     /** Orchestrating workflow wallet for delegated agent context */

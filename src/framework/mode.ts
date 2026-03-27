@@ -22,3 +22,9 @@ export function shouldInitializeWorkflowRuntime(options?: {
 
   return resolveRuntimeHostMode({ env }) !== "local";
 }
+
+export function shouldEnforceCloudPermissions(options?: {
+  env?: NodeJS.ProcessEnv;
+}): boolean {
+  return resolveRuntimeHostMode(options) === "cloud";
+}

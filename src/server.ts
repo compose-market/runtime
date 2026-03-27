@@ -11,7 +11,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { z } from "zod";
-import { registerOrchestrationRoutes, initializeWorkflowRuntime } from "./orchestration.js";
+import { registerOrchestrationRoutes, initializeWorkflowRuntime, registerWorkspaceRoutes } from "./orchestration.js";
 import { requireRuntimeInternalToken } from "./auth.js";
 import {
   getRuntimeStatus,
@@ -36,6 +36,7 @@ import {
   shouldInitializeWorkflowRuntime,
 } from "./framework/mode.js";
 import { createMeshRouter } from "./mesh/routes.js";
+import { initializeLocalAgentHeartbeatHost } from "./mesh/supervisor.js";
 
 const app = express();
 
@@ -57,6 +58,9 @@ const corsOptions: CorsOptions = {
     "Authorization",
     "x-compose-run-id",
     "x-idempotency-key",
+    "x-session-active",
+    "x-session-user-address",
+    "x-session-budget-remaining",
     "access-control-expose-headers"
   ],
   exposedHeaders: ["*", "PAYMENT-RESPONSE", "payment-response", "x-session-id"]
@@ -304,6 +308,7 @@ if (shouldInitializeWorkflowRuntime()) {
   initializeWorkflowRuntime();
 }
 app.use("/internal/workflow", orchestrationRouter);
+registerWorkspaceRoutes(app);
 
 app.get("/status", asyncHandler(async (req: Request, res: Response) => {
   // Alias for /health but explicitly requested by Connector
@@ -723,12 +728,21 @@ export function shouldAutoStartRuntimeServer(options: RuntimeAutostartOptions = 
 
 let runtimeServerPromise: Promise<HttpServer> | null = null;
 
+export function initializeLocalRuntimeHostServices(env: NodeJS.ProcessEnv = process.env): void {
+  if (resolveRuntimeHostMode({ env }) !== "local") {
+    return;
+  }
+
+  initializeLocalAgentHeartbeatHost(env);
+}
+
 export async function startRuntimeServer(port?: number): Promise<HttpServer> {
   if (runtimeServerPromise) {
     return await runtimeServerPromise;
   }
 
   const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
+  initializeLocalRuntimeHostServices(process.env);
   runtimeServerPromise = new Promise<HttpServer>((resolve, reject) => {
     const server = app.listen(resolvedPort);
 

@@ -17,7 +17,7 @@ import {
 
 export interface VectorSearchRequest {
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     query: string;
     queryEmbedding: number[];
@@ -28,7 +28,7 @@ export interface VectorSearchRequest {
 
 export interface VectorIndexParams {
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     content: string;
     embedding: number[];
@@ -39,12 +39,12 @@ export interface VectorIndexParams {
 
 function buildVectorFilter(params: {
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
 }): Record<string, unknown> {
     const filter: Record<string, unknown> = { agentWallet: params.agentWallet };
-    if (params.userId) {
-        filter.userId = params.userId;
+    if (params.userAddress) {
+        filter.userAddress = params.userAddress;
     }
     if (params.threadId) {
         filter.threadId = params.threadId;
@@ -62,7 +62,7 @@ async function fallbackKeywordVectorSearch(params: VectorSearchRequest): Promise
     const vectors = await getMemoryVectorsCollection();
     const filter = buildVectorFilter({
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
     });
 
@@ -87,7 +87,7 @@ async function fallbackKeywordVectorSearch(params: VectorSearchRequest): Promise
                 score,
                 source: doc.source,
                 agentWallet: doc.agentWallet,
-                userId: doc.userId,
+                userAddress: doc.userAddress,
                 threadId: doc.threadId,
                 decayScore: doc.decayScore,
                 accessCount: doc.accessCount,
@@ -119,7 +119,7 @@ export async function hybridVectorSearch(params: VectorSearchRequest): Promise<S
     const threshold = params.threshold ?? 0.2;
     const filter = buildVectorFilter({
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
     });
 
@@ -165,7 +165,7 @@ export async function hybridVectorSearch(params: VectorSearchRequest): Promise<S
             content: string;
             source: MemoryVector["source"];
             agentWallet: string;
-            userId?: string;
+            userAddress?: string;
             threadId?: string;
             decayScore: number;
             accessCount: number;
@@ -180,7 +180,7 @@ export async function hybridVectorSearch(params: VectorSearchRequest): Promise<S
             score: item.adjustedScore,
             source: item.source,
             agentWallet: item.agentWallet,
-            userId: item.userId,
+            userAddress: item.userAddress,
             threadId: item.threadId,
             decayScore: item.decayScore,
             accessCount: item.accessCount,
@@ -206,7 +206,7 @@ export async function indexVector(params: VectorIndexParams): Promise<{ vectorId
     await vectors.insertOne({
         vectorId,
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
         content: params.content,
         embedding: params.embedding,
@@ -221,7 +221,7 @@ export async function indexVector(params: VectorIndexParams): Promise<{ vectorId
 
     await invalidateMemoryScope({
         agentWallet: params.agentWallet,
-        userAddress: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
     });
 
@@ -231,7 +231,7 @@ export async function indexVector(params: VectorIndexParams): Promise<{ vectorId
 export async function indexMemoryContent(params: {
     content: string;
     agentWallet: string;
-    userId?: string;
+    userAddress?: string;
     threadId?: string;
     source: MemoryVector["source"];
     metadata?: Record<string, unknown>;
@@ -239,7 +239,7 @@ export async function indexMemoryContent(params: {
     const embedding = await getEmbedding(params.content);
     const indexed = await indexVector({
         agentWallet: params.agentWallet,
-        userId: params.userId,
+        userAddress: params.userAddress,
         threadId: params.threadId,
         content: params.content,
         embedding: embedding.embedding,
@@ -257,7 +257,7 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
     const {
         query,
         agentWallet,
-        userId,
+        userAddress,
         threadId,
         limit = 10,
         threshold,
@@ -267,7 +267,7 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
     const cacheKey = getVectorQueryCacheKey({
         query,
         agentWallet,
-        userId,
+        userAddress,
         threadId,
         limit,
         threshold,
@@ -286,7 +286,7 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
         query,
         queryEmbedding: queryEmbedding.embedding,
         agentWallet,
-        userId,
+        userAddress,
         threadId,
         limit: limit * 2,
         threshold,

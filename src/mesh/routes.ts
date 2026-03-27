@@ -1,7 +1,8 @@
 import express, { type Request, type Response, type Router } from "express";
 import { z } from "zod";
-import { anchorMeshState } from "./anchor.js";
+import { ensureHai, isA409, verifyAnchor } from "./hai.js";
 import { loadMeshSynapseConfig } from "./config.js";
+import { anchorMeshState } from "./anchor.js";
 import type { MeshSynapseAnchorRequest } from "./types.js";
 
 const walletPattern = /^0x[a-f0-9]{40}$/i;
@@ -29,6 +30,13 @@ const AnchorRequestSchema = z.object({
   sessionKeyExpiresAt: z.number().int().positive().nullable().optional(),
 }).strict();
 
+const RegisterHaiRequestSchema = z.object({
+  agentWallet: z.string().regex(walletPattern).transform((value) => value.toLowerCase() as `0x${string}`),
+  userAddress: z.string().regex(walletPattern).transform((value) => value.toLowerCase() as `0x${string}`),
+  deviceId: z.string().trim().min(8).max(128),
+  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+}).strict();
+
 function extractRuntimeToken(req: Request): string | null {
   const header = req.headers["x-compose-local-runtime-token"];
   if (Array.isArray(header)) {
@@ -54,6 +62,33 @@ function requireLocalRuntimeAuth(req: Request, res: Response): boolean {
 export function createMeshRouter(): Router {
   const router = express.Router();
 
+  router.post("/hai/register", async (req: Request, res: Response) => {
+    if (!requireLocalRuntimeAuth(req, res)) {
+      return;
+    }
+
+    const parsed = RegisterHaiRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Invalid HAI registration payload",
+        details: parsed.error.issues.map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message,
+        })),
+      });
+      return;
+    }
+
+    try {
+      const row = await ensureHai(parsed.data);
+      res.status(200).json(row);
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Failed to register HAI",
+      });
+    }
+  });
+
   router.post("/synapse/anchor", async (req: Request, res: Response) => {
     if (!requireLocalRuntimeAuth(req, res)) {
       return;
@@ -72,9 +107,18 @@ export function createMeshRouter(): Router {
     }
 
     try {
-      const result = await anchorMeshState(parsed.data as MeshSynapseAnchorRequest);
+      const request = parsed.data as MeshSynapseAnchorRequest;
+      await verifyAnchor(request);
+      const result = await anchorMeshState(request);
       res.status(200).json(result);
     } catch (error) {
+      if (isA409(error)) {
+        res.status(409).json({
+          error: error.message,
+          code: error.code,
+        });
+        return;
+      }
       res.status(500).json({
         error: error instanceof Error ? error.message : "Failed to anchor mesh state",
       });
