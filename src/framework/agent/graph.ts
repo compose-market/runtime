@@ -5,7 +5,7 @@
  * [Start] -> [Model] -> [Tools?] -> [Model] ... -> [End]
  */
 
-import { StateGraph, MessagesAnnotation, START, END } from "@langchain/langgraph";
+import { StateGraph, MessagesAnnotation, START } from "@langchain/langgraph";
 import { type BaseMessage, AIMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -44,30 +44,7 @@ export function createAgentGraph(
     systemPrompt?: string,
     dynamicSystemPrompt?: () => string | undefined,
 ) {
-    // DEBUG: Log tools before binding
-    console.log(`[DEBUG] Binding ${tools.length} tools to model:`);
-    tools.forEach((t, idx) => {
-        console.log(`[DEBUG] Tool ${idx + 1}: ${t.name} - ${t.description}`);
-    });
-    if (systemPrompt) {
-        console.log(`[DEBUG] System prompt provided (${systemPrompt.length} chars)`);
-    }
-
-    // Bind tools to model
-    // For vLLM compatibility: don't specify tool_choice to avoid "auto tool choice requires --enable-auto-tool-choice" error
-    // The agent's system prompt instructs it when to use tools - LLM reasoning handles tool selection
     const modelWithTools = model.bindTools(tools);
-
-    // DEBUG: Check if tools were bound - properly inspect the object
-    console.log(`[DEBUG] Model after bindTools type:`, typeof modelWithTools);
-    console.log(`[DEBUG] Model constructor:`, modelWithTools.constructor.name);
-    console.log(`[DEBUG] Has kwargs:`, !!modelWithTools.kwargs);
-    if (modelWithTools.kwargs) {
-        console.log(`[DEBUG] kwargs.tools exists:`, !!modelWithTools.kwargs.tools);
-        console.log(`[DEBUG] kwargs.tools length:`, modelWithTools.kwargs.tools?.length || 0);
-        // Check if tool_choice is being set
-        console.log(`[DEBUG] kwargs.tool_choice:`, modelWithTools.kwargs.tool_choice || 'not set');
-    }
 
     const toolNode = new ToolNode(tools);
 

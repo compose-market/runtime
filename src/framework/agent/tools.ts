@@ -1,19 +1,16 @@
 /**
  * Agent Tool Factories
  * 
- * Creates LangChain tools from the in-process GOAT and MCP runtimes.
+ * Creates LangChain tools from Manowar agents.
  */
 
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
-import type { ComposeTool } from "../../types.js";
 import type { AgentWallet } from "../../agent-wallet.js";
 import { getAgentExecutionContext } from "./context.js";
 import { searchKnowledge } from "../knowledge/index.js";
 import { addMemory, searchMemory, searchMemoryLayers } from "../memory/index.js";
 import { shouldEnforceCloudPermissions } from "../mode.js";
-import { isLocalMeshPublicationAvailable, queueLocalMeshPublication } from "../../mesh/publication-queue.js";
-import { resolveLocalBaseDir, writeLocalSkillDocument } from "../../mesh/workspace.js";
 import { executeGoatTool, getPlugin } from "../../mcps/goat.js";
 import { executeServerTool, getServerTools } from "../../mcps/mcp.js";
 import {
@@ -96,8 +93,8 @@ function resolveSessionContext(input: SessionContextProvider): AgentSessionConte
     return input;
 }
 
-function createKnowledgeTools(input: {
-    agentWallet?: AgentWallet;
+export function createKnowledgeTools(input: {
+    agentWallet?: Pick<AgentWallet, "address">;
     userAddress?: string;
 }): DynamicStructuredTool[] {
     if (!input.agentWallet) {
@@ -414,17 +411,7 @@ export async function createAgentTools(
     const tools: DynamicStructuredTool[] = [];
     const usedToolNames = new Set<string>();
 
-    for (const tool of createMeshPublicationTools({ agentWallet, sessionContext })) {
-        tools.push(tool);
-        usedToolNames.add(tool.name);
-    }
-
     for (const tool of createKnowledgeTools({ agentWallet, userAddress })) {
-        tools.push(tool);
-        usedToolNames.add(tool.name);
-    }
-
-    for (const tool of createLocalSkillTools({ agentWallet, sessionContext })) {
         tools.push(tool);
         usedToolNames.add(tool.name);
     }
@@ -767,82 +754,6 @@ function createBackpackTools(input: {
 // =============================================================================
 // Mem0 / Built-in Tools
 // =============================================================================
-
-function createMeshPublicationTools(input: {
-    agentWallet?: AgentWallet;
-    sessionContext?: SessionContextProvider;
-}): DynamicStructuredTool[] {
-    if (!input.agentWallet || !isLocalMeshPublicationAvailable()) {
-        return [];
-    }
-
-    return [
-        new DynamicStructuredTool({
-            name: "publish_mesh_state",
-            description: "Anchor the current local agent state to the Compose Synapse collection and publish the refreshed mesh manifest to the libp2p network. Use this after meaningful local updates, before conclaves, or when a mesh skill instructs you to refresh your sovereign network state.",
-            schema: z.object({
-                reason: z.string().min(1).max(180).optional().describe("Short reason for this publish, for example startup, heartbeat, skill-update, memory-change, or conclave-entry"),
-            }),
-            func: async ({ reason }: { reason?: string }) => {
-                const activeSessionContext = resolveSessionContext(input.sessionContext);
-                await enforceToolPermissions({
-                    toolName: "publish_mesh_state",
-                    toolDescription: "Anchor current local state and publish updated mesh manifest",
-                    cloudPermissions: activeSessionContext?.cloudPermissions,
-                });
-
-                const result = await queueLocalMeshPublication({
-                    agentWallet: input.agentWallet!.address,
-                    reason,
-                });
-
-                return JSON.stringify(result);
-            },
-        }),
-    ];
-}
-
-function createLocalSkillTools(input: {
-    agentWallet?: AgentWallet;
-    sessionContext?: SessionContextProvider;
-}): DynamicStructuredTool[] {
-    const baseDir = resolveLocalBaseDir();
-    if (!baseDir || !input.agentWallet) {
-        return [];
-    }
-    const agentWallet = input.agentWallet.address;
-
-    return [
-        new DynamicStructuredTool({
-            name: "save_local_skill",
-            description: "Persist a reusable skill only in this agent's local workspace on the user's device.",
-            schema: z.object({
-                skillName: z.string().min(1).max(120).describe("Human-readable local skill name"),
-                skillMarkdown: z.string().min(1).describe("SKILL.md content or skill body to persist locally"),
-            }),
-            func: async ({ skillName, skillMarkdown }: { skillName: string; skillMarkdown: string }) => {
-                const activeSessionContext = resolveSessionContext(input.sessionContext);
-                const grants = new Set(
-                    (activeSessionContext?.sessionGrants || [])
-                        .map((item) => item.trim().toLowerCase())
-                        .filter(Boolean),
-                );
-
-                if (grants.size > 0 && !grants.has("*") && !grants.has("fs.write") && !grants.has("fs.edit")) {
-                    throw new Error("Permission denied for local skill persistence");
-                }
-
-                const result = await writeLocalSkillDocument(baseDir, {
-                    agentWallet,
-                    skillName,
-                    skillMarkdown,
-                });
-
-                return JSON.stringify(result);
-            },
-        }),
-    ];
-}
 
 export function createMem0Tools(agentId: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
     const context = getAgentExecutionContext();
