@@ -1,8 +1,7 @@
 /**
  * Runtime Server - Tool & Runtime Service
  *
- * Runtime execution plane for tools, long-running agent/workflow execution,
- * and the embedded Mesh state.
+ * Runtime execution plane for tools and long-running agent/workflow execution.
  */
 import "dotenv/config";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -35,8 +34,12 @@ import {
   resolveRuntimeHostMode,
   shouldInitializeWorkflowRuntime,
 } from "./framework/mode.js";
-import { createMeshRouter } from "./mesh/routes.js";
-import { initializeLocalAgentHeartbeatHost } from "./mesh/supervisor.js";
+import { runWithAgentExecutionContext } from "./framework/agent/context.js";
+import { createMem0Tools } from "./framework/agent/tools.js";
+import { ensureHai, isA409, verifyAnchor } from "./mesh/hai.js";
+import { anchorMeshState } from "./mesh/anchor.js";
+import { pinMeshArtifact } from "./mesh/filecoin-pin.js";
+import type { MeshSharedArtifactPinRequest, MeshSynapseAnchorRequest } from "./mesh/types.js";
 
 const app = express();
 
@@ -153,6 +156,237 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
   next();
 });
+
+const LOCAL_RUNTIME_AUTH_HEADER = "x-compose-local-runtime-token";
+const walletAddressSchema = z.string().regex(/^0x[a-fA-F0-9]{40}$/);
+const hex32Pattern = /^0x[a-f0-9]{64}$/i;
+const privateKeyPattern = /^0x[a-f0-9]{64}$/i;
+const haiIdPattern = /^[a-z0-9]{6}$/i;
+const statePathPattern = /^compose-[a-z0-9]{6}-#\d+$/i;
+const learningPathPattern = /^learning-[a-z0-9]{6}-(learning|report|resource|ticket)-#\d+$/i;
+
+const LocalMeshToolRequestSchema = z.object({
+  agentWallet: walletAddressSchema,
+  userAddress: walletAddressSchema.optional(),
+  toolName: z.enum(["search_memory", "save_memory", "search_all_memory"]),
+  args: z.record(z.string(), z.unknown()).optional(),
+  haiId: z.string().trim().min(1).max(64).optional(),
+  threadId: z.string().trim().min(1).max(128).optional(),
+  workflowWallet: walletAddressSchema.optional(),
+});
+
+const RegisterHaiRequestSchema = z.object({
+  agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  deviceId: z.string().trim().min(8).max(128),
+  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+}).strict();
+
+const AnchorRequestSchema = z.object({
+  apiUrl: z.string().trim().url(),
+  composeKeyToken: z.string().trim().min(1),
+  userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  deviceId: z.string().trim().min(8).max(128),
+  chainId: z.number().int().positive(),
+  targetSynapseExpiry: z.number().int().positive(),
+  haiId: z.string().regex(haiIdPattern).transform((value) => value.toLowerCase()),
+  updateNumber: z.number().int().positive(),
+  path: z.string().regex(statePathPattern),
+  canonicalSnapshotJson: z.string().trim().min(2),
+  stateRootHash: z.string().regex(hex32Pattern).transform((value) => value.toLowerCase() as `0x${string}`),
+  envelopeJson: z.string().trim().min(2),
+  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`),
+  payerAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+  sessionKeyExpiresAt: z.number().int().positive().nullable().optional(),
+}).strict();
+
+const FilecoinPinRequestSchema = z.object({
+  apiUrl: z.string().trim().url(),
+  composeKeyToken: z.string().trim().min(1),
+  userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  deviceId: z.string().trim().min(8).max(128),
+  chainId: z.number().int().positive(),
+  targetSynapseExpiry: z.number().int().positive(),
+  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`),
+  payerAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+  sessionKeyExpiresAt: z.number().int().positive().nullable().optional(),
+  signedRequestJson: z.string().trim().min(2),
+  haiId: z.string().regex(haiIdPattern).transform((value) => value.toLowerCase()),
+  artifactKind: z.enum(["learning", "report", "resource", "ticket"]),
+  artifactNumber: z.number().int().positive(),
+  path: z.string().regex(learningPathPattern),
+  payloadJson: z.string().trim().min(2),
+  publisherAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+  accessPriceUsdc: z.string().trim().min(1).nullable().optional(),
+  title: z.string().trim().min(1).nullable().optional(),
+  summary: z.string().trim().min(1).nullable().optional(),
+  copies: z.number().int().positive().optional(),
+}).strict();
+
+function requireLocalRuntimeAuthToken(): string {
+  const value = String(process.env.COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN || "").trim();
+  if (!value) {
+    throw new Error("COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN is required for local runtime mesh routes");
+  }
+  return value;
+}
+
+function isLocalMeshRouteEnabled(): boolean {
+  return resolveRuntimeHostMode() === "local";
+}
+
+function authorizeLocalMeshRequest(req: Request, res: Response): boolean {
+  if (!isLocalMeshRouteEnabled()) {
+    res.status(404).json({ error: "Local mesh routes are only available in local runtime host mode" });
+    return false;
+  }
+
+  if (getRequestHeader(req, LOCAL_RUNTIME_AUTH_HEADER) !== requireLocalRuntimeAuthToken()) {
+    res.status(401).json({ error: "Missing or invalid local runtime authorization" });
+    return false;
+  }
+
+  return true;
+}
+
+async function executeLocalMeshTool(input: z.infer<typeof LocalMeshToolRequestSchema>): Promise<unknown> {
+  const tools = createMem0Tools(input.agentWallet, input.userAddress, input.workflowWallet);
+  const tool = tools.find((candidate) => candidate.name === input.toolName);
+  if (!tool) {
+    throw new Error(`Unsupported local mesh tool: ${input.toolName}`);
+  }
+
+  return runWithAgentExecutionContext(
+    {
+      composeRunId: input.haiId,
+      threadId: input.threadId || input.haiId || input.agentWallet,
+      agentWallet: input.agentWallet,
+      userAddress: input.userAddress,
+      workflowWallet: input.workflowWallet,
+    },
+    async () => await tool.invoke(input.args || {}),
+  );
+}
+
+function sendValidationError(res: Response, label: string, error: z.ZodError): void {
+  res.status(400).json({
+    error: label,
+    details: error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      message: issue.message,
+    })),
+  });
+}
+
+app.post("/mesh/tools/execute", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = LocalMeshToolRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid local mesh tool payload", parsed.error);
+    return;
+  }
+
+  try {
+    const result = await executeLocalMeshTool(parsed.data);
+    res.status(200).json({ result });
+  } catch (error) {
+    sendRuntimeError(res, error, "Failed to execute local mesh tool");
+  }
+}));
+
+app.post("/mesh/hai/register", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = RegisterHaiRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid HAI registration payload", parsed.error);
+    return;
+  }
+
+  try {
+    const row = await ensureHai(parsed.data);
+    res.status(200).json(row);
+  } catch (error) {
+    if (isA409(error)) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+      });
+      return;
+    }
+
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to register HAI",
+    });
+  }
+}));
+
+app.post("/mesh/synapse/anchor", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = AnchorRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid mesh Synapse anchor payload", parsed.error);
+    return;
+  }
+
+  try {
+    const input = parsed.data as MeshSynapseAnchorRequest;
+    await verifyAnchor(input);
+    const result = await anchorMeshState(input);
+    res.status(200).json(result);
+  } catch (error) {
+    if (isA409(error)) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+      });
+      return;
+    }
+
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to anchor mesh state",
+    });
+  }
+}));
+
+app.post("/mesh/filecoin/pin", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = FilecoinPinRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid mesh Filecoin pin payload", parsed.error);
+    return;
+  }
+
+  try {
+    const result = await pinMeshArtifact(parsed.data as MeshSharedArtifactPinRequest);
+    res.status(200).json(result);
+  } catch (error) {
+    if (isA409(error)) {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+      });
+      return;
+    }
+
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to pin mesh artifact",
+    });
+  }
+}));
 
 // ============================================================================
 // MCP Inspect (Ephemeral Spawn + Tool Introspection)
@@ -329,8 +563,6 @@ app.get("/status", asyncHandler(async (req: Request, res: Response) => {
     },
   });
 }));
-
-app.use("/mesh", createMeshRouter());
 
 // ============================================================================
 // GOAT Plugin Routes (Tool Execution)
@@ -728,21 +960,12 @@ export function shouldAutoStartRuntimeServer(options: RuntimeAutostartOptions = 
 
 let runtimeServerPromise: Promise<HttpServer> | null = null;
 
-export function initializeLocalRuntimeHostServices(env: NodeJS.ProcessEnv = process.env): void {
-  if (resolveRuntimeHostMode({ env }) !== "local") {
-    return;
-  }
-
-  initializeLocalAgentHeartbeatHost(env);
-}
-
 export async function startRuntimeServer(port?: number): Promise<HttpServer> {
   if (runtimeServerPromise) {
     return await runtimeServerPromise;
   }
 
   const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
-  initializeLocalRuntimeHostServices(process.env);
   runtimeServerPromise = new Promise<HttpServer>((resolve, reject) => {
     const server = app.listen(resolvedPort);
 
