@@ -1,11 +1,11 @@
 export type MeshSharedArtifactKind = "learning" | "report" | "resource" | "ticket";
-export type MeshSignedRequestAction = "compose.state.read.v1";
+export type MeshSignedRequestAction = "compose.state.read" | "learning.pin";
 
 export interface MeshSignedRequestEnvelope {
   version: 1;
-  kind: "compose.mesh.request.v1";
+  kind: "compose.mesh.request";
   action: MeshSignedRequestAction;
-  collection: "compose";
+  collection: "compose" | "learnings";
   requesterHaiId: string;
   requesterAgentWallet: `0x${string}`;
   requesterUserAddress: `0x${string}`;
@@ -15,6 +15,10 @@ export interface MeshSignedRequestEnvelope {
   targetPieceCid?: string | null;
   targetDataSetId?: string | null;
   targetPieceId?: string | null;
+  artifactKind?: MeshSharedArtifactKind | null;
+  fileName?: string | null;
+  rootCid?: string | null;
+  payloadSha256?: `0x${string}` | null;
   signedAt: number;
   signature: string;
 }
@@ -106,7 +110,7 @@ export interface MeshSharedArtifactPinResponse {
   payerAddress: `0x${string}`;
   sessionKeyExpiresAt: number;
   source: string;
-  collection: "knowledge";
+  collection: "learnings";
 }
 
 export interface MeshSharedArtifactReadRequest extends MeshSessionRequest {
