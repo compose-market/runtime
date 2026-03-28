@@ -20,7 +20,7 @@ import {
   extractTokens,
   resolveAuthoritativeTokens,
 } from "./langsmith.js";
-import { resolveRuntimeHostMode, shouldEnforceCloudPermissions } from "./mode.js";
+import { shouldEnforceCloudPermissions } from "./mode.js";
 
 export interface BackpackConnectedAccount {
   slug: string;
@@ -706,10 +706,6 @@ function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-function isLocalRuntimeHost(): boolean {
-  return resolveRuntimeHostMode() === "local";
-}
-
 function cloudWorkerRoot(agentWallet: string): string {
   return path.join(DEFAULT_CLOUD_WORKER_ROOT, agentWallet.toLowerCase());
 }
@@ -758,10 +754,6 @@ function resolveManagedExecutionContext(
   message: string,
   options: ExecuteOptions,
 ): { worker: CloudAgentWorker; sessionKey: string; message: string } | null {
-  if (isLocalRuntimeHost()) {
-    return null;
-  }
-
   const worker = workers.get(agentWallet);
   if (!worker) {
     return null;
@@ -818,10 +810,6 @@ function parseSubagentDepth(sessionKey: string): number {
 }
 
 export async function createManagedAgent(config: AgentConfig): Promise<AgentInstance> {
-  if (isLocalRuntimeHost()) {
-    throw new Error("Managed cloud agents are cloud-only");
-  }
-
   const existing = workers.get(config.agentWallet);
   if (existing) {
     return existing.runtime;
@@ -855,10 +843,6 @@ export function scheduleManagedAgentCron(input: {
   everyMs: number;
   message: string;
 }): void {
-  if (isLocalRuntimeHost()) {
-    throw new Error("Managed cron scheduling is cloud-only");
-  }
-
   const worker = ensureWorker(input.agentWallet);
   const everyMs = Math.max(1_000, input.everyMs);
   const sessionKey = `${DEFAULT_CRON_SESSION_PREFIX}:${input.id}`;
@@ -905,10 +889,6 @@ export function unscheduleManagedAgentCron(agentWallet: string, jobId: string): 
 }
 
 export async function executeManagedAgent(params: ManagedAgentExecutionParams): Promise<ManagedAgentExecutionResult> {
-  if (isLocalRuntimeHost()) {
-    throw new Error("Managed cloud execution is cloud-only");
-  }
-
   const worker = ensureWorker(params.agentWallet);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
   const subDepth = sessionKey.includes("subagent") ? parseSubagentDepth(sessionKey) : (params.subagentDepth || 0);
@@ -942,10 +922,6 @@ export async function executeManagedAgent(params: ManagedAgentExecutionParams): 
 }
 
 export async function* streamManagedAgent(params: ManagedAgentExecutionParams): AsyncGenerator<unknown> {
-  if (isLocalRuntimeHost()) {
-    throw new Error("Managed cloud streaming is cloud-only");
-  }
-
   const worker = ensureWorker(params.agentWallet);
   const sessionKey = parseSessionKey(params.agentWallet, params.threadId, params.sessionKey);
   const subDepth = sessionKey.includes("subagent") ? parseSubagentDepth(sessionKey) : (params.subagentDepth || 0);
