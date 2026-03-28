@@ -21,6 +21,7 @@ export const hex32Re = /^0x[a-f0-9]{64}$/i;
 export const sigRe = /^[a-f0-9]+$/i;
 export const haiRe = /^[a-z0-9]{6}$/i;
 export const stateRe = /^compose-([a-z0-9]{6})-#(\d+)$/i;
+export const learningRe = /^learning-([a-z0-9]{6})-(learning|report|resource|ticket)-#(\d+)$/i;
 const pkRe = /^0x[a-f0-9]{64}$/i;
 
 export class MeshA409Error extends Error {
@@ -42,9 +43,9 @@ export function isA409(error: unknown): error is MeshA409Error {
 
 const reqSchema = z.object({
     version: z.literal(1),
-    kind: z.literal("compose.mesh.request.v1"),
-    action: z.literal("compose.state.read.v1"),
-    collection: z.literal("compose"),
+    kind: z.literal("compose.mesh.request"),
+    action: z.enum(["compose.state.read", "learning.pin"]),
+    collection: z.enum(["compose", "learnings"]),
     requesterHaiId: z.string().regex(haiRe).transform((value) => value.toLowerCase()),
     requesterAgentWallet: z.string().regex(walletRe).transform((value) => value.toLowerCase() as `0x${string}`),
     requesterUserAddress: z.string().regex(walletRe).transform((value) => value.toLowerCase() as `0x${string}`),
@@ -54,6 +55,10 @@ const reqSchema = z.object({
     targetPieceCid: z.string().trim().min(1).nullable().optional(),
     targetDataSetId: z.string().trim().min(1).nullable().optional(),
     targetPieceId: z.string().trim().min(1).nullable().optional(),
+    artifactKind: z.enum(["learning", "report", "resource", "ticket"]).nullable().optional(),
+    fileName: z.string().trim().min(1).nullable().optional(),
+    rootCid: z.string().trim().min(1).nullable().optional(),
+    payloadSha256: z.string().regex(hex32Re).transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
     signedAt: z.number().int().positive(),
     signature: z.string().regex(sigRe),
 }).strict();
@@ -86,7 +91,9 @@ export interface HaiRow {
     payerAddress: `0x${string}` | null;
     sessionKeyExpiresAt: number | null;
     nextUpdateNumber: number;
+    nextLearningNumber: number;
     lastUpdateNumber: number | null;
+    lastLearningNumber: number | null;
     lastPath: string | null;
     lastStateRootHash: `0x${string}` | null;
     lastPieceCid: string | null;
@@ -239,6 +246,22 @@ export function parseStatePath(pathText: string): { hai: string; n: number } {
     };
 }
 
+export function parseLearningPath(pathText: string): {
+    hai: string;
+    kind: "learning" | "report" | "resource" | "ticket";
+    n: number;
+} {
+    const hit = learningRe.exec(pathText.trim());
+    if (!hit) {
+        throw new Error("Invalid compose mesh learning path");
+    }
+    return {
+        hai: hit[1].toLowerCase(),
+        kind: hit[2].toLowerCase() as "learning" | "report" | "resource" | "ticket",
+        n: Number(hit[3]),
+    };
+}
+
 export async function ensureHai(input: {
     agentWallet: string;
     userAddress: string;
@@ -265,7 +288,9 @@ export async function ensureHai(input: {
             payerAddress: row.payerAddress ? normWallet(row.payerAddress, "payerAddress") : null,
             sessionKeyExpiresAt: Number.isFinite(row.sessionKeyExpiresAt) ? Number(row.sessionKeyExpiresAt) : null,
             nextUpdateNumber: Number.isInteger(row.nextUpdateNumber) && row.nextUpdateNumber > 0 ? row.nextUpdateNumber : 1,
+            nextLearningNumber: Number.isInteger(row.nextLearningNumber) && row.nextLearningNumber > 0 ? row.nextLearningNumber : 1,
             lastUpdateNumber: Number.isInteger(row.lastUpdateNumber) ? row.lastUpdateNumber : null,
+            lastLearningNumber: Number.isInteger(row.lastLearningNumber) ? row.lastLearningNumber : null,
             lastPath: typeof row.lastPath === "string" && row.lastPath.trim().length > 0 ? row.lastPath : null,
             lastStateRootHash: row.lastStateRootHash ? row.lastStateRootHash.toLowerCase() as `0x${string}` : null,
             lastPieceCid: typeof row.lastPieceCid === "string" && row.lastPieceCid.trim().length > 0 ? row.lastPieceCid : null,
@@ -293,7 +318,9 @@ export async function ensureHai(input: {
         payerAddress: null,
         sessionKeyExpiresAt: null,
         nextUpdateNumber: 1,
+        nextLearningNumber: 1,
         lastUpdateNumber: null,
+        lastLearningNumber: null,
         lastPath: null,
         lastStateRootHash: null,
         lastPieceCid: null,
@@ -340,9 +367,31 @@ export async function markHaiAnchor(input: {
     return saveHai(row, env);
 }
 
+export async function markHaiLearning(input: {
+    agentWallet: string;
+    userAddress: string;
+    deviceId: string;
+    artifactNumber: number;
+    payerAddress?: `0x${string}` | null;
+    sessionKeyExpiresAt?: number | null;
+}, env: NodeJS.ProcessEnv = process.env): Promise<HaiRow> {
+    const row = await ensureHai({
+        agentWallet: input.agentWallet,
+        userAddress: input.userAddress,
+        deviceId: input.deviceId,
+    }, env);
+    row.nextLearningNumber = input.artifactNumber + 1;
+    row.lastLearningNumber = input.artifactNumber;
+    row.payerAddress = input.payerAddress ?? row.payerAddress ?? null;
+    row.sessionKeyExpiresAt = input.sessionKeyExpiresAt ?? row.sessionKeyExpiresAt ?? null;
+    row.updatedAt = Date.now();
+    return saveHai(row, env);
+}
+
 function expectSameReq(
     env: MeshSignedRequestEnvelope,
     want: {
+        collection: "compose" | "learnings";
         agentWallet: `0x${string}`;
         userAddress: `0x${string}`;
         deviceId: string;
@@ -350,8 +399,11 @@ function expectSameReq(
         pieceCid?: string | null;
         dataSetId?: string | null;
         pieceId?: string | null;
+        artifactKind?: "learning" | "report" | "resource" | "ticket" | null;
+        payloadSha256?: `0x${string}` | null;
     },
 ): void {
+    if (env.collection !== want.collection) throw a409("Signed HAI collection does not match the request");
     if (env.requesterAgentWallet !== want.agentWallet) throw a409("Signed HAI agentWallet does not match the request");
     if (env.requesterUserAddress !== want.userAddress) throw a409("Signed HAI userAddress does not match the request");
     if (env.requesterDeviceId !== want.deviceId) throw a409("Signed HAI deviceId does not match the request");
@@ -359,12 +411,15 @@ function expectSameReq(
     if ((env.targetPieceCid ?? null) !== (want.pieceCid ?? null)) throw a409("Signed HAI pieceCid does not match the request");
     if ((env.targetDataSetId ?? null) !== (want.dataSetId ?? null)) throw a409("Signed HAI dataSetId does not match the request");
     if ((env.targetPieceId ?? null) !== (want.pieceId ?? null)) throw a409("Signed HAI pieceId does not match the request");
+    if ((env.artifactKind ?? null) !== (want.artifactKind ?? null)) throw a409("Signed HAI artifactKind does not match the request");
+    if ((env.payloadSha256 ?? null) !== (want.payloadSha256 ?? null)) throw a409("Signed HAI payloadSha256 does not match the request");
 }
 
 async function verifyReq(input: {
     raw: string;
     action: MeshSignedRequestAction;
     want: {
+        collection: "compose" | "learnings";
         agentWallet: `0x${string}`;
         userAddress: `0x${string}`;
         deviceId: string;
@@ -372,6 +427,8 @@ async function verifyReq(input: {
         pieceCid?: string | null;
         dataSetId?: string | null;
         pieceId?: string | null;
+        artifactKind?: "learning" | "report" | "resource" | "ticket" | null;
+        payloadSha256?: `0x${string}` | null;
     };
 }): Promise<MeshSignedRequestEnvelope> {
     let raw: unknown;
@@ -452,8 +509,9 @@ export async function verifyStateRead(req: MeshSynapseReadRequest): Promise<Mesh
     if (parsedPath.hai !== req.haiId.toLowerCase()) throw a409("Mesh state read path haiId does not match the request");
     return verifyReq({
         raw: req.signedRequestJson,
-        action: "compose.state.read.v1",
+        action: "compose.state.read",
         want: {
+            collection: "compose",
             agentWallet: req.agentWallet,
             userAddress: req.userAddress,
             deviceId: req.deviceId,
@@ -461,6 +519,37 @@ export async function verifyStateRead(req: MeshSynapseReadRequest): Promise<Mesh
             pieceCid: req.pieceCid,
             dataSetId: req.dataSetId,
             pieceId: req.pieceId,
+        },
+    });
+}
+
+export async function verifyLearningPin(input: {
+    signedRequestJson: string;
+    agentWallet: `0x${string}`;
+    userAddress: `0x${string}`;
+    deviceId: string;
+    haiId: string;
+    artifactKind: "learning" | "report" | "resource" | "ticket";
+    artifactNumber: number;
+    path: string;
+    payloadJson: string;
+}): Promise<MeshSignedRequestEnvelope> {
+    const parsedPath = parseLearningPath(input.path);
+    if (parsedPath.hai !== input.haiId.toLowerCase()) throw a409("Mesh learning path haiId does not match the request");
+    if (parsedPath.kind !== input.artifactKind) throw a409("Mesh learning path kind does not match the request");
+    if (parsedPath.n !== input.artifactNumber) throw a409("Mesh learning path number does not match the request");
+
+    return verifyReq({
+        raw: input.signedRequestJson,
+        action: "learning.pin",
+        want: {
+            collection: "learnings",
+            agentWallet: input.agentWallet,
+            userAddress: input.userAddress,
+            deviceId: input.deviceId,
+            path: input.path,
+            artifactKind: input.artifactKind,
+            payloadSha256: sha256Hex(input.payloadJson),
         },
     });
 }
