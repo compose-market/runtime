@@ -20,7 +20,7 @@ export const walletRe = /^0x[a-f0-9]{40}$/i;
 export const hex32Re = /^0x[a-f0-9]{64}$/i;
 export const sigRe = /^[a-f0-9]+$/i;
 export const haiRe = /^[a-z0-9]{6}$/i;
-export const stateRe = /^compose-([a-z0-9]{6})-#(\d+)$/i;
+export const stateRe = /^compose-([a-z0-9]{6})-(\d+)$/i;
 export const learningRe = /^learning-([a-z0-9]{6})-(learning|report|resource|ticket)-#(\d+)$/i;
 const pkRe = /^0x[a-f0-9]{64}$/i;
 
