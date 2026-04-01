@@ -1,11 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface AgentExecutionContext {
+    mode?: "global" | "local";
     composeRunId?: string;
     threadId?: string;
     agentWallet?: string;
     userAddress?: string;
     workflowWallet?: string;
+    haiId?: string;
+    memoryPrompt?: string;
+    lastUserMessage?: string;
 }
 
 const executionContextStorage = new AsyncLocalStorage<AgentExecutionContext>();

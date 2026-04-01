@@ -8,8 +8,10 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { AgentWallet } from "../../agent-wallet.js";
 import { getAgentExecutionContext } from "./context.js";
+import { resolveMemoryScope } from "./memory-scope.js";
 import { searchKnowledge } from "../knowledge/index.js";
-import { addMemory, searchMemory, searchMemoryLayers } from "../memory/index.js";
+import { DEFAULT_AGENT_MEMORY_LAYERS, persistExplicitAgentMemory, retrieveAgentMemory } from "./memory.js";
+import { searchMemoryLayers } from "../memory/index.js";
 import { shouldEnforceCloudPermissions } from "../mode.js";
 import { executeGoatTool, getPlugin } from "../../mcps/goat.js";
 import { executeServerTool, getServerTools } from "../../mcps/mcp.js";
@@ -752,87 +754,113 @@ function createBackpackTools(input: {
 }
 
 // =============================================================================
-// Mem0 / Built-in Tools
+// Memory / Built-in Tools
 // =============================================================================
 
-export function createMem0Tools(agentId: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
-    const context = getAgentExecutionContext();
+export function createMemoryTools(agentId: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
+    function resolveToolText(value: string | undefined, field: "content" | "query"): string {
+        const trimmed = value?.trim();
+        if (trimmed) {
+            return trimmed;
+        }
+
+        const fallback = getAgentExecutionContext()?.lastUserMessage?.trim();
+        if (fallback) {
+            return fallback;
+        }
+
+        throw new Error(`Runtime memory tool requires ${field} or lastUserMessage`);
+    }
 
     const searchKnowledge = new DynamicStructuredTool({
         name: "search_memory",
-        description: "Search your long-term memory/knowledge base for past interactions or learned facts. Uses graph memory for better relation-based retrieval.",
-        schema: z.object({ query: z.string().describe("Search query") }),
-        func: async ({ query }: { query: string }) => {
-            const filters: Record<string, unknown> = {};
-            if (workflowWallet) filters.workflow_wallet = workflowWallet;
-            if (context?.composeRunId) filters.compose_run_id = context.composeRunId;
-
-            const items = await searchMemory({
-                query,
-                agent_id: agentId,
-                user_id: userAddress,
-                run_id: context?.threadId,
-                limit: 8,
-                enable_graph: true,
-                rerank: true,
-                filters,
-            });
-            if (!items.length) return "No relevant memories found.";
-            return items.map((item) => `[Memory]: ${item.memory}`).join("\n\n");
+        description: "Search the full runtime memory stack for past interactions or learned facts across working memory, transcripts, vectors, graph memory, patterns, and archives.",
+        schema: z.object({
+            query: z.string().optional().describe("Search query. Always pass the user recall request here; if omitted, the runtime falls back to the latest user message."),
+        }),
+        func: async ({ query }: { query?: string }) => {
+            try {
+                const effectiveQuery = resolveToolText(query, "query");
+                const scope = resolveMemoryScope({
+                    agentId,
+                    userAddress,
+                    workflowWallet,
+                    context: getAgentExecutionContext(),
+                });
+                const { summary } = await retrieveAgentMemory({
+                    query: effectiveQuery,
+                    scope,
+                    limit: 8,
+                });
+                if (!summary) return "No relevant memories found.";
+                return summary;
+            } catch (error) {
+                return `Runtime memory unavailable: ${error instanceof Error ? error.message : String(error)}`;
+            }
         },
     });
 
     const storeKnowledge = new DynamicStructuredTool({
         name: "save_memory",
         description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
-        schema: z.object({ content: z.string().describe("Fact to remember") }),
-        func: async ({ content }: { content: string }) => {
-            const saved = await addMemory({
-                messages: [{ role: "user", content }],
-                agent_id: agentId,
-                user_id: userAddress,
-                run_id: context?.threadId,
-                enable_graph: true,
+        schema: z.object({
+            content: z.string().optional().describe("Fact to remember. Always pass the durable fact here; if omitted, the runtime falls back to the latest user message."),
+        }),
+        func: async ({ content }: { content?: string }) => {
+            const effectiveContent = resolveToolText(content, "content");
+            const scope = resolveMemoryScope({
+                agentId,
+                userAddress,
+                workflowWallet,
+                context: getAgentExecutionContext(),
+            });
+            const saved = await persistExplicitAgentMemory({
+                scope,
+                content: effectiveContent,
                 metadata: {
-                    type: "explicit_save",
                     workflow_wallet: workflowWallet,
-                    compose_run_id: context?.composeRunId,
                 },
             });
-            if (saved.length === 0) return "Failed to save memory.";
-            return "Memory saved with graph extraction.";
+            if (!saved) return "Failed to save memory.";
+            return "Memory saved.";
         },
     });
 
     const hybridSearch = new DynamicStructuredTool({
         name: "search_all_memory",
-        description: "Hybrid search across all memory layers including working, scene, graph, patterns, and archives.",
+        description: "Hybrid search across all runtime memory layers including working, scene, graph, patterns, archives, and vectors.",
         schema: z.object({
-            query: z.string().describe("Search query"),
-            layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives"])).optional(),
+            query: z.string().optional().describe("Search query. Always pass the user recall request here; if omitted, the runtime falls back to the latest user message."),
+            layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives", "vectors"])).optional(),
         }),
-        func: async ({ query, layers }: { query: string; layers?: string[] }) => {
-            const results = await searchMemoryLayers({
-                query,
-                agentWallet: agentId,
-                userAddress: userAddress,
-                threadId: context?.threadId,
-                layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || ["working", "scene", "graph", "patterns", "archives"],
-                limit: 5,
-            });
-            return JSON.stringify(results);
+        func: async ({ query, layers }: { query?: string; layers?: string[] }) => {
+            try {
+                const effectiveQuery = resolveToolText(query, "query");
+                const scope = resolveMemoryScope({
+                    agentId,
+                    userAddress,
+                    workflowWallet,
+                    context: getAgentExecutionContext(),
+                });
+                const results = await searchMemoryLayers({
+                    query: effectiveQuery,
+                    agentWallet: scope.agentId,
+                    userAddress: scope.userId,
+                    threadId: scope.threadId,
+                    layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || [...DEFAULT_AGENT_MEMORY_LAYERS],
+                    limit: 5,
+                });
+                return JSON.stringify(results);
+            } catch (error) {
+                return JSON.stringify({
+                    query: query || getAgentExecutionContext()?.lastUserMessage || "",
+                    layers: {},
+                    totals: {},
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
         },
     });
 
     return [searchKnowledge, storeKnowledge, hybridSearch];
-}
-
-export interface EnhancedMemoryToolsConfig {
-    agentId: string;
-    userAddress?: string;
-    workflowWallet?: string;
-}
-
-export function createEnhancedMemoryTools(config: EnhancedMemoryToolsConfig): DynamicStructuredTool[] {
-    return createMem0Tools(config.agentId, config.userAddress, config.workflowWallet);
 }

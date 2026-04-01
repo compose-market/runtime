@@ -14,7 +14,7 @@ import { v4 as uuidv4 } from "uuid";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ChatOpenAI } from "@langchain/openai";
 import type { AgentWallet } from "../../agent-wallet.js";
-import { createAgentTools, createMem0Tools } from "./tools.js";
+import { createAgentTools, createMemoryTools } from "./tools.js";
 import { getRelevantContext, recordConversationTurn } from "../workflow/embeddings.js";
 
 interface AlwaysOnAgentConfig {
@@ -86,7 +86,7 @@ export class AlwaysOnAgent {
             },
         );
 
-        const memoryTools = createMem0Tools(
+        const memoryTools = createMemoryTools(
             this.agentWallet.address,
             undefined,
             undefined,
