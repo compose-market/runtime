@@ -2,6 +2,7 @@ import {
     CACHE_TTL_SECONDS,
     getCachedJson,
     getLayerQueryCacheKey,
+    resolveScopedCacheKey,
     setCachedJson,
 } from "./cache.js";
 import {
@@ -105,13 +106,17 @@ export function buildSceneLayerFilter(params: Pick<LayeredSearchParams, "agentWa
 export async function searchMemoryLayers(params: LayeredSearchParams): Promise<LayeredSearchResult> {
     const limit = params.limit || 5;
     const layers = ensureLayers(params.layers);
-    const cacheKey = getLayerQueryCacheKey({
+    const cacheKey = await resolveScopedCacheKey(getLayerQueryCacheKey({
         query: params.query,
         agentWallet: params.agentWallet,
         userAddress: params.userAddress,
         threadId: params.threadId,
         layers,
         limit,
+    }), {
+        agentWallet: params.agentWallet,
+        userAddress: params.userAddress,
+        threadId: params.threadId,
     });
 
     const cached = await getCachedJson<LayeredSearchResult>(cacheKey);

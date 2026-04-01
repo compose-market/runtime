@@ -18,6 +18,22 @@ const DEFAULT_DB_NAME = process.env.MONGO_MEMORY_DB || "compose_memory";
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 100;
 const MAX_DELAY_MS = 5000;
+const VECTOR_SEARCH_INDEX_NAME = "vector_index";
+
+const VECTOR_SEARCH_INDEX_DEFINITION = {
+    fields: [
+        {
+            type: "vector",
+            path: "embedding",
+            numDimensions: 1024,
+            similarity: "cosine",
+        },
+        { type: "filter", path: "agentWallet" },
+        { type: "filter", path: "userAddress" },
+        { type: "filter", path: "threadId" },
+        { type: "filter", path: "source" },
+    ],
+} as const;
 
 let client: MongoClient | null = null;
 let db: Db | null = null;
@@ -105,32 +121,38 @@ async function ensureIndexes(targetDb: Db): Promise<void> {
         await sessions.createIndex(index.key, { name: index.name });
     }
 
-    // Best-effort vector index creation for Atlas deployments.
+    await ensureVectorSearchIndex(vectors);
+}
+
+async function ensureVectorSearchIndex(vectors: Collection<MemoryVector>): Promise<void> {
+    const collection = vectors as Collection<MemoryVector> & {
+        listSearchIndexes?: (name?: string) => { toArray: () => Promise<Array<Record<string, unknown>>> };
+        createSearchIndex?: (definition: Record<string, unknown>) => Promise<string>;
+        updateSearchIndex?: (name: string, definition: Record<string, unknown>) => Promise<void>;
+    };
+
+    if (
+        typeof collection.listSearchIndexes !== "function"
+        || typeof collection.createSearchIndex !== "function"
+        || typeof collection.updateSearchIndex !== "function"
+    ) {
+        return;
+    }
+
     try {
-        await (vectors as any).createSearchIndex({
-            name: "vector_index",
+        const existing = await collection.listSearchIndexes(VECTOR_SEARCH_INDEX_NAME).toArray();
+        if (existing.length > 0) {
+            await collection.updateSearchIndex(VECTOR_SEARCH_INDEX_NAME, VECTOR_SEARCH_INDEX_DEFINITION);
+            return;
+        }
+
+        await collection.createSearchIndex({
+            name: VECTOR_SEARCH_INDEX_NAME,
             type: "vectorSearch",
-            definition: {
-                mappings: {
-                    dynamic: false,
-                    fields: {
-                        embedding: {
-                            type: "knnVector",
-                            dimensions: 1024,
-                            similarity: "cosine",
-                        },
-                        agentWallet: { type: "token" },
-                        userAddress: { type: "token" },
-                        threadId: { type: "token" },
-                        source: { type: "token" },
-                        decayScore: { type: "number" },
-                        createdAt: { type: "date" },
-                    },
-                },
-            },
+            definition: VECTOR_SEARCH_INDEX_DEFINITION,
         });
     } catch {
-        // Ignore unsupported driver or existing index errors.
+        // Ignore unsupported deployment or transient Atlas search index errors.
     }
 }
 

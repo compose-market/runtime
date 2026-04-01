@@ -70,6 +70,7 @@ export {
 
 export {
     storeTranscript,
+    rememberSessionMessages,
     getTranscriptBySessionId,
     getTranscriptByThreadId,
     indexSessionTranscript,

@@ -4,6 +4,7 @@ import {
     getCachedJson,
     getGraphQueryCacheKey,
     invalidateMemoryScope,
+    resolveScopedCacheKey,
     setCachedJson,
 } from "./cache.js";
 import type {
@@ -60,6 +61,7 @@ export async function addMemory(params: MemoryAddParams): Promise<MemoryItem[]> 
             run_id: params.run_id,
             metadata: params.metadata,
             enable_graph: params.enable_graph ?? false,
+            async_mode: params.async_mode,
         });
         await invalidateMemoryScope({
             agentWallet: params.agent_id,
@@ -113,7 +115,7 @@ export async function searchMemory(params: MemorySearchParams): Promise<MemoryIt
         return [];
     }
 
-    const cacheKey = getGraphQueryCacheKey({
+    const cacheKey = await resolveScopedCacheKey(getGraphQueryCacheKey({
         query: params.query,
         agentWallet: params.agent_id || "unknown",
         userAddress: params.user_id,
@@ -122,6 +124,10 @@ export async function searchMemory(params: MemorySearchParams): Promise<MemoryIt
         rerank: params.rerank,
         enableGraph: params.enable_graph,
         filters: typeof params.filters === "object" && params.filters ? params.filters : undefined,
+    }), {
+        agentWallet: params.agent_id || "unknown",
+        userAddress: params.user_id,
+        threadId: params.run_id,
     });
 
     const cached = await getCachedJson<MemoryItem[]>(cacheKey);

@@ -4,6 +4,8 @@ import { createClient, type RedisClientType } from "redis";
 const DEFAULT_VECTOR_QUERY_TTL_SECONDS = Number(process.env.MEMORY_VECTOR_QUERY_CACHE_TTL_SECONDS || 120);
 const DEFAULT_LAYER_QUERY_TTL_SECONDS = Number(process.env.MEMORY_LAYER_QUERY_CACHE_TTL_SECONDS || 120);
 const DEFAULT_GRAPH_QUERY_TTL_SECONDS = Number(process.env.MEMORY_GRAPH_QUERY_CACHE_TTL_SECONDS || 120);
+const DEFAULT_REDIS_CONNECT_TIMEOUT_MS = Number(process.env.MEMORY_REDIS_CONNECT_TIMEOUT_MS || 2000);
+const GLOBAL_MEMORY_NAMESPACE_KEY = "memory:ns:global";
 
 export const CACHE_TTL_SECONDS = {
     vectorQuery: Number.isFinite(DEFAULT_VECTOR_QUERY_TTL_SECONDS) ? Math.max(1, DEFAULT_VECTOR_QUERY_TTL_SECONDS) : 120,
@@ -52,15 +54,59 @@ function buildScopeKey(scope: { agentWallet: string; userAddress?: string; threa
     return `a:${normalizeScopePart(scope.agentWallet)}:u:${normalizeScopePart(scope.userAddress)}:t:${normalizeScopePart(scope.threadId)}`;
 }
 
-function buildScopePattern(scope: MemoryScope): string {
-    const agentPart = scope.agentWallet ? normalizeScopePart(scope.agentWallet) : "*";
-    const userPart = scope.userAddress ? normalizeScopePart(scope.userAddress) : "*";
-    const threadPart = scope.threadId ? normalizeScopePart(scope.threadId) : "*";
-    return `a:${agentPart}:u:${userPart}:t:${threadPart}`;
-}
-
 export function createContentHash(content: string): string {
     return createHash("sha256").update(content).digest("hex").slice(0, 32);
+}
+
+function buildNamespaceKey(scope: MemoryScope): string {
+    return `memory:ns:${buildScopeKey({
+        agentWallet: scope.agentWallet || "_",
+        userAddress: scope.userAddress,
+        threadId: scope.threadId,
+    })}`;
+}
+
+function buildNamespaceChain(scope: { agentWallet: string; userAddress?: string; threadId?: string }): string[] {
+    const keys = [
+        GLOBAL_MEMORY_NAMESPACE_KEY,
+        buildNamespaceKey({ agentWallet: scope.agentWallet }),
+    ];
+
+    if (scope.userAddress) {
+        keys.push(buildNamespaceKey({
+            agentWallet: scope.agentWallet,
+            userAddress: scope.userAddress,
+        }));
+    }
+
+    if (scope.threadId) {
+        keys.push(buildNamespaceKey({
+            agentWallet: scope.agentWallet,
+            userAddress: scope.userAddress,
+            threadId: scope.threadId,
+        }));
+    }
+
+    return [...new Set(keys)];
+}
+
+async function getNamespaceToken(scope: { agentWallet: string; userAddress?: string; threadId?: string }): Promise<string> {
+    try {
+        const redis = await getRedisClient();
+        const keys = buildNamespaceChain(scope);
+        const values = await redis.mGet(keys);
+        return createContentHash(values.map((value) => value || "0").join("|"));
+    } catch {
+        return "0";
+    }
+}
+
+export async function resolveScopedCacheKey(
+    key: string,
+    scope: { agentWallet: string; userAddress?: string; threadId?: string },
+): Promise<string> {
+    const namespaceToken = await getNamespaceToken(scope);
+    return `${key}:ns:${namespaceToken}`;
 }
 
 export function getVectorQueryCacheKey(input: {
@@ -129,7 +175,10 @@ export async function getRedisClient(): Promise<RedisClientType> {
         return connectionPromise;
     }
 
-    connectionPromise = connect();
+    connectionPromise = connect().catch((error) => {
+        connectionPromise = null;
+        throw error;
+    });
     return connectionPromise;
 }
 
@@ -142,17 +191,46 @@ async function connect(): Promise<RedisClientType> {
     console.log(`[memory:cache] Connecting to ${host}:${port} (TLS: ${useTls})`);
 
     client = createClient({
-        socket: useTls ? { host, port, tls: true as const } : { host, port },
+        socket: useTls
+            ? {
+                host,
+                port,
+                tls: true as const,
+                connectTimeout: DEFAULT_REDIS_CONNECT_TIMEOUT_MS,
+                reconnectStrategy: (retries) => Math.min(retries * 50, 500),
+            }
+            : {
+                host,
+                port,
+                connectTimeout: DEFAULT_REDIS_CONNECT_TIMEOUT_MS,
+                reconnectStrategy: (retries) => Math.min(retries * 50, 500),
+            },
         password,
     });
 
     client.on("error", (err) => console.error("[memory:cache] Redis error:", err));
     client.on("reconnecting", () => console.log("[memory:cache] Redis reconnecting..."));
+    client.on("end", () => {
+        if (client && !client.isOpen) {
+            client = null;
+        }
+    });
 
     await client.connect();
+    connectionPromise = null;
     console.log("[memory:cache] Redis connected");
 
     return client;
+}
+
+export async function warmMemoryCache(): Promise<boolean> {
+    try {
+        await getRedisClient();
+        return true;
+    } catch (error) {
+        console.warn("[memory:cache] warmMemoryCache failed", error);
+        return false;
+    }
 }
 
 export async function closeRedis(): Promise<void> {
@@ -162,23 +240,6 @@ export async function closeRedis(): Promise<void> {
         connectionPromise = null;
         console.log("[memory:cache] Redis closed");
     }
-}
-
-async function scanKeysByPattern(redis: RedisClientType, pattern: string): Promise<string[]> {
-    const keys: string[] = [];
-    let cursor = "0";
-    do {
-        const result = await redis.scan(cursor, {
-            MATCH: pattern,
-            COUNT: 250,
-        });
-        cursor = result.cursor;
-        if (result.keys.length > 0) {
-            keys.push(...result.keys);
-        }
-    } while (cursor !== "0");
-
-    return keys;
 }
 
 export async function getCachedJson<T>(key: string): Promise<T | null> {
@@ -205,20 +266,18 @@ export async function setCachedJson(key: string, value: unknown, ttlSeconds: num
 export async function invalidateMemoryScope(scope: MemoryScope): Promise<number> {
     try {
         const redis = await getRedisClient();
-        const scopePattern = buildScopePattern(scope);
-        const patterns = [
-            `memory:query:vector:${scopePattern}:*`,
-            `memory:query:layers:${scopePattern}:*`,
-            `memory:query:graph:${scopePattern}:*`,
-        ];
-
-        let deleted = 0;
-        for (const pattern of patterns) {
-            const keys = await scanKeysByPattern(redis, pattern);
-            if (keys.length === 0) continue;
-            deleted += await redis.del(keys);
+        const key = scope.agentWallet
+            ? buildNamespaceKey(scope)
+            : GLOBAL_MEMORY_NAMESPACE_KEY;
+        const nextValue = await redis.incr(key);
+        if (nextValue === 1) {
+            await redis.expire(key, Math.max(
+                CACHE_TTL_SECONDS.vectorQuery,
+                CACHE_TTL_SECONDS.layerQuery,
+                CACHE_TTL_SECONDS.graphQuery,
+            ) * 4);
         }
-        return deleted;
+        return 1;
     } catch (error) {
         console.warn("[memory:cache] invalidateMemoryScope failed", error);
         return 0;

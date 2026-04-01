@@ -1,5 +1,5 @@
 import { invalidateMemoryScope } from "./cache.js";
-import { getSessionTranscriptsCollection } from "./mongo.js";
+import { getSessionsCollection, getSessionTranscriptsCollection } from "./mongo.js";
 import type { SessionTranscript } from "./types.js";
 import { indexMemoryContent } from "./vector.js";
 import { buildApiInternalHeaders, requireApiInternalUrl } from "../../auth.js";
@@ -15,6 +15,9 @@ export interface TranscriptStoreParams {
     tokenCount: number;
     metadata?: SessionTranscript["metadata"];
 }
+
+const DEFAULT_SESSION_MEMORY_TTL_MS = Number(process.env.MEMORY_SESSION_TTL_MS || 30 * 24 * 60 * 60 * 1000);
+const DEFAULT_SESSION_MEMORY_CONTEXT_LIMIT = Number(process.env.MEMORY_SESSION_CONTEXT_LIMIT || 12);
 
 export async function storeTranscript(params: TranscriptStoreParams): Promise<{ success: boolean }> {
     const transcripts = await getSessionTranscriptsCollection();
@@ -49,6 +52,72 @@ export async function storeTranscript(params: TranscriptStoreParams): Promise<{ 
     });
 
     return { success: true };
+}
+
+function normalizeWorkingMemoryLine(message: SessionTranscript["messages"][number]): string {
+    return `${message.role}: ${message.content}`.trim().slice(0, 1000);
+}
+
+export async function rememberSessionMessages(params: {
+    sessionId: string;
+    threadId: string;
+    agentWallet: string;
+    userAddress?: string;
+    messages: SessionTranscript["messages"];
+    state?: Record<string, unknown>;
+    entities?: Record<string, unknown>;
+}): Promise<{ success: boolean; contextCount: number }> {
+    const sessions = await getSessionsCollection();
+    const existing = await sessions.findOne({ sessionId: params.sessionId });
+    const now = Date.now();
+
+    const nextContext = [
+        ...(existing?.workingMemory.context || []),
+        ...params.messages
+            .filter((message) => message.role !== "system" && message.role !== "tool" && message.content.trim().length > 0)
+            .map(normalizeWorkingMemoryLine),
+    ].slice(-DEFAULT_SESSION_MEMORY_CONTEXT_LIMIT);
+
+    await sessions.updateOne(
+        { sessionId: params.sessionId },
+        {
+            $set: {
+                agentWallet: params.agentWallet,
+                userAddress: params.userAddress,
+                threadId: params.threadId,
+                workingMemory: {
+                    context: nextContext,
+                    entities: {
+                        ...(existing?.workingMemory.entities || {}),
+                        ...(params.entities || {}),
+                    },
+                    state: {
+                        ...(existing?.workingMemory.state || {}),
+                        ...(params.state || {}),
+                    },
+                },
+                compressed: false,
+                expiresAt: now + DEFAULT_SESSION_MEMORY_TTL_MS,
+                lastAccessedAt: now,
+            },
+            $setOnInsert: {
+                sessionId: params.sessionId,
+                createdAt: now,
+            },
+        },
+        { upsert: true },
+    );
+
+    await invalidateMemoryScope({
+        agentWallet: params.agentWallet,
+        userAddress: params.userAddress,
+        threadId: params.threadId,
+    });
+
+    return {
+        success: true,
+        contextCount: nextContext.length,
+    };
 }
 
 export async function getTranscriptBySessionId(sessionId: string): Promise<SessionTranscript | null> {

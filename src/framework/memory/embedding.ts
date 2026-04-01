@@ -2,6 +2,7 @@ import { createContentHash, getRedisClient } from "./cache.js";
 import type { EmbeddingResult } from "./types.js";
 
 const EMBEDDING_CACHE_TTL_SECONDS = 86400;
+const MONGODB_VOYAGE_EMBEDDING_URL = `${String(process.env.MONGO_DB_EMBEDDING_API_BASE_URL || "https://ai.mongodb.com/v1").replace(/\/+$/, "")}/embeddings`;
 
 interface VoyageEmbeddingResponse {
     object: string;
@@ -136,7 +137,7 @@ async function tryVoyageEmbedding(text: string): Promise<EmbeddingResult | null>
     }
 
     try {
-        const response = await fetch("https://api.voyageai.com/v1/embeddings", {
+        const response = await fetch(MONGODB_VOYAGE_EMBEDDING_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -173,7 +174,7 @@ async function tryVoyageBatchEmbedding(texts: string[]): Promise<number[][] | nu
     }
 
     try {
-        const response = await fetch("https://api.voyageai.com/v1/embeddings", {
+        const response = await fetch(MONGODB_VOYAGE_EMBEDDING_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

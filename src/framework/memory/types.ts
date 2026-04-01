@@ -49,6 +49,7 @@ export interface MemoryAddParams {
     run_id?: string;
     metadata?: Record<string, unknown>;
     enable_graph?: boolean;
+    async_mode?: boolean;
 }
 
 export interface KnowledgeAddParams {

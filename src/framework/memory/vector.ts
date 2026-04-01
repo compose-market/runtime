@@ -4,6 +4,7 @@ import {
     getCachedJson,
     getVectorQueryCacheKey,
     invalidateMemoryScope,
+    resolveScopedCacheKey,
     setCachedJson,
 } from "./cache.js";
 import { getEmbedding } from "./embedding.js";
@@ -264,7 +265,7 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
         options,
     } = params;
 
-    const cacheKey = getVectorQueryCacheKey({
+    const cacheKey = await resolveScopedCacheKey(getVectorQueryCacheKey({
         query,
         agentWallet,
         userAddress,
@@ -272,6 +273,10 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
         limit,
         threshold,
         options,
+    }), {
+        agentWallet,
+        userAddress,
+        threadId,
     });
 
     const cached = await getCachedJson<SearchResult[]>(cacheKey);
