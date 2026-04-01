@@ -35,7 +35,8 @@ import {
   shouldInitializeWorkflowRuntime,
 } from "./framework/mode.js";
 import { runWithAgentExecutionContext } from "./framework/agent/context.js";
-import { createMem0Tools } from "./framework/agent/tools.js";
+import { createMemoryTools } from "./framework/agent/tools.js";
+import { warmMemoryCache } from "./framework/memory/cache.js";
 import { ensureHai, isA409, verifyAnchor } from "./mesh/hai.js";
 import { anchorMeshState } from "./mesh/anchor.js";
 import { pinMeshArtifact } from "./mesh/filecoin-pin.js";
@@ -162,7 +163,7 @@ const walletAddressSchema = z.string().regex(/^0x[a-fA-F0-9]{40}$/);
 const hex32Pattern = /^0x[a-f0-9]{64}$/i;
 const privateKeyPattern = /^0x[a-f0-9]{64}$/i;
 const haiIdPattern = /^[a-z0-9]{6}$/i;
-const statePathPattern = /^compose-[a-z0-9]{6}-#\d+$/i;
+const statePathPattern = /^compose-[a-z0-9]{6}-\d+$/i;
 const learningPathPattern = /^learning-[a-z0-9]{6}-(learning|report|resource|ticket)-#\d+$/i;
 
 const LocalMeshToolRequestSchema = z.object({
@@ -170,8 +171,8 @@ const LocalMeshToolRequestSchema = z.object({
   userAddress: walletAddressSchema.optional(),
   toolName: z.enum(["search_memory", "save_memory", "search_all_memory"]),
   args: z.record(z.string(), z.unknown()).optional(),
-  haiId: z.string().trim().min(1).max(64).optional(),
-  threadId: z.string().trim().min(1).max(128).optional(),
+  haiId: z.string().trim().min(1).max(64),
+  threadId: z.string().trim().min(1).max(128),
   workflowWallet: walletAddressSchema.optional(),
 });
 
@@ -252,7 +253,7 @@ function authorizeLocalMeshRequest(req: Request, res: Response): boolean {
 }
 
 async function executeLocalMeshTool(input: z.infer<typeof LocalMeshToolRequestSchema>): Promise<unknown> {
-  const tools = createMem0Tools(input.agentWallet, input.userAddress, input.workflowWallet);
+  const tools = createMemoryTools(input.agentWallet, input.userAddress, input.workflowWallet);
   const tool = tools.find((candidate) => candidate.name === input.toolName);
   if (!tool) {
     throw new Error(`Unsupported local mesh tool: ${input.toolName}`);
@@ -260,8 +261,9 @@ async function executeLocalMeshTool(input: z.infer<typeof LocalMeshToolRequestSc
 
   return runWithAgentExecutionContext(
     {
-      composeRunId: input.haiId,
-      threadId: input.threadId || input.haiId || input.agentWallet,
+      mode: "local",
+      haiId: input.haiId,
+      threadId: input.threadId,
       agentWallet: input.agentWallet,
       userAddress: input.userAddress,
       workflowWallet: input.workflowWallet,
@@ -966,6 +968,7 @@ export async function startRuntimeServer(port?: number): Promise<HttpServer> {
   }
 
   const resolvedPort = port || Number(process.env.MCP_PORT || process.env.PORT || 4003);
+  void warmMemoryCache();
   runtimeServerPromise = new Promise<HttpServer>((resolve, reject) => {
     const server = app.listen(resolvedPort);
 
