@@ -368,9 +368,10 @@ function buildEnhancedPrompt(name: string, description: string, plugins: string[
     const toolInstructions = pluginNames.length > 0
         ? `\n\nYou have access to the following tools: ${pluginNames.join(", ")}. When a user asks a question that can be answered using one of these tools (e.g., current prices, market data, on-chain actions), you MUST use the appropriate tool to answer. Do not say you cannot access real-time information - you CAN via your tools.`
         : "";
+    const memoryInstructions = "\n\nYou also have runtime memory tools: search_memory, save_memory, and search_all_memory. When a user asks what you remember, asks you to recall prior conversations or preferences, or tells you to remember something important, you MUST use the appropriate memory tool instead of guessing. Use save_memory with a content string containing the fact to retain. Use search_memory with a query string describing what to recall. Do not call memory tools with empty arguments. If a user shares a durable fact like their name, acknowledge that you will remember it instead of claiming memory is unavailable unless a memory tool actually fails.";
 
     const basePrompt = systemPrompt || `You are ${name}. ${description}`;
-    return `${basePrompt}${toolInstructions}`;
+    return `${basePrompt}${toolInstructions}${memoryInstructions}`;
 }
 
 function buildRuntimeConfig(

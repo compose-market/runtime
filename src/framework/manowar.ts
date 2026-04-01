@@ -7,9 +7,11 @@ import path from "node:path";
 
 import type { AgentWallet } from "../agent-wallet.js";
 import { createAgentGraph } from "./agent/graph.js";
-import { createAgentTools } from "./agent/tools.js";
+import { createAgentTools, createMemoryTools } from "./agent/tools.js";
 import { Mem0CallbackHandler } from "./agent/callbacks.js";
-import { runWithAgentExecutionContext } from "./agent/context.js";
+import { getAgentExecutionContext, runWithAgentExecutionContext } from "./agent/context.js";
+import { persistAgentConversationTurn, retrieveAgentMemory } from "./agent/memory.js";
+import { resolveMemoryScope } from "./agent/memory-scope.js";
 import {
   buildApiInternalHeaders,
   requireApiInternalToken,
@@ -202,32 +204,38 @@ function createEmptyStreamUsageTotals(): StreamUsageTotals {
 function buildDynamicSystemContext(config: AgentConfig): string | undefined {
   const lines: string[] = [];
   const sessionContext = config.sessionContext;
-  if (!sessionContext) {
-    return undefined;
-  }
+  if (sessionContext) {
+    lines.push("Execution context:");
+    lines.push(`- Session active: ${sessionContext.sessionActive ? "yes" : "no"}`);
+    lines.push(`- Session budget remaining: ${sessionContext.sessionBudgetRemaining}`);
+    if (shouldEnforceCloudPermissions() && sessionContext.cloudPermissions?.length) {
+      lines.push(`- Backpack cloud permissions: ${sessionContext.cloudPermissions.join(", ")}`);
+    }
 
-  lines.push("Execution context:");
-  lines.push(`- Session active: ${sessionContext.sessionActive ? "yes" : "no"}`);
-  lines.push(`- Session budget remaining: ${sessionContext.sessionBudgetRemaining}`);
-  if (shouldEnforceCloudPermissions() && sessionContext.cloudPermissions?.length) {
-    lines.push(`- Backpack cloud permissions: ${sessionContext.cloudPermissions.join(", ")}`);
-  }
-
-  if (sessionContext.backpackAccounts) {
-    const connectedAccounts = sessionContext.backpackAccounts.filter((account) => account.connected);
-    if (connectedAccounts.length > 0) {
-      lines.push("Backpack accounts currently connected for this user:");
-      connectedAccounts.forEach((account) => {
-        lines.push(`- ${account.slug}: ${account.name} (${account.status || "ACTIVE"})`);
-      });
-      lines.push("Backpack accounts are authenticated user accounts. They are distinct from MCP servers and distinct from skills.");
-      lines.push("Use the backpack tools to inspect available actions and execute them through the user's connected account.");
-    } else {
-      lines.push("No Backpack accounts are currently connected for this user.");
+    if (sessionContext.backpackAccounts) {
+      const connectedAccounts = sessionContext.backpackAccounts.filter((account) => account.connected);
+      if (connectedAccounts.length > 0) {
+        lines.push("Backpack accounts currently connected for this user:");
+        connectedAccounts.forEach((account) => {
+          lines.push(`- ${account.slug}: ${account.name} (${account.status || "ACTIVE"})`);
+        });
+        lines.push("Backpack accounts are authenticated user accounts. They are distinct from MCP servers and distinct from skills.");
+        lines.push("Use the backpack tools to inspect available actions and execute them through the user's connected account.");
+      } else {
+        lines.push("No Backpack accounts are currently connected for this user.");
+      }
     }
   }
 
-  return lines.join("\n");
+  const memoryPrompt = getAgentExecutionContext()?.memoryPrompt;
+  if (memoryPrompt) {
+    if (lines.length > 0) {
+      lines.push("");
+    }
+    lines.push(memoryPrompt);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 export function createModel(modelName: string, temperature: number = 0.7): BaseChatModel {
@@ -256,11 +264,15 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     config.chainId,
     config.userAddress,
   );
+  const memoryTools = config.memory === false
+    ? []
+    : createMemoryTools(config.agentWallet, config.userAddress, config.workflowWallet);
+  const runtimeTools = [...composeTools, ...memoryTools];
   const model = createModel(config.model, config.temperature ?? 0.7);
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
   const executor = createAgentGraph(
     model,
-    composeTools,
+    runtimeTools,
     checkpointDir,
     config.systemPrompt,
     () => buildDynamicSystemContext(config),
@@ -270,7 +282,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     name: config.name,
     executor,
     config,
-    tools: [...composeTools],
+    tools: runtimeTools,
   };
   agents.set(id, instance);
   return instance;
@@ -396,6 +408,81 @@ async function buildHumanMessage(message: string, options: ExecuteOptions): Prom
   });
 }
 
+function buildGlobalMemoryScope(agentWallet: string, options: ExecuteOptions, threadId: string) {
+  return resolveMemoryScope({
+    agentId: agentWallet,
+    userAddress: options.userAddress,
+    workflowWallet: options.workflowWallet,
+    context: {
+      mode: "global",
+      composeRunId: options.composeRunId,
+      threadId,
+      agentWallet,
+      userAddress: options.userAddress,
+      workflowWallet: options.workflowWallet,
+    },
+  });
+}
+
+function buildConversationTurnSessionId(agentWallet: string, threadId: string, composeRunId?: string): string {
+  if (composeRunId && composeRunId.trim().length > 0) {
+    return composeRunId.trim();
+  }
+  return `turn:${agentWallet}:${threadId}:${Date.now()}`;
+}
+
+async function loadConversationMemoryPrompt(
+  agentWallet: string,
+  message: string,
+  options: ExecuteOptions,
+  threadId: string,
+): Promise<string | undefined> {
+  const query = message.trim();
+  if (!query) {
+    return undefined;
+  }
+
+  try {
+    const scope = buildGlobalMemoryScope(agentWallet, options, threadId);
+    const { prompt } = await retrieveAgentMemory({
+      query,
+      scope,
+      limit: 6,
+    });
+    return prompt || undefined;
+  } catch (error) {
+    console.error("[manowar] failed to load runtime memory", error);
+    return undefined;
+  }
+}
+
+async function persistConversationTurnSafely(input: {
+  agentWallet: string;
+  threadId: string;
+  options: ExecuteOptions;
+  userMessage: string;
+  assistantMessage: string;
+  modelUsed: string;
+  totalTokens: number;
+}): Promise<void> {
+  try {
+    const scope = buildGlobalMemoryScope(input.agentWallet, input.options, input.threadId);
+    await persistAgentConversationTurn({
+      scope,
+      sessionId: buildConversationTurnSessionId(input.agentWallet, input.threadId, input.options.composeRunId),
+      userMessage: input.userMessage,
+      assistantMessage: input.assistantMessage,
+      modelUsed: input.modelUsed,
+      totalTokens: input.totalTokens,
+      metadata: {
+        workflow_wallet: input.options.workflowWallet,
+      },
+    });
+  } catch (error) {
+    console.error("[manowar] failed to persist conversation turn memory", error);
+  }
+}
+
 async function executeAgentCore(
   agent: AgentInstance,
   message: string,
@@ -412,18 +499,26 @@ async function executeAgentCore(
       agent.config.sessionContext = options.sessionContext;
     }
 
-    const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId);
     const usageTracker = new AgentMemoryTracker(agentWallet, threadId);
+    const callbacks = agent.config.memory === false
+      ? [usageTracker]
+      : [new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId), usageTracker];
     const humanMessage = await buildHumanMessage(message, options);
+    const memoryPrompt = agent.config.memory === false
+      ? undefined
+      : await loadConversationMemoryPrompt(agentWallet, message, options, threadId);
 
     const maxRecursionLimit = Math.min(parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10), 500);
     const result = await runWithAgentExecutionContext(
       {
+        mode: "global",
         composeRunId: options.composeRunId,
         threadId,
         agentWallet,
         userAddress,
         workflowWallet,
+        memoryPrompt,
+        lastUserMessage: message,
       },
       async () =>
         agent.executor.invoke(
@@ -437,7 +532,7 @@ async function executeAgentCore(
               maxRecursionDepth: maxRecursionLimit,
               startTime: Date.now(),
             },
-            callbacks: [mem0Handler, usageTracker],
+            callbacks,
             recursionLimit: maxRecursionLimit,
           },
         ),
@@ -459,6 +554,19 @@ async function executeAgentCore(
           }
         : null,
     );
+    const output = resolveMessageText(lastMessage);
+
+    if (agent.config.memory !== false) {
+      await persistConversationTurnSafely({
+        agentWallet,
+        threadId,
+        options,
+        userMessage: message,
+        assistantMessage: output,
+        modelUsed: agent.config.model || "unknown",
+        totalTokens: extractedTokens.totalTokens,
+      });
+    }
 
     return {
       success: true,
@@ -466,7 +574,7 @@ async function executeAgentCore(
         role: item._getType?.() || "unknown",
         content: resolveMessageText(item),
       })),
-      output: resolveMessageText(lastMessage),
+      output,
       usage: {
         prompt_tokens: extractedTokens.inputTokens,
         completion_tokens: extractedTokens.outputTokens,
@@ -499,23 +607,32 @@ async function* streamAgentCore(
   const threadId = options.threadId || `thread-${agentWallet}`;
   const userAddress = options.userAddress;
   const workflowWallet = options.workflowWallet;
-  const mem0Handler = new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId);
   const usageTracker = new AgentMemoryTracker(agentWallet, threadId);
+  const callbacks = agent.config.memory === false
+    ? [usageTracker]
+    : [new Mem0CallbackHandler(agentWallet, threadId, userAddress, workflowWallet, options.composeRunId), usageTracker];
   const humanMessage = await buildHumanMessage(message, options);
+  const memoryPrompt = agent.config.memory === false
+    ? undefined
+    : await loadConversationMemoryPrompt(agentWallet, message, options, threadId);
 
   const maxRecursionLimit = Math.min(parseInt(process.env.MAX_AGENT_RECURSION_DEPTH || "100", 10), 500);
   const usageTotals = createEmptyStreamUsageTotals();
   let thinkingActive = false;
   let lastUsageCandidate: unknown = null;
+  let streamedAssistantText = "";
 
   try {
     const eventStream = await runWithAgentExecutionContext(
       {
+        mode: "global",
         composeRunId: options.composeRunId,
         threadId,
         agentWallet,
         userAddress,
         workflowWallet,
+        memoryPrompt,
+        lastUserMessage: message,
       },
       async () =>
         agent.executor.streamEvents(
@@ -529,7 +646,7 @@ async function* streamAgentCore(
               maxRecursionDepth: maxRecursionLimit,
               startTime: Date.now(),
             },
-            callbacks: [mem0Handler, usageTracker],
+            callbacks,
             recursionLimit: maxRecursionLimit,
             version: "v2",
           },
@@ -553,6 +670,7 @@ async function* streamAgentCore(
         const chunk = event.data?.chunk;
         const content = normalizeMessageContent(chunk?.content);
         if (content) {
+          streamedAssistantText += content;
           yield { choices: [{ delta: { content } }] };
         }
       } else if (event.event === "on_chat_model_end") {
@@ -615,6 +733,18 @@ async function* streamAgentCore(
       usageTotals.completionTokens = authoritativeTokens.outputTokens;
       usageTotals.reasoningTokens = authoritativeTokens.reasoningTokens;
       usageTotals.totalTokens = authoritativeTokens.totalTokens;
+    }
+
+    if (agent.config.memory !== false) {
+      await persistConversationTurnSafely({
+        agentWallet,
+        threadId,
+        options,
+        userMessage: message,
+        assistantMessage: streamedAssistantText,
+        modelUsed: agent.config.model || "unknown",
+        totalTokens: usageTotals.totalTokens,
+      });
     }
 
     yield {
