@@ -15,6 +15,13 @@ const EnvSchema = z.object({
   FILECOIN_MAINNET_RPC: z.string().trim().min(1).optional(),
 });
 
+function normalizeInlineCommentedEnvValue(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return value.replace(/\s+#.*$/, "").trim();
+}
+
 export interface MeshSynapseConfig {
   runtimeAuthToken: string;
   network: "calibration" | "mainnet";
@@ -33,7 +40,15 @@ export function resolveSynapseChain(network: MeshSynapseConfig["network"]): Chai
 }
 
 export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): MeshSynapseConfig {
-  const parsed = EnvSchema.parse(env);
+  const parsed = EnvSchema.parse({
+    ...env,
+    COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN: normalizeInlineCommentedEnvValue(env.COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN),
+    SYNAPSE_NETWORK: normalizeInlineCommentedEnvValue(env.SYNAPSE_NETWORK),
+    SYNAPSE_PROJECT_NAMESPACE: normalizeInlineCommentedEnvValue(env.SYNAPSE_PROJECT_NAMESPACE),
+    SYNAPSE_RPC_URL: normalizeInlineCommentedEnvValue(env.SYNAPSE_RPC_URL),
+    FILECOIN_CALIBRATION_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_CALIBRATION_RPC),
+    FILECOIN_MAINNET_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_MAINNET_RPC),
+  });
   const rpcUrl = parsed.SYNAPSE_RPC_URL
     || (parsed.SYNAPSE_NETWORK === "mainnet" ? parsed.FILECOIN_MAINNET_RPC : undefined)
     || (parsed.SYNAPSE_NETWORK === "calibration" ? parsed.FILECOIN_CALIBRATION_RPC : undefined)
@@ -77,35 +92,23 @@ export function createStateDatasetMetadata(
   };
 }
 
-export function createComposeDatasetMetadata(
-  config: MeshSynapseConfig,
-  env: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
-  return createStateDatasetMetadata(config, env);
+export function createStateLatestAlias(haiId: string): string {
+  return `compose-${haiId.toLowerCase()}:latest`;
 }
 
 export function createStatePieceMetadata(input: {
   haiId: string;
   path: string;
-  agentWallet: `0x${string}`;
-  userAddress: `0x${string}`;
-  deviceId: string;
+  updateNumber: number;
+  stateRootHash: `0x${string}`;
 }): Record<string, string> {
   return {
     name: input.path,
     HAI: input.haiId.toLowerCase(),
-    Agent: input.agentWallet.toLowerCase(),
+    Latest: createStateLatestAlias(input.haiId),
+    Update: String(Math.trunc(input.updateNumber)),
+    StateRootHash: input.stateRootHash.toLowerCase(),
   };
-}
-
-export function createComposePieceMetadata(input: {
-  haiId: string;
-  path: string;
-  agentWallet: `0x${string}`;
-  userAddress: `0x${string}`;
-  deviceId: string;
-}): Record<string, string> {
-  return createStatePieceMetadata(input);
 }
 
 export function createLearningDatasetMetadata(

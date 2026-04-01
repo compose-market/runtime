@@ -1,6 +1,10 @@
 import type { UploadResult } from "@filoz/synapse-sdk";
-import { createComposePieceMetadata, loadMeshSynapseConfig } from "./config.js";
-import { createMeshStorageContext } from "./control-plane.js";
+import {
+  createStateLatestAlias,
+  createStatePieceMetadata,
+  loadMeshSynapseConfig,
+} from "./config.js";
+import { createMeshStorageContext } from "./synapse.js";
 import { markHaiAnchor } from "./hai.js";
 import type { MeshSynapseAnchorRequest, MeshSynapseAnchorResponse } from "./types.js";
 
@@ -23,14 +27,13 @@ export async function anchorMeshState(
   request: MeshSynapseAnchorRequest,
 ): Promise<MeshSynapseAnchorResponse> {
   const config = loadMeshSynapseConfig();
-  const latestAlias = `compose-${request.haiId}:latest`;
+  const latestAlias = createStateLatestAlias(request.haiId);
   const payload = new TextEncoder().encode(request.envelopeJson);
-  const pieceMetadata = createComposePieceMetadata({
+  const pieceMetadata = createStatePieceMetadata({
     haiId: request.haiId,
     path: request.path,
-    agentWallet: request.agentWallet,
-    userAddress: request.userAddress,
-    deviceId: request.deviceId,
+    updateNumber: request.updateNumber,
+    stateRootHash: request.stateRootHash,
   });
 
   let storage = await createMeshStorageContext(request);
