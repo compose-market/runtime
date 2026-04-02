@@ -15,6 +15,7 @@ import type {
 } from "./types.js";
 
 type ProvisionableRequest = MeshSessionRequest;
+type SynapseCreateSessionKey = NonNullable<Parameters<typeof Synapse.create>[0]["sessionKey"]>;
 
 function normalizeSynapseExpiryMs(value: number): number {
   if (!Number.isFinite(value) || value <= 0) {
@@ -36,7 +37,7 @@ function apiUrl(request: ProvisionableRequest): string {
   return request.apiUrl.replace(/\/+$/, "");
 }
 
-function minSessionExpiryMs(sessionKey: SessionKey.SessionKey<"Secp256k1">): number {
+function minSessionExpiryMs(sessionKey: SynapseCreateSessionKey): number {
   const minExpiry = SessionKey.DefaultFwssPermissions.reduce((min, permission) => {
     const expiry = sessionKey.expirations[permission] ?? 0n;
     return expiry < min ? expiry : min;
@@ -48,14 +49,14 @@ function minSessionExpiryMs(sessionKey: SessionKey.SessionKey<"Secp256k1">): num
 function buildSessionKey(
   request: ProvisionableRequest,
   payerAddress: `0x${string}`,
-) {
+): SynapseCreateSessionKey {
   const config = loadMeshSynapseConfig();
   return SessionKey.fromSecp256k1({
     privateKey: request.sessionKeyPrivateKey,
     root: payerAddress,
     chain: resolveSynapseChain(config.network),
     transport: config.rpcUrl ? http(config.rpcUrl) : http(),
-  });
+  }) as unknown as SynapseCreateSessionKey;
 }
 
 function createReadOnlyPayerAccount(address: `0x${string}`) {
@@ -117,37 +118,12 @@ export async function ensureProvisionedSynapseClient(
   const config = loadMeshSynapseConfig();
   const chain = resolveSynapseChain(config.network);
   const requiredExpiry = normalizeSynapseExpiryMs(request.targetSynapseExpiry);
-
-  let payerAddress = request.payerAddress ?? null;
-  let sessionKeyExpiresAt = normalizeSynapseExpiryMs(request.sessionKeyExpiresAt ?? 0);
-
-  let sessionKey = payerAddress
-    ? buildSessionKey(request, payerAddress)
-    : null;
-
-  if (sessionKey) {
-    await sessionKey.syncExpirations();
-    sessionKeyExpiresAt = minSessionExpiryMs(sessionKey);
-  }
-
-  const sessionNeedsProvisioning = (
-    sessionKey == null
-    || !sessionKey.hasPermissions(SessionKey.DefaultFwssPermissions)
-    || sessionKeyExpiresAt < requiredExpiry
-  );
-
-  if (sessionNeedsProvisioning || (options?.depositAmount ?? 0n) > 0n) {
-    const provisioned = await requestProvision(request, options);
-    payerAddress = provisioned.payerAddress;
-    sessionKeyExpiresAt = normalizeSynapseExpiryMs(provisioned.sessionKeyExpiresAt);
-    sessionKey = buildSessionKey(request, payerAddress);
-    await sessionKey.syncExpirations();
-    sessionKeyExpiresAt = Math.max(sessionKeyExpiresAt, minSessionExpiryMs(sessionKey));
-  }
-
-  if (!payerAddress || !sessionKey) {
-    throw new Error("Synapse provisioning did not return a payer-backed session key");
-  }
+  const provisioned = await requestProvision(request, options);
+  const payerAddress = provisioned.payerAddress;
+  let sessionKeyExpiresAt = normalizeSynapseExpiryMs(provisioned.sessionKeyExpiresAt);
+  const sessionKey = buildSessionKey(request, payerAddress);
+  await sessionKey.syncExpirations();
+  sessionKeyExpiresAt = Math.max(sessionKeyExpiresAt, minSessionExpiryMs(sessionKey));
 
   if (!sessionKey.hasPermissions(SessionKey.DefaultFwssPermissions)) {
     throw new Error("Synapse session key is missing required FWSS permissions");
