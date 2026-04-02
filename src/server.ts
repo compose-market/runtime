@@ -9,11 +9,13 @@ import cors, { type CorsOptions } from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { CodeLanguage } from "@daytonaio/sdk";
 import { z } from "zod";
 import { registerOrchestrationRoutes, initializeWorkflowRuntime, registerWorkspaceRoutes } from "./orchestration.js";
 import { requireRuntimeInternalToken } from "./auth.js";
 import {
   getRuntimeStatus,
+  peekRuntimeStatus,
   listPlugins,
   getPluginTools,
   listAllTools,
@@ -37,12 +39,28 @@ import {
 import { runWithAgentExecutionContext } from "./framework/agent/context.js";
 import { createMemoryTools } from "./framework/agent/tools.js";
 import { warmMemoryCache } from "./framework/memory/cache.js";
-import { ensureHai, isA409, verifyAnchor } from "./mesh/hai.js";
+import { isA409, registerHai, verifyAnchor } from "./mesh/hai.js";
 import { anchorMeshState } from "./mesh/anchor.js";
 import { pinMeshArtifact } from "./mesh/filecoin-pin.js";
-import type { MeshSharedArtifactPinRequest, MeshSynapseAnchorRequest } from "./mesh/types.js";
+import { readMeshReputationSummary } from "./mesh/reputation.js";
+import {
+  createDaytonaClient,
+  loadDaytonaConfig,
+  persistConclaveReceipt,
+  runConclaveSandbox,
+} from "./mesh/sandbox.js";
+import type {
+  MeshSharedArtifactPinRequest,
+  MeshSynapseAnchorRequest,
+} from "./mesh/types.js";
 
 const app = express();
+const LOCAL_RUNTIME_API_VERSION = 2;
+const LOCAL_RUNTIME_CAPABILITIES = [
+  "mesh.reputation.summary",
+  "mesh.filecoin.pin",
+  "mesh.conclave.run",
+] as const;
 
 // CORS Configuration
 const corsOptions: CorsOptions = {
@@ -180,7 +198,7 @@ const RegisterHaiRequestSchema = z.object({
   agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
   userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
   deviceId: z.string().trim().min(8).max(128),
-  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
+  haiId: z.string().regex(haiIdPattern).transform((value) => value.toLowerCase()).nullable().optional(),
 }).strict();
 
 const AnchorRequestSchema = z.object({
@@ -198,8 +216,6 @@ const AnchorRequestSchema = z.object({
   stateRootHash: z.string().regex(hex32Pattern).transform((value) => value.toLowerCase() as `0x${string}`),
   envelopeJson: z.string().trim().min(2),
   sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`),
-  payerAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
-  sessionKeyExpiresAt: z.number().int().positive().nullable().optional(),
 }).strict();
 
 const FilecoinPinRequestSchema = z.object({
@@ -211,8 +227,6 @@ const FilecoinPinRequestSchema = z.object({
   chainId: z.number().int().positive(),
   targetSynapseExpiry: z.number().int().positive(),
   sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`),
-  payerAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
-  sessionKeyExpiresAt: z.number().int().positive().nullable().optional(),
   signedRequestJson: z.string().trim().min(2),
   haiId: z.string().regex(haiIdPattern).transform((value) => value.toLowerCase()),
   artifactKind: z.enum(["learning", "report", "resource", "ticket"]),
@@ -226,6 +240,28 @@ const FilecoinPinRequestSchema = z.object({
   copies: z.number().int().positive().optional(),
 }).strict();
 
+const ConclaveRunRequestSchema = z.object({
+  agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).optional(),
+  haiId: z.string().trim().min(1).max(64).optional(),
+  threadId: z.string().trim().min(1).max(128).optional(),
+  conclaveId: z.string().trim().min(1).max(120),
+  command: z.string().trim().min(1),
+  cwd: z.string().trim().min(1).optional(),
+  envVars: z.record(z.string(), z.string()).optional(),
+  labels: z.record(z.string(), z.string()).optional(),
+  snapshotId: z.string().trim().min(1).nullable().optional(),
+  language: z.enum(["javascript", "typescript", "python"]).optional(),
+  timeoutMs: z.number().int().positive().max(3_600_000).optional(),
+  networkBlockAll: z.boolean().optional(),
+  networkAllowList: z.string().trim().min(1).optional(),
+}).strict();
+
+const ReputationSummaryQuerySchema = z.object({
+  agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
+  baseDir: z.string().trim().min(1).optional(),
+}).strict();
+
 function requireLocalRuntimeAuthToken(): string {
   const value = String(process.env.COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN || "").trim();
   if (!value) {
@@ -234,22 +270,29 @@ function requireLocalRuntimeAuthToken(): string {
   return value;
 }
 
-function isLocalMeshRouteEnabled(): boolean {
+function isLocalRuntimeHost(): boolean {
   return resolveRuntimeHostMode() === "local";
 }
 
-function authorizeLocalMeshRequest(req: Request, res: Response): boolean {
-  if (!isLocalMeshRouteEnabled()) {
-    res.status(404).json({ error: "Local mesh routes are only available in local runtime host mode" });
+function authorizeLocalRuntimeHostRequest(req: Request, res: Response): boolean {
+  if (!isLocalRuntimeHost()) {
+    res.status(404).json({ error: "Not found" });
     return false;
   }
-
   if (getRequestHeader(req, LOCAL_RUNTIME_AUTH_HEADER) !== requireLocalRuntimeAuthToken()) {
     res.status(401).json({ error: "Missing or invalid local runtime authorization" });
     return false;
   }
 
   return true;
+}
+
+function authorizeLocalMeshRequest(req: Request, res: Response): boolean {
+  if (!isLocalRuntimeHost()) {
+    return true;
+  }
+
+  return authorizeLocalRuntimeHostRequest(req, res);
 }
 
 async function executeLocalMeshTool(input: z.infer<typeof LocalMeshToolRequestSchema>): Promise<unknown> {
@@ -313,8 +356,8 @@ app.post("/mesh/hai/register", asyncHandler(async (req: Request, res: Response) 
   }
 
   try {
-    const row = await ensureHai(parsed.data);
-    res.status(200).json(row);
+    const registered = registerHai(parsed.data);
+    res.status(200).json(registered);
   } catch (error) {
     if (isA409(error)) {
       res.status(409).json({
@@ -386,6 +429,101 @@ app.post("/mesh/filecoin/pin", asyncHandler(async (req: Request, res: Response) 
 
     res.status(500).json({
       error: error instanceof Error ? error.message : "Failed to pin mesh artifact",
+    });
+  }
+}));
+
+app.get("/mesh/reputation/summary", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = ReputationSummaryQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid mesh reputation query", parsed.error);
+    return;
+  }
+
+  try {
+    const summary = await readMeshReputationSummary({
+      agentWallet: parsed.data.agentWallet,
+      baseDir: parsed.data.baseDir,
+    });
+    res.status(200).json({
+      reputationScore: summary.score,
+      totalConclaves: summary.totalConclaves,
+      successfulConclaves: summary.successfulConclaves,
+      successRate: summary.successRate,
+      qualityMultiplier: summary.qualityMultiplier,
+      activityMultiplier: summary.activityMultiplier,
+      lastConclaveAt: summary.lastConclaveAt,
+      daysSinceLastConclave: summary.daysSinceLastConclave,
+      successfulLearningPublications: summary.successfulLearningPublications,
+      lastLearningAt: summary.lastLearningAt,
+      lastManifestAt: summary.lastManifestAt,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to summarize mesh reputation",
+    });
+  }
+}));
+
+app.post("/mesh/conclave/run", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = ConclaveRunRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid mesh conclave payload", parsed.error);
+    return;
+  }
+
+  try {
+    const config = loadDaytonaConfig();
+    const client = createDaytonaClient(config);
+    const language = parsed.data.language === undefined
+      ? undefined
+      : parsed.data.language === "python"
+        ? CodeLanguage.PYTHON
+        : parsed.data.language === "javascript"
+          ? CodeLanguage.JAVASCRIPT
+          : CodeLanguage.TYPESCRIPT;
+    const receipt = await runConclaveSandbox(
+      client,
+      config,
+      {
+        conclaveId: parsed.data.conclaveId,
+        command: parsed.data.command,
+        cwd: parsed.data.cwd,
+        envVars: parsed.data.envVars,
+        labels: {
+          agentWallet: parsed.data.agentWallet,
+          ...(parsed.data.labels || {}),
+        },
+        snapshotId: parsed.data.snapshotId ?? null,
+        language,
+        timeoutMs: parsed.data.timeoutMs,
+        networkBlockAll: parsed.data.networkBlockAll,
+        networkAllowList: parsed.data.networkAllowList,
+      },
+    );
+    const storedAt = await persistConclaveReceipt({
+      conclaveId: parsed.data.conclaveId,
+      agentWallet: parsed.data.agentWallet,
+      receipt,
+    });
+
+    res.status(200).json({
+      conclaveId: parsed.data.conclaveId,
+      agentWallet: parsed.data.agentWallet,
+      ...receipt,
+      storedAt,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to run Daytona conclave",
     });
   }
 }));
@@ -548,8 +686,9 @@ registerWorkspaceRoutes(app);
 
 app.get("/status", asyncHandler(async (req: Request, res: Response) => {
   // Alias for /health but explicitly requested by Connector
-  // We can redirect or just reuse the logic
-  const goatStatus = await getRuntimeStatus();
+  // Keep health cheap and non-blocking. Full GOAT initialization belongs on
+  // explicit runtime/tool routes, not the local host readiness probe.
+  const goatStatus = peekRuntimeStatus();
   const hostMode = resolveRuntimeHostMode();
   const temporalWorkersEnabled = shouldInitializeWorkflowRuntime();
   res.json({
@@ -559,11 +698,22 @@ app.get("/status", asyncHandler(async (req: Request, res: Response) => {
     version: "0.3.0",
     hostMode,
     temporalWorkersEnabled,
+    localRuntimeApiVersion: LOCAL_RUNTIME_API_VERSION,
+    meshCapabilities: LOCAL_RUNTIME_CAPABILITIES,
     runtimes: {
       goat: goatStatus.initialized,
       mcp: true,
     },
   });
+}));
+
+app.post("/__local/stop", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalRuntimeHostRequest(req, res)) {
+    return;
+  }
+
+  res.status(202).json({ status: "stopping" });
+  setTimeout(() => process.exit(0), 25).unref();
 }));
 
 // ============================================================================
@@ -697,11 +847,24 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
 // MCP Server Spawning Routes (On-Demand)
 // ============================================================================
 
-const mcpRuntime = new McpRuntime();
-mcpRuntime.initialize().catch(console.error);
+let inspectRuntimePromise: Promise<McpRuntime> | null = null;
 
-const inspectRuntime = new McpRuntime({ maxSessions: 5, sessionTimeoutMs: 60 * 1000 });
-inspectRuntime.initialize().catch(console.error);
+async function getInspectRuntime(): Promise<McpRuntime> {
+  if (inspectRuntimePromise) {
+    return await inspectRuntimePromise;
+  }
+
+  inspectRuntimePromise = (async () => {
+    const runtime = new McpRuntime({ maxSessions: 5, sessionTimeoutMs: 60 * 1000 });
+    await runtime.initialize();
+    return runtime;
+  })().catch((error) => {
+    inspectRuntimePromise = null;
+    throw error;
+  });
+
+  return await inspectRuntimePromise;
+}
 
 /**
  * POST /mcp/inspect
@@ -750,6 +913,7 @@ app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
   for (const candidate of validCandidates) {
     let sessionId: string | null = null;
     try {
+      const inspectRuntime = await getInspectRuntime();
       sessionId = await inspectRuntime.spawnServer(serverId, candidate);
       const tools = inspectRuntime.getSessionTools(sessionId);
 
@@ -788,6 +952,7 @@ app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
     } finally {
       if (sessionId) {
         try {
+          const inspectRuntime = await getInspectRuntime();
           await inspectRuntime.terminateSession(sessionId);
         } catch {
           // Ignore cleanup errors.
