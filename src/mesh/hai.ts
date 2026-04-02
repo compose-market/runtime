@@ -1,6 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { createHash } from "node:crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { encodePacked, keccak256 } from "viem";
 import { z } from "zod";
@@ -22,7 +20,6 @@ export const sigRe = /^[a-f0-9]+$/i;
 export const haiRe = /^[a-z0-9]{6}$/i;
 export const stateRe = /^compose-([a-z0-9]{6})-(\d+)$/i;
 export const learningRe = /^learning-([a-z0-9]{6})-(learning|report|resource|ticket)-#(\d+)$/i;
-const pkRe = /^0x[a-f0-9]{64}$/i;
 
 export class MeshA409Error extends Error {
     readonly code = "a409" as const;
@@ -80,47 +77,6 @@ const anchorSchema = z.object({
     snapshot: z.unknown(),
     signature: z.string().regex(sigRe),
 }).strict();
-
-export interface HaiRow {
-    version: 1;
-    agentWallet: `0x${string}`;
-    userAddress: `0x${string}`;
-    deviceId: string;
-    haiId: string;
-    synapseSessionPrivateKey: `0x${string}`;
-    payerAddress: `0x${string}` | null;
-    sessionKeyExpiresAt: number | null;
-    nextUpdateNumber: number;
-    nextLearningNumber: number;
-    lastUpdateNumber: number | null;
-    lastLearningNumber: number | null;
-    lastPath: string | null;
-    lastStateRootHash: `0x${string}` | null;
-    lastPieceCid: string | null;
-    lastAnchoredAt: number | null;
-    updatedAt: number;
-}
-
-function baseDir(env: NodeJS.ProcessEnv = process.env): string {
-    const dir = String(env.COMPOSE_LOCAL_BASE_DIR || "").trim();
-    if (!dir) {
-        throw new Error("COMPOSE_LOCAL_BASE_DIR is required for local HAI registration");
-    }
-    return dir;
-}
-
-function dirPath(env: NodeJS.ProcessEnv = process.env): string {
-    return path.join(baseDir(env), "synapse", "hai");
-}
-
-function rowPath(
-    agentWallet: `0x${string}`,
-    userAddress: `0x${string}`,
-    deviceId: string,
-    env: NodeJS.ProcessEnv = process.env,
-): string {
-    return path.join(dirPath(env), `${agentWallet}__${userAddress}__${deviceId}.json`);
-}
 
 function hex(input: string): string {
     return createHash("sha256").update(input).digest("hex");
@@ -262,130 +218,20 @@ export function parseLearningPath(pathText: string): {
     };
 }
 
-export async function ensureHai(input: {
+export function registerHai(input: {
     agentWallet: string;
     userAddress: string;
     deviceId: string;
-    sessionKeyPrivateKey?: string | null;
-}, env: NodeJS.ProcessEnv = process.env): Promise<HaiRow> {
+    haiId?: string | null;
+}): { haiId: string } {
     const agentWallet = normWallet(input.agentWallet, "agentWallet");
     const userAddress = normWallet(input.userAddress, "userAddress");
     const deviceId = normDev(input.deviceId);
-    const file = rowPath(agentWallet, userAddress, deviceId, env);
-    await mkdir(dirPath(env), { recursive: true });
-
-    try {
-        const raw = await readFile(file, "utf8");
-        const row = JSON.parse(raw) as HaiRow;
-        const haiId = mkHai({ userAddress, agentWallet, deviceId });
-        const normalized: HaiRow = {
-            ...row,
-            agentWallet,
-            userAddress,
-            deviceId,
-            haiId,
-            synapseSessionPrivateKey: normPk(row.synapseSessionPrivateKey),
-            payerAddress: row.payerAddress ? normWallet(row.payerAddress, "payerAddress") : null,
-            sessionKeyExpiresAt: Number.isFinite(row.sessionKeyExpiresAt) ? Number(row.sessionKeyExpiresAt) : null,
-            nextUpdateNumber: Number.isInteger(row.nextUpdateNumber) && row.nextUpdateNumber > 0 ? row.nextUpdateNumber : 1,
-            nextLearningNumber: Number.isInteger(row.nextLearningNumber) && row.nextLearningNumber > 0 ? row.nextLearningNumber : 1,
-            lastUpdateNumber: Number.isInteger(row.lastUpdateNumber) ? row.lastUpdateNumber : null,
-            lastLearningNumber: Number.isInteger(row.lastLearningNumber) ? row.lastLearningNumber : null,
-            lastPath: typeof row.lastPath === "string" && row.lastPath.trim().length > 0 ? row.lastPath : null,
-            lastStateRootHash: row.lastStateRootHash ? row.lastStateRootHash.toLowerCase() as `0x${string}` : null,
-            lastPieceCid: typeof row.lastPieceCid === "string" && row.lastPieceCid.trim().length > 0 ? row.lastPieceCid : null,
-            lastAnchoredAt: Number.isFinite(row.lastAnchoredAt) ? Number(row.lastAnchoredAt) : null,
-            updatedAt: Date.now(),
-        };
-        await saveHai(normalized, env);
-        return normalized;
-    } catch (error) {
-        const errno = error as NodeJS.ErrnoException;
-        if (errno?.code !== "ENOENT") {
-            throw error;
-        }
+    const haiId = mkHai({ userAddress, agentWallet, deviceId });
+    if (input.haiId && input.haiId.trim().toLowerCase() !== haiId) {
+        throw a409("HAI does not match the requester triplet");
     }
-
-    const row: HaiRow = {
-        version: 1,
-        agentWallet,
-        userAddress,
-        deviceId,
-        haiId: mkHai({ userAddress, agentWallet, deviceId }),
-        synapseSessionPrivateKey: input.sessionKeyPrivateKey
-            ? normPk(input.sessionKeyPrivateKey)
-            : `0x${randomBytes(32).toString("hex")}` as `0x${string}`,
-        payerAddress: null,
-        sessionKeyExpiresAt: null,
-        nextUpdateNumber: 1,
-        nextLearningNumber: 1,
-        lastUpdateNumber: null,
-        lastLearningNumber: null,
-        lastPath: null,
-        lastStateRootHash: null,
-        lastPieceCid: null,
-        lastAnchoredAt: null,
-        updatedAt: Date.now(),
-    };
-    await saveHai(row, env);
-    return row;
-}
-
-async function saveHai(row: HaiRow, env: NodeJS.ProcessEnv = process.env): Promise<HaiRow> {
-    const file = rowPath(row.agentWallet, row.userAddress, row.deviceId, env);
-    await mkdir(dirPath(env), { recursive: true });
-    await writeFile(file, JSON.stringify(row, null, 2), "utf8");
-    return row;
-}
-
-export async function markHaiAnchor(input: {
-    agentWallet: string;
-    userAddress: string;
-    deviceId: string;
-    updateNumber: number;
-    path: string;
-    stateRootHash: `0x${string}`;
-    pieceCid: string;
-    anchoredAt: number;
-    payerAddress?: `0x${string}` | null;
-    sessionKeyExpiresAt?: number | null;
-}, env: NodeJS.ProcessEnv = process.env): Promise<HaiRow> {
-    const row = await ensureHai({
-        agentWallet: input.agentWallet,
-        userAddress: input.userAddress,
-        deviceId: input.deviceId,
-    }, env);
-    row.nextUpdateNumber = input.updateNumber + 1;
-    row.lastUpdateNumber = input.updateNumber;
-    row.lastPath = input.path;
-    row.lastStateRootHash = input.stateRootHash;
-    row.lastPieceCid = input.pieceCid;
-    row.lastAnchoredAt = input.anchoredAt;
-    row.payerAddress = input.payerAddress ?? row.payerAddress ?? null;
-    row.sessionKeyExpiresAt = input.sessionKeyExpiresAt ?? row.sessionKeyExpiresAt ?? null;
-    row.updatedAt = Date.now();
-    return saveHai(row, env);
-}
-
-export async function markHaiLearning(input: {
-    agentWallet: string;
-    userAddress: string;
-    deviceId: string;
-    artifactNumber: number;
-    payerAddress?: `0x${string}` | null;
-    sessionKeyExpiresAt?: number | null;
-}, env: NodeJS.ProcessEnv = process.env): Promise<HaiRow> {
-    const row = await ensureHai({
-        agentWallet: input.agentWallet,
-        userAddress: input.userAddress,
-        deviceId: input.deviceId,
-    }, env);
-    row.nextLearningNumber = input.artifactNumber + 1;
-    row.lastLearningNumber = input.artifactNumber;
-    row.payerAddress = input.payerAddress ?? row.payerAddress ?? null;
-    row.sessionKeyExpiresAt = input.sessionKeyExpiresAt ?? row.sessionKeyExpiresAt ?? null;
-    row.updatedAt = Date.now();
-    return saveHai(row, env);
+    return { haiId };
 }
 
 function expectSameReq(
@@ -556,16 +402,4 @@ export async function verifyLearningPin(input: {
 
 export function signBytes(env: Omit<MeshSignedRequestEnvelope, "signature">): string {
     return reqBytes(env);
-}
-
-export function isHaiReady(env: NodeJS.ProcessEnv = process.env): boolean {
-    return String(env.COMPOSE_LOCAL_BASE_DIR || "").trim().length > 0;
-}
-
-export function normPk(value: string): `0x${string}` {
-    const normalized = value.trim().toLowerCase();
-    if (!pkRe.test(normalized)) {
-        throw new Error("sessionKeyPrivateKey must be a valid hex private key");
-    }
-    return normalized as `0x${string}`;
 }
