@@ -483,6 +483,11 @@ export class GoatRuntime {
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
     await initializeRuntime();
 
+    return peekRuntimeStatus();
+}
+
+export function peekRuntimeStatus(): RuntimeStatus {
+
     const chain = USE_MAINNET ? avalanche : avalancheFuji;
 
     return {
@@ -601,6 +606,3 @@ export async function getPluginIds(): Promise<string[]> {
     await initializeRuntime();
     return Array.from(pluginRegistry.keys());
 }
-
-// Initialize on module load
-initializeRuntime().catch(console.error);
