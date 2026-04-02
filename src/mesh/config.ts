@@ -7,9 +7,7 @@ export const STATE_COLLECTION = "compose";
 export const LEARNINGS_COLLECTION = "learnings";
 
 const EnvSchema = z.object({
-  COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN: z.string().trim().min(1),
   SYNAPSE_NETWORK: z.enum(["calibration", "mainnet"]).default("calibration"),
-  SYNAPSE_PROJECT_NAMESPACE: z.string().trim().min(1).default(STATE_COLLECTION),
   SYNAPSE_RPC_URL: z.string().trim().min(1).optional(),
   FILECOIN_CALIBRATION_RPC: z.string().trim().min(1).optional(),
   FILECOIN_MAINNET_RPC: z.string().trim().min(1).optional(),
@@ -23,7 +21,6 @@ function normalizeInlineCommentedEnvValue(value: string | undefined): string | u
 }
 
 export interface MeshSynapseConfig {
-  runtimeAuthToken: string;
   network: "calibration" | "mainnet";
   source: typeof STATE_COLLECTION;
   rpcUrl: string | null;
@@ -42,9 +39,7 @@ export function resolveSynapseChain(network: MeshSynapseConfig["network"]): Chai
 export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): MeshSynapseConfig {
   const parsed = EnvSchema.parse({
     ...env,
-    COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN: normalizeInlineCommentedEnvValue(env.COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN),
     SYNAPSE_NETWORK: normalizeInlineCommentedEnvValue(env.SYNAPSE_NETWORK),
-    SYNAPSE_PROJECT_NAMESPACE: normalizeInlineCommentedEnvValue(env.SYNAPSE_PROJECT_NAMESPACE),
     SYNAPSE_RPC_URL: normalizeInlineCommentedEnvValue(env.SYNAPSE_RPC_URL),
     FILECOIN_CALIBRATION_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_CALIBRATION_RPC),
     FILECOIN_MAINNET_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_MAINNET_RPC),
@@ -54,15 +49,9 @@ export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): Mes
     || (parsed.SYNAPSE_NETWORK === "calibration" ? parsed.FILECOIN_CALIBRATION_RPC : undefined)
     || null;
 
-  const source = parsed.SYNAPSE_PROJECT_NAMESPACE.trim().toLowerCase();
-  if (source !== STATE_COLLECTION) {
-    throw new Error(`SYNAPSE_PROJECT_NAMESPACE must be "${STATE_COLLECTION}" for Compose mesh storage`);
-  }
-
   return {
-    runtimeAuthToken: parsed.COMPOSE_LOCAL_RUNTIME_AUTH_TOKEN,
     network: parsed.SYNAPSE_NETWORK,
-    source,
+    source: STATE_COLLECTION,
     rpcUrl,
   };
 }

@@ -5,7 +5,6 @@ import {
   loadMeshSynapseConfig,
 } from "./config.js";
 import { createMeshStorageContext } from "./synapse.js";
-import { markHaiAnchor } from "./hai.js";
 import type { MeshSynapseAnchorRequest, MeshSynapseAnchorResponse } from "./types.js";
 
 function assertCompleteUpload(uploadResult: UploadResult): void {
@@ -69,19 +68,6 @@ export async function anchorMeshState(
     : uploadResult.pieceCid.toString();
   const anchoredAt = Date.now();
 
-  await markHaiAnchor({
-    agentWallet: request.agentWallet,
-    userAddress: request.userAddress,
-    deviceId: request.deviceId,
-    updateNumber: request.updateNumber,
-    path: request.path,
-    stateRootHash: request.stateRootHash,
-    pieceCid,
-    anchoredAt,
-    payerAddress: storage.payerAddress,
-    sessionKeyExpiresAt: storage.sessionKeyExpiresAt,
-  });
-
   return {
     haiId: request.haiId,
     updateNumber: request.updateNumber,
@@ -96,8 +82,6 @@ export async function anchorMeshState(
     dataSetId: primaryCopy?.dataSetId?.toString() ?? storage.context.dataSetId?.toString() ?? null,
     pieceId: primaryCopy?.pieceId?.toString() ?? null,
     retrievalUrl: primaryCopy?.retrievalUrl ?? null,
-    payerAddress: storage.payerAddress,
-    sessionKeyExpiresAt: storage.sessionKeyExpiresAt,
     source: config.source,
   };
 }

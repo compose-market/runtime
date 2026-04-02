@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import {
     CodeLanguage,
     Daytona,
@@ -76,12 +78,16 @@ export interface DaytonaConclaveReceipt {
     meteringRootHash: Hex;
 }
 
+export interface StoredConclaveReceipt extends DaytonaConclaveReceipt {
+    conclaveId: string;
+    agentWallet: `0x${string}`;
+    success: boolean;
+}
+
 export interface DaytonaSandboxLike {
     id: string;
     snapshot?: string;
-    buildInfo?: {
-        imageName?: string;
-    };
+    buildInfo?: unknown;
     process: {
         createSession(sessionId: string): Promise<void>;
         deleteSession(sessionId: string): Promise<void>;
@@ -114,6 +120,16 @@ export interface DaytonaLike {
     delete(sandbox: DaytonaSandboxLike, timeoutSeconds?: number): Promise<void>;
 }
 
+function resolveImageRef(buildInfo: unknown): string | null {
+    if (!buildInfo || typeof buildInfo !== "object") {
+        return null;
+    }
+    const imageName = (buildInfo as { imageName?: unknown }).imageName;
+    return typeof imageName === "string" && imageName.trim().length > 0
+        ? imageName
+        : null;
+}
+
 function normalizeLanguage(language: string): CodeLanguage {
     switch (language.trim().toLowerCase()) {
         case "javascript":
@@ -132,6 +148,14 @@ function timeoutMsToSeconds(timeoutMs: number): number {
 
 function gone(error: unknown): boolean {
     return error instanceof DaytonaNotFoundError;
+}
+
+function localBaseDir(env: NodeJS.ProcessEnv = process.env): string {
+    const value = String(env.COMPOSE_LOCAL_BASE_DIR || "").trim();
+    if (!value) {
+        throw new Error("COMPOSE_LOCAL_BASE_DIR is required for mesh conclave receipts");
+    }
+    return value;
 }
 
 export function loadDaytonaConfig(env: NodeJS.ProcessEnv = process.env): DaytonaRuntimeConfig {
@@ -286,7 +310,7 @@ export async function runConclaveSandbox(
         return {
             sandboxId: sandbox.id,
             snapshotId: sandbox.snapshot || spec.snapshotId || config.snapshotId || null,
-            imageRef: sandbox.buildInfo?.imageName ?? null,
+            imageRef: resolveImageRef(sandbox.buildInfo),
             startedAt,
             finishedAt: Date.now(),
             exitCode,
@@ -308,4 +332,31 @@ export async function runConclaveSandbox(
         }
         await destroySandbox(sandbox, client, timeoutSeconds);
     }
+}
+
+export async function persistConclaveReceipt(input: {
+    conclaveId: string;
+    agentWallet: `0x${string}`;
+    receipt: DaytonaConclaveReceipt;
+    env?: NodeJS.ProcessEnv;
+}): Promise<string> {
+    const env = input.env ?? process.env;
+    const dir = path.join(
+        localBaseDir(env),
+        "mesh",
+        "conclaves",
+        "results",
+        input.agentWallet.toLowerCase(),
+    );
+    await mkdir(dir, { recursive: true });
+
+    const filePath = path.join(dir, `${input.conclaveId}.json`);
+    const payload: StoredConclaveReceipt = {
+        conclaveId: input.conclaveId,
+        agentWallet: input.agentWallet.toLowerCase() as `0x${string}`,
+        success: input.receipt.exitCode === 0,
+        ...input.receipt,
+    };
+    await writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
+    return filePath;
 }

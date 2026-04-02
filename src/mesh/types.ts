@@ -32,8 +32,6 @@ export interface MeshSessionRequest {
   chainId: number;
   targetSynapseExpiry: number;
   sessionKeyPrivateKey: `0x${string}`;
-  payerAddress?: `0x${string}` | null;
-  sessionKeyExpiresAt?: number | null;
 }
 
 export interface MeshSynapseAnchorRequest extends MeshSessionRequest {
@@ -59,8 +57,6 @@ export interface MeshSynapseAnchorResponse {
   dataSetId: string | null;
   pieceId: string | null;
   retrievalUrl: string | null;
-  payerAddress: `0x${string}`;
-  sessionKeyExpiresAt: number;
   source: string;
 }
 
@@ -107,8 +103,6 @@ export interface MeshSharedArtifactPinResponse {
   dataSetId: string | null;
   pieceId: string | null;
   retrievalUrl: string | null;
-  payerAddress: `0x${string}`;
-  sessionKeyExpiresAt: number;
   source: string;
   collection: "learnings";
 }
@@ -124,6 +118,48 @@ export interface MeshSharedArtifactReadResponse {
   rootCid: string;
   payloadJson: string;
   collection: "learnings";
+}
+
+export interface MeshConclaveRunRequest {
+  agentWallet: `0x${string}`;
+  userAddress?: `0x${string}`;
+  haiId?: string;
+  threadId?: string;
+  conclaveId: string;
+  command: string;
+  cwd?: string;
+  envVars?: Record<string, string>;
+  labels?: Record<string, string>;
+  snapshotId?: string | null;
+  language?: "typescript";
+  timeoutMs?: number;
+  networkBlockAll?: boolean;
+  networkAllowList?: string;
+}
+
+export interface MeshConclaveRunResponse {
+  conclaveId: string;
+  agentWallet: `0x${string}`;
+  sandboxId: string;
+  snapshotId: string | null;
+  imageRef: string | null;
+  startedAt: number;
+  finishedAt: number;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  meteringRecords: Array<{
+    type: "meter";
+    agentWallet: `0x${string}`;
+    messages?: number;
+    tokensIn?: number;
+    tokensOut?: number;
+    toolCalls?: number;
+    outputHash?: string;
+  }>;
+  artifactRootHash: `0x${string}`;
+  meteringRootHash: `0x${string}`;
+  storedAt: string;
 }
 
 export interface LocalSynapseProvisionResponse {

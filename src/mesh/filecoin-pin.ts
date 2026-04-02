@@ -5,7 +5,7 @@ import {
   createLearningPieceMetadata,
   loadMeshSynapseConfig,
 } from "./config.js";
-import { markHaiLearning, verifyLearningPin } from "./hai.js";
+import { verifyLearningPin } from "./hai.js";
 import { ensureProvisionedSynapseClient } from "./synapse.js";
 import type { MeshSharedArtifactPinRequest, MeshSharedArtifactPinResponse } from "./types.js";
 
@@ -127,15 +127,6 @@ export async function pinMeshArtifact(
     ? uploadResult.pieceCid
     : uploadResult.pieceCid.toString();
 
-  await markHaiLearning({
-    agentWallet: request.agentWallet,
-    userAddress: request.userAddress,
-    deviceId: request.deviceId,
-    artifactNumber: request.artifactNumber,
-    payerAddress: provisioned.payerAddress,
-    sessionKeyExpiresAt: provisioned.sessionKeyExpiresAt,
-  });
-
   return {
     haiId: request.haiId,
     artifactKind,
@@ -151,8 +142,6 @@ export async function pinMeshArtifact(
     dataSetId: primaryCopy?.dataSetId?.toString() ?? context.dataSetId?.toString() ?? null,
     pieceId: primaryCopy?.pieceId?.toString() ?? null,
     retrievalUrl: primaryCopy?.retrievalUrl ?? null,
-    payerAddress: provisioned.payerAddress,
-    sessionKeyExpiresAt: provisioned.sessionKeyExpiresAt,
     source: config.source,
     collection: "learnings",
   };
