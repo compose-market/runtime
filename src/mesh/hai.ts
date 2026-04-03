@@ -153,6 +153,10 @@ function reqBytes(env: Omit<MeshSignedRequestEnvelope, "signature">): string {
         env.targetPieceCid ?? null,
         env.targetDataSetId ?? null,
         env.targetPieceId ?? null,
+        env.artifactKind ?? null,
+        env.fileName ?? null,
+        env.rootCid ?? null,
+        env.payloadSha256 ?? null,
         env.signedAt,
     ]);
 }
