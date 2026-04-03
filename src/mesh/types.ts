@@ -75,6 +75,9 @@ export interface MeshSynapseReadRequest extends MeshSessionRequest {
 }
 
 export interface MeshSharedArtifactPinRequest extends MeshSessionRequest {
+  agentWallet: `0x${string}`;
+  userAddress: `0x${string}`;
+  deviceId: string;
   signedRequestJson: string;
   haiId: string;
   artifactKind: MeshSharedArtifactKind;

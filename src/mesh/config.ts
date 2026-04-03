@@ -8,6 +8,7 @@ export const LEARNINGS_COLLECTION = "learnings";
 
 const EnvSchema = z.object({
   SYNAPSE_NETWORK: z.enum(["calibration", "mainnet"]).default("calibration"),
+  SYNAPSE_PROJECT_NAMESPACE: z.string().trim().min(1),
   SYNAPSE_RPC_URL: z.string().trim().min(1).optional(),
   FILECOIN_CALIBRATION_RPC: z.string().trim().min(1).optional(),
   FILECOIN_MAINNET_RPC: z.string().trim().min(1).optional(),
@@ -22,8 +23,21 @@ function normalizeInlineCommentedEnvValue(value: string | undefined): string | u
 
 export interface MeshSynapseConfig {
   network: "calibration" | "mainnet";
-  source: typeof STATE_COLLECTION;
+  source: string;
   rpcUrl: string | null;
+}
+
+export function loadMeshFilecoinPrivateKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` {
+  const value = normalizeInlineCommentedEnvValue(env.SYNAPSE_WALLET_PRIVATE_KEY);
+  if (!value) {
+    throw new Error("Filecoin Pin private key is required");
+  }
+
+  const normalized = value.startsWith("0x") ? value : `0x${value}`;
+  if (!/^0x[a-fA-F0-9]{64}$/.test(normalized)) {
+    throw new Error("Filecoin Pin private key must be a valid hex private key");
+  }
+  return normalized as `0x${string}`;
 }
 
 export function resolveSynapseChain(network: MeshSynapseConfig["network"]): Chain {
@@ -36,10 +50,15 @@ export function resolveSynapseChain(network: MeshSynapseConfig["network"]): Chai
   }
 }
 
+export function resolveFilecoinNetworkChain(network: MeshSynapseConfig["network"]): Chain {
+  return resolveSynapseChain(network);
+}
+
 export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): MeshSynapseConfig {
   const parsed = EnvSchema.parse({
     ...env,
     SYNAPSE_NETWORK: normalizeInlineCommentedEnvValue(env.SYNAPSE_NETWORK),
+    SYNAPSE_PROJECT_NAMESPACE: normalizeInlineCommentedEnvValue(env.SYNAPSE_PROJECT_NAMESPACE),
     SYNAPSE_RPC_URL: normalizeInlineCommentedEnvValue(env.SYNAPSE_RPC_URL),
     FILECOIN_CALIBRATION_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_CALIBRATION_RPC),
     FILECOIN_MAINNET_RPC: normalizeInlineCommentedEnvValue(env.FILECOIN_MAINNET_RPC),
@@ -51,9 +70,13 @@ export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): Mes
 
   return {
     network: parsed.SYNAPSE_NETWORK,
-    source: STATE_COLLECTION,
+    source: parsed.SYNAPSE_PROJECT_NAMESPACE,
     rpcUrl,
   };
+}
+
+export function loadMeshFilecoinNetworkConfig(env: NodeJS.ProcessEnv = process.env): MeshSynapseConfig {
+  return loadMeshSynapseConfig(env);
 }
 
 function environmentLabel(env: NodeJS.ProcessEnv): string {
