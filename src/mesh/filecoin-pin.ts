@@ -78,21 +78,24 @@ function assertCompleteUpload(uploadResult: {
   failedAttempts: Array<{
     role: string;
     providerId: bigint;
-    error: string;
+      error: string;
   }>;
 }): void {
   if (uploadResult.copies.length === 0) {
     throw new Error("Filecoin Pin upload returned no persisted copies");
   }
+}
 
-  if (uploadResult.failedAttempts.length === 0) {
-    return;
-  }
-
-  const failureSummary = uploadResult.failedAttempts
+function summarizeFailedAttempts(uploadResult: {
+  failedAttempts: Array<{
+    role: string;
+    providerId: bigint;
+    error: string;
+  }>;
+}): string {
+  return uploadResult.failedAttempts
     .map((attempt) => `${attempt.role}:${attempt.providerId.toString()}:${attempt.error}`)
     .join("; ");
-  throw new Error(`Filecoin Pin upload did not complete all requested copies: ${failureSummary}`);
 }
 
 function learningPayloadFileName(request: MeshSharedArtifactPinRequest): string {
@@ -271,6 +274,13 @@ export async function pinMeshArtifact(
       providerIds,
     });
     assertCompleteUpload(uploadResult);
+    if (uploadResult.failedAttempts.length > 0) {
+      const failureSummary = summarizeFailedAttempts(uploadResult);
+      const redundancySummary = uploadResult.copies.length < providerIds.length
+        ? `stored ${uploadResult.copies.length}/${providerIds.length} copies with reduced redundancy`
+        : `completed with recovered provider retries`;
+      console.warn(`Filecoin Pin upload ${redundancySummary} for ${request.path}: ${failureSummary}`);
+    }
 
     const primaryCopy = uploadResult.copies[0] ?? null;
 
