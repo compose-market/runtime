@@ -14,7 +14,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@daytonaio/sdk": "^0.160.0",
+    "@daytonaio/sdk": "^0.161.0",
     "filecoin-pin": "^0.20.0",
     "@filoz/synapse-core": "^0.4.0",
     "@filoz/synapse-sdk": "^0.40.3",
@@ -42,10 +42,10 @@
     "@goat-sdk/wallet-evm": "^0.3.0",
     "@goat-sdk/wallet-viem": "^0.3.0",
     "@ipld/car": "^5.4.3",
-    "@langchain/core": "^1.1.38",
-    "@langchain/langgraph": "^1.2.6",
+    "@langchain/core": "^1.1.39",
+    "@langchain/langgraph": "^1.2.7",
     "@langchain/langgraph-checkpoint": "^1.0.1",
-    "@langchain/openai": "^1.4.1",
+    "@langchain/openai": "^1.4.2",
     "@libp2p/crypto": "^5.1.14",
     "@libp2p/peer-id": "^6.0.5",
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -65,7 +65,7 @@
     "pdfjs-dist": "^5.6.205",
     "redis": "^5.11.0",
     "uuid": "^13.0.0",
-    "viem": "^2.47.6",
+    "viem": "^2.47.10",
     "zod": "^4.3.6",
     "zod-to-json-schema": "^3.25.2"
   },

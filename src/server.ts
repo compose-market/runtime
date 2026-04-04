@@ -182,7 +182,7 @@ const hex32Pattern = /^0x[a-f0-9]{64}$/i;
 const privateKeyPattern = /^0x[a-f0-9]{64}$/i;
 const haiIdPattern = /^[a-z0-9]{6}$/i;
 const statePathPattern = /^compose-[a-z0-9]{6}-\d+$/i;
-const learningPathPattern = /^learning-[a-z0-9]{6}-(learning|report|resource|ticket)-#\d+$/i;
+const learningPathPattern = /^compose-[a-z0-9]{6}-[a-z0-9]+(?:-[a-z0-9]+)*-#\d+$/i;
 
 const LocalMeshToolRequestSchema = z.object({
   agentWallet: walletAddressSchema,
@@ -225,18 +225,16 @@ const FilecoinPinRequestSchema = z.object({
   agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
   deviceId: z.string().trim().min(8).max(128),
   chainId: z.number().int().positive(),
-  targetSynapseExpiry: z.number().int().positive(),
+  targetSessionExpiry: z.number().int().positive(),
   signedRequestJson: z.string().trim().min(2),
   haiId: z.string().regex(haiIdPattern).transform((value) => value.toLowerCase()),
   artifactKind: z.enum(["learning", "report", "resource", "ticket"]),
   artifactNumber: z.number().int().positive(),
   path: z.string().regex(learningPathPattern),
   payloadJson: z.string().trim().min(2),
-  sessionKeyPrivateKey: z.string().regex(privateKeyPattern).transform((value) => value.toLowerCase() as `0x${string}`),
-  publisherAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`).nullable().optional(),
-  accessPriceUsdc: z.string().trim().min(1).nullable().optional(),
-  title: z.string().trim().min(1).nullable().optional(),
-  summary: z.string().trim().min(1).nullable().optional(),
+  filecoinPinSessionKeyPrivateKey: z.string()
+    .regex(privateKeyPattern)
+    .transform((value) => value.toLowerCase() as `0x${string}`),
   copies: z.number().int().positive().optional(),
 }).strict();
 
