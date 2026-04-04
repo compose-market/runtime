@@ -34,6 +34,17 @@ export interface MeshSessionRequest {
   sessionKeyPrivateKey: `0x${string}`;
 }
 
+export interface MeshFilecoinPinSessionRequest {
+  apiUrl: string;
+  composeKeyToken: string;
+  userAddress: `0x${string}`;
+  agentWallet: `0x${string}`;
+  deviceId: string;
+  chainId: number;
+  targetSessionExpiry: number;
+  filecoinPinSessionKeyPrivateKey: `0x${string}`;
+}
+
 export interface MeshSynapseAnchorRequest extends MeshSessionRequest {
   haiId: string;
   updateNumber: number;
@@ -74,20 +85,13 @@ export interface MeshSynapseReadRequest extends MeshSessionRequest {
   signedRequestJson: string;
 }
 
-export interface MeshSharedArtifactPinRequest extends MeshSessionRequest {
-  agentWallet: `0x${string}`;
-  userAddress: `0x${string}`;
-  deviceId: string;
+export interface MeshSharedArtifactPinRequest extends MeshFilecoinPinSessionRequest {
   signedRequestJson: string;
   haiId: string;
   artifactKind: MeshSharedArtifactKind;
   artifactNumber: number;
   path: string;
   payloadJson: string;
-  publisherAddress?: `0x${string}` | null;
-  accessPriceUsdc?: string | null;
-  title?: string | null;
-  summary?: string | null;
   copies?: number;
 }
 
@@ -175,4 +179,18 @@ export interface LocalSynapseProvisionResponse {
   depositExecuted: boolean;
   network: "calibration" | "mainnet";
   source: string;
+}
+
+export interface LocalFilecoinPinProvisionResponse {
+  success: true;
+  payerAddress: `0x${string}`;
+  sessionKeyAddress: `0x${string}`;
+  sessionKeyExpiresAt: number;
+  availableFunds: string;
+  depositAmount: string;
+  depositExecuted: boolean;
+  network: "calibration" | "mainnet";
+  source: string;
+  fileSizeBytes: number;
+  providerIds: string[];
 }
