@@ -19,7 +19,7 @@ export const hex32Re = /^0x[a-f0-9]{64}$/i;
 export const sigRe = /^[a-f0-9]+$/i;
 export const haiRe = /^[a-z0-9]{6}$/i;
 export const stateRe = /^compose-([a-z0-9]{6})-(\d+)$/i;
-export const learningRe = /^learning-([a-z0-9]{6})-(learning|report|resource|ticket)-#(\d+)$/i;
+export const learningRe = /^compose-([a-z0-9]{6})-([a-z0-9]+(?:-[a-z0-9]+)*)-#(\d+)$/i;
 
 export class MeshA409Error extends Error {
     readonly code = "a409" as const;
@@ -208,7 +208,7 @@ export function parseStatePath(pathText: string): { hai: string; n: number } {
 
 export function parseLearningPath(pathText: string): {
     hai: string;
-    kind: "learning" | "report" | "resource" | "ticket";
+    slug: string;
     n: number;
 } {
     const hit = learningRe.exec(pathText.trim());
@@ -217,7 +217,7 @@ export function parseLearningPath(pathText: string): {
     }
     return {
         hai: hit[1].toLowerCase(),
-        kind: hit[2].toLowerCase() as "learning" | "report" | "resource" | "ticket",
+        slug: hit[2].toLowerCase(),
         n: Number(hit[3]),
     };
 }
@@ -386,7 +386,6 @@ export async function verifyLearningPin(input: {
 }): Promise<MeshSignedRequestEnvelope> {
     const parsedPath = parseLearningPath(input.path);
     if (parsedPath.hai !== input.haiId.toLowerCase()) throw a409("Mesh learning path haiId does not match the request");
-    if (parsedPath.kind !== input.artifactKind) throw a409("Mesh learning path kind does not match the request");
     if (parsedPath.n !== input.artifactNumber) throw a409("Mesh learning path number does not match the request");
 
     return verifyReq({

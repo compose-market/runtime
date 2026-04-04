@@ -166,11 +166,18 @@ async function readPublicationSignals(
         const resultPath = typeof parsed.path === "string" ? parsed.path.trim() : "";
         const collection = typeof parsed.collection === "string" ? parsed.collection.trim() : "";
 
-        if (fileKind === "manifest.publish" || resultPath.startsWith("compose-")) {
+        if (
+            fileKind === "manifest.publish"
+            || (resultPath.startsWith("compose-") && !resultPath.includes("-#"))
+        ) {
             lastManifestAt = maxTimestamp(lastManifestAt, anchoredAt ?? fallbackTimestamp);
         }
 
-        if (fileKind === "learning.pin" || collection === "learnings" || resultPath.startsWith("learning-")) {
+        if (
+            fileKind === "learning.pin"
+            || collection === "learnings"
+            || (resultPath.startsWith("compose-") && resultPath.includes("-#"))
+        ) {
             successfulLearningPublications += 1;
             lastLearningAt = maxTimestamp(lastLearningAt, fallbackTimestamp);
         }
