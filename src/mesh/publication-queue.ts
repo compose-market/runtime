@@ -140,16 +140,16 @@ export async function queueLocalMeshPublication(input: {
     }, options);
   }
   
-  export async function queueLocalMeshLearning(input: {
-    agentWallet: `0x${string}`;
-    title: string;
-    summary: string;
-    content: string;
-    accessPriceUsdc?: string;
-  }, options?: {
-    env?: NodeJS.ProcessEnv;
-    timeoutMs?: number;
-  }): Promise<MeshPublicationQueueResult> {
+export async function queueLocalMeshLearning(input: {
+  agentWallet: `0x${string}`;
+  title: string;
+  summary: string;
+  content: string;
+  accessPriceUsdc: string;
+}, options?: {
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+}): Promise<MeshPublicationQueueResult> {
     return queueLocalMeshRequest({
       requestId: `mesh-learning-${randomUUID()}`,
       kind: "learning.pin",
@@ -158,6 +158,6 @@ export async function queueLocalMeshPublication(input: {
       title: input.title.trim(),
       summary: input.summary.trim(),
       content: input.content.trim(),
-      ...(input.accessPriceUsdc?.trim() ? { accessPriceUsdc: input.accessPriceUsdc.trim() } : {}),
+      accessPriceUsdc: input.accessPriceUsdc.trim(),
   }, options);
 }

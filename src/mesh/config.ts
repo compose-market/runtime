@@ -1,10 +1,12 @@
-import { calibration, mainnet, type Chain } from "@filoz/synapse-sdk";
+import { calibration, mainnet, METADATA_KEYS, type Chain } from "@filoz/synapse-sdk";
 import { z } from "zod";
-import type { MeshSharedArtifactKind } from "./types.js";
 
 
 export const STATE_COLLECTION = "compose";
 export const LEARNINGS_COLLECTION = "learnings";
+const COMPOSE_STORAGE_SOURCE = "compose";
+const LEARNING_DATASET_SCHEMA = "compose.mesh.learning.v1";
+const METADATA_VALUE_LIMIT = 128;
 
 const EnvSchema = z.object({
   SYNAPSE_NETWORK: z.enum(["calibration", "mainnet"]).default("calibration"),
@@ -25,19 +27,6 @@ export interface MeshSynapseConfig {
   network: "calibration" | "mainnet";
   source: string;
   rpcUrl: string | null;
-}
-
-export function loadMeshFilecoinPrivateKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` {
-  const value = normalizeInlineCommentedEnvValue(env.SYNAPSE_WALLET_PRIVATE_KEY);
-  if (!value) {
-    throw new Error("Filecoin Pin private key is required");
-  }
-
-  const normalized = value.startsWith("0x") ? value : `0x${value}`;
-  if (!/^0x[a-fA-F0-9]{64}$/.test(normalized)) {
-    throw new Error("Filecoin Pin private key must be a valid hex private key");
-  }
-  return normalized as `0x${string}`;
 }
 
 export function resolveSynapseChain(network: MeshSynapseConfig["network"]): Chain {
@@ -70,7 +59,7 @@ export function loadMeshSynapseConfig(env: NodeJS.ProcessEnv = process.env): Mes
 
   return {
     network: parsed.SYNAPSE_NETWORK,
-    source: parsed.SYNAPSE_PROJECT_NAMESPACE,
+    source: COMPOSE_STORAGE_SOURCE,
     rpcUrl,
   };
 }
@@ -125,47 +114,29 @@ export function createStatePieceMetadata(input: {
 
 export function createLearningDatasetMetadata(
   config: MeshSynapseConfig,
-  env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   return {
-    Application: "compose",
     Collection: LEARNINGS_COLLECTION,
-    Environment: environmentLabel(env),
-    Network: config.network,
-    Domain: "compose.market",
-    Schema: "compose.mesh.learnings",
-    Scope: "mesh",
-    withIPFSIndexing: "",
+    Schema: LEARNING_DATASET_SCHEMA,
+    [METADATA_KEYS.SOURCE]: COMPOSE_STORAGE_SOURCE,
+    [METADATA_KEYS.WITH_IPFS_INDEXING]: "",
   };
 }
 
-export function createLearningLatestAlias(haiId: string, kind: MeshSharedArtifactKind): string {
-  return `learning-${haiId.toLowerCase()}-${kind}:latest`;
+export function createLearningLatestAlias(haiId: string): string {
+  return `compose-${haiId.toLowerCase()}:latest`;
 }
 
 export function createLearningPieceMetadata(input: {
-  haiId: string;
-  path: string;
-  artifactKind: MeshSharedArtifactKind;
+  title: string;
+  summary: string;
   agentWallet: `0x${string}`;
   userAddress: `0x${string}`;
-  deviceId: string;
-  publisherAddress: `0x${string}`;
-  accessPriceUsdc?: string | null;
-  title?: string | null;
-  summary?: string | null;
 }): Record<string, string> {
   return {
-    name: input.path,
-    HAI: input.haiId.toLowerCase(),
-    ArtifactKind: input.artifactKind,
+    name: input.title.trim().slice(0, METADATA_VALUE_LIMIT),
     Agent: input.agentWallet.toLowerCase(),
     User: input.userAddress.toLowerCase(),
-    Device: input.deviceId,
-    Publisher: input.publisherAddress.toLowerCase(),
-    Latest: createLearningLatestAlias(input.haiId, input.artifactKind),
-    ...(input.accessPriceUsdc?.trim() ? { AccessPriceUsdc: input.accessPriceUsdc.trim() } : {}),
-    ...(input.title?.trim() ? { Title: input.title.trim() } : {}),
-    ...(input.summary?.trim() ? { Summary: input.summary.trim() } : {}),
+    Summary: input.summary.trim().slice(0, METADATA_VALUE_LIMIT),
   };
 }
