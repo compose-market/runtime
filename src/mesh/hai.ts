@@ -21,21 +21,21 @@ export const haiRe = /^[a-z0-9]{6}$/i;
 export const stateRe = /^compose-([a-z0-9]{6})-(\d+)$/i;
 export const learningRe = /^compose-([a-z0-9]{6})-([a-z0-9]+(?:-[a-z0-9]+)*)-#(\d+)$/i;
 
-export class MeshA409Error extends Error {
-    readonly code = "a409" as const;
+export class MeshA509Error extends Error {
+    readonly code = "a509" as const;
 
     constructor(message = "inconsistent agent identity") {
         super(message);
-        this.name = "MeshA409Error";
+        this.name = "MeshA509Error";
     }
 }
 
-export function a409(message = "inconsistent agent identity"): MeshA409Error {
-    return new MeshA409Error(message);
+export function a509(message = "inconsistent agent identity"): MeshA509Error {
+    return new MeshA509Error(message);
 }
 
-export function isA409(error: unknown): error is MeshA409Error {
-    return error instanceof MeshA409Error;
+export function isA509(error: unknown): error is MeshA509Error {
+    return error instanceof MeshA509Error;
 }
 
 const reqSchema = z.object({
@@ -130,11 +130,11 @@ function within(ts: number, label: string): void {
 async function verifySig(peerIdText: string, payload: string, sig: string, label: string): Promise<void> {
     const peer = peerIdFromString(peerIdText.trim());
     if (!peer.publicKey) {
-        throw a409(`${label} peerId must contain inline public key material`);
+        throw a509(`${label} peerId must contain inline public key material`);
     }
     const ok = await peer.publicKey.verify(enc.encode(payload), hexBytes(sig));
     if (!ok) {
-        throw a409(`${label} signature verification failed`);
+        throw a509(`${label} signature verification failed`);
     }
 }
 
@@ -233,7 +233,7 @@ export function registerHai(input: {
     const deviceId = normDev(input.deviceId);
     const haiId = mkHai({ userAddress, agentWallet, deviceId });
     if (input.haiId && input.haiId.trim().toLowerCase() !== haiId) {
-        throw a409("HAI does not match the requester triplet");
+        throw a509("HAI does not match the requester triplet");
     }
     return { haiId };
 }
@@ -253,16 +253,16 @@ function expectSameReq(
         payloadSha256?: `0x${string}` | null;
     },
 ): void {
-    if (env.collection !== want.collection) throw a409("Signed HAI collection does not match the request");
-    if (env.requesterAgentWallet !== want.agentWallet) throw a409("Signed HAI agentWallet does not match the request");
-    if (env.requesterUserAddress !== want.userAddress) throw a409("Signed HAI userAddress does not match the request");
-    if (env.requesterDeviceId !== want.deviceId) throw a409("Signed HAI deviceId does not match the request");
-    if (env.targetPath !== want.path) throw a409("Signed HAI path does not match the request");
-    if ((env.targetPieceCid ?? null) !== (want.pieceCid ?? null)) throw a409("Signed HAI pieceCid does not match the request");
-    if ((env.targetDataSetId ?? null) !== (want.dataSetId ?? null)) throw a409("Signed HAI dataSetId does not match the request");
-    if ((env.targetPieceId ?? null) !== (want.pieceId ?? null)) throw a409("Signed HAI pieceId does not match the request");
-    if ((env.artifactKind ?? null) !== (want.artifactKind ?? null)) throw a409("Signed HAI artifactKind does not match the request");
-    if ((env.payloadSha256 ?? null) !== (want.payloadSha256 ?? null)) throw a409("Signed HAI payloadSha256 does not match the request");
+    if (env.collection !== want.collection) throw a509("Signed HAI collection does not match the request");
+    if (env.requesterAgentWallet !== want.agentWallet) throw a509("Signed HAI agentWallet does not match the request");
+    if (env.requesterUserAddress !== want.userAddress) throw a509("Signed HAI userAddress does not match the request");
+    if (env.requesterDeviceId !== want.deviceId) throw a509("Signed HAI deviceId does not match the request");
+    if (env.targetPath !== want.path) throw a509("Signed HAI path does not match the request");
+    if ((env.targetPieceCid ?? null) !== (want.pieceCid ?? null)) throw a509("Signed HAI pieceCid does not match the request");
+    if ((env.targetDataSetId ?? null) !== (want.dataSetId ?? null)) throw a509("Signed HAI dataSetId does not match the request");
+    if ((env.targetPieceId ?? null) !== (want.pieceId ?? null)) throw a509("Signed HAI pieceId does not match the request");
+    if ((env.artifactKind ?? null) !== (want.artifactKind ?? null)) throw a509("Signed HAI artifactKind does not match the request");
+    if ((env.payloadSha256 ?? null) !== (want.payloadSha256 ?? null)) throw a509("Signed HAI payloadSha256 does not match the request");
 }
 
 async function verifyReq(input: {
@@ -298,7 +298,7 @@ async function verifyReq(input: {
         agentWallet: env.requesterAgentWallet,
         deviceId: env.requesterDeviceId,
     })) {
-        throw a409("Signed HAI does not match the requester triplet");
+        throw a509("Signed HAI does not match the requester triplet");
     }
 
     expectSameReq(env, input.want);
@@ -310,8 +310,8 @@ async function verifyReq(input: {
 
 export async function verifyAnchor(req: MeshSynapseAnchorRequest): Promise<void> {
     const parsedPath = parseStatePath(req.path);
-    if (parsedPath.hai !== req.haiId.toLowerCase()) throw a409("Mesh state path haiId does not match the request");
-    if (parsedPath.n !== req.updateNumber) throw a409("Mesh state path number does not match the request");
+    if (parsedPath.hai !== req.haiId.toLowerCase()) throw a509("Mesh state path haiId does not match the request");
+    if (parsedPath.n !== req.updateNumber) throw a509("Mesh state path number does not match the request");
 
     let raw: unknown;
     try {
@@ -327,19 +327,19 @@ export async function verifyAnchor(req: MeshSynapseAnchorRequest): Promise<void>
         agentWallet: env.agentWallet,
         deviceId: env.deviceId,
     })) {
-        throw a409("Mesh state HAI does not match the triplet");
+        throw a509("Mesh state HAI does not match the triplet");
     }
-    if (env.haiId !== req.haiId.toLowerCase()) throw a409("Mesh state HAI does not match the request");
-    if (env.updateNumber !== req.updateNumber) throw a409("Mesh state update number does not match the request");
-    if (env.path !== req.path) throw a409("Mesh state path does not match the request");
-    if (env.agentWallet !== req.agentWallet.toLowerCase()) throw a409("Mesh state agentWallet does not match the request");
-    if (env.userAddress !== req.userAddress.toLowerCase()) throw a409("Mesh state userAddress does not match the request");
-    if (env.deviceId !== req.deviceId) throw a409("Mesh state deviceId does not match the request");
-    if (env.chainId !== req.chainId) throw a409("Mesh state chainId does not match the request");
+    if (env.haiId !== req.haiId.toLowerCase()) throw a509("Mesh state HAI does not match the request");
+    if (env.updateNumber !== req.updateNumber) throw a509("Mesh state update number does not match the request");
+    if (env.path !== req.path) throw a509("Mesh state path does not match the request");
+    if (env.agentWallet !== req.agentWallet.toLowerCase()) throw a509("Mesh state agentWallet does not match the request");
+    if (env.userAddress !== req.userAddress.toLowerCase()) throw a509("Mesh state userAddress does not match the request");
+    if (env.deviceId !== req.deviceId) throw a509("Mesh state deviceId does not match the request");
+    if (env.chainId !== req.chainId) throw a509("Mesh state chainId does not match the request");
 
     const root = sha256Hex(req.canonicalSnapshotJson);
-    if (root !== req.stateRootHash.toLowerCase()) throw a409("Mesh state root hash does not match canonicalSnapshotJson");
-    if (env.stateRootHash !== root) throw a409("Mesh state envelope root hash does not match canonicalSnapshotJson");
+    if (root !== req.stateRootHash.toLowerCase()) throw a509("Mesh state root hash does not match canonicalSnapshotJson");
+    if (env.stateRootHash !== root) throw a509("Mesh state envelope root hash does not match canonicalSnapshotJson");
 
     let parsedSnapshot: unknown;
     try {
@@ -348,7 +348,7 @@ export async function verifyAnchor(req: MeshSynapseAnchorRequest): Promise<void>
         throw new Error("canonicalSnapshotJson must be valid JSON");
     }
     if (JSON.stringify(stable(parsedSnapshot)) !== JSON.stringify(stable(env.snapshot))) {
-        throw a409("Mesh state snapshot does not match canonicalSnapshotJson");
+        throw a509("Mesh state snapshot does not match canonicalSnapshotJson");
     }
 
     await verifySig(env.peerId, req.canonicalSnapshotJson, env.signature, "Mesh state");
@@ -356,7 +356,7 @@ export async function verifyAnchor(req: MeshSynapseAnchorRequest): Promise<void>
 
 export async function verifyStateRead(req: MeshSynapseReadRequest): Promise<MeshSignedRequestEnvelope> {
     const parsedPath = parseStatePath(req.path);
-    if (parsedPath.hai !== req.haiId.toLowerCase()) throw a409("Mesh state read path haiId does not match the request");
+    if (parsedPath.hai !== req.haiId.toLowerCase()) throw a509("Mesh state read path haiId does not match the request");
     return verifyReq({
         raw: req.signedRequestJson,
         action: "compose.state.read",
@@ -385,8 +385,8 @@ export async function verifyLearningPin(input: {
     payloadJson: string;
 }): Promise<MeshSignedRequestEnvelope> {
     const parsedPath = parseLearningPath(input.path);
-    if (parsedPath.hai !== input.haiId.toLowerCase()) throw a409("Mesh learning path haiId does not match the request");
-    if (parsedPath.n !== input.artifactNumber) throw a409("Mesh learning path number does not match the request");
+    if (parsedPath.hai !== input.haiId.toLowerCase()) throw a509("Mesh learning path haiId does not match the request");
+    if (parsedPath.n !== input.artifactNumber) throw a509("Mesh learning path number does not match the request");
 
     return verifyReq({
         raw: input.signedRequestJson,
