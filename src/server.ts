@@ -39,7 +39,7 @@ import {
 import { runWithAgentExecutionContext } from "./framework/agent/context.js";
 import { createMemoryTools } from "./framework/agent/tools.js";
 import { warmMemoryCache } from "./framework/memory/cache.js";
-import { isA409, registerHai, verifyAnchor } from "./mesh/hai.js";
+import { isA509, registerHai, verifyAnchor } from "./mesh/hai.js";
 import { anchorMeshState } from "./mesh/anchor.js";
 import { pinMeshArtifact } from "./mesh/filecoin-pin.js";
 import { readMeshReputationSummary } from "./mesh/reputation.js";
@@ -357,7 +357,7 @@ app.post("/mesh/hai/register", asyncHandler(async (req: Request, res: Response) 
     const registered = registerHai(parsed.data);
     res.status(200).json(registered);
   } catch (error) {
-    if (isA409(error)) {
+    if (isA509(error)) {
       res.status(409).json({
         error: error.message,
         code: error.code,
@@ -388,7 +388,7 @@ app.post("/mesh/synapse/anchor", asyncHandler(async (req: Request, res: Response
     const result = await anchorMeshState(input);
     res.status(200).json(result);
   } catch (error) {
-    if (isA409(error)) {
+    if (isA509(error)) {
       res.status(409).json({
         error: error.message,
         code: error.code,
@@ -417,7 +417,7 @@ app.post("/mesh/filecoin/pin", asyncHandler(async (req: Request, res: Response) 
     const result = await pinMeshArtifact(parsed.data as MeshSharedArtifactPinRequest);
     res.status(200).json(result);
   } catch (error) {
-    if (isA409(error)) {
+    if (isA509(error)) {
       res.status(409).json({
         error: error.message,
         code: error.code,
