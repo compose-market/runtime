@@ -15,21 +15,19 @@ import {
     resolveAgent,
     resolveAgentInstance,
     markAgentExecuted,
-} from "./framework/runtime.js";
+} from "./manowar/runtime.js";
 import {
     executeResponses,
-    type ExecutionResult,
-} from "./framework/manowar.js";
-import { createComposeRunId, executeAgentRun, getAgentRunState, startAgentRun } from "./temporal/service.js";
+    streamAgent,
+    abortRun,
+    buildRunKey,
+} from "./manowar/framework.js";
+import { createComposeRunId, executeAgentRun, getAgentRunState } from "./temporal/service.js";
 import { extractRuntimeSessionHeaders } from "./auth.js";
 
 const router = Router();
 const JSON_KEEPALIVE_INTERVAL_MS = 5000; // 5 seconds - keeps proxies alive, prevents 504s
 const AGENT_WARMUP_TIMEOUT_MS = 12000;
-const AGENT_STREAM_POLL_INTERVAL_MS = 1000;
-const AGENT_STREAM_STATE_MISS_LIMIT = 8;
-const AGENT_STREAM_POLL_TIMEOUT_MS = 5 * 60 * 1000;
-
 // =============================================================================
 // Middleware
 // =============================================================================
@@ -59,6 +57,34 @@ function safeStringify(value: unknown): string {
     } catch {
         return JSON.stringify({ error: "Failed to serialize response" });
     }
+}
+
+function createTimingLogger(label: string, metadata: Record<string, unknown>, startedAt = Date.now()) {
+    const marks: Record<string, number> = {};
+    return (name: string, at = Date.now()) => {
+        if (marks[name] !== undefined) {
+            return;
+        }
+        marks[name] = at - startedAt;
+        console.log(`[${label}]`, JSON.stringify({ ...metadata, mark: name, elapsedMs: marks[name], marks }));
+    };
+}
+
+function eventRecord(event: unknown): Record<string, unknown> {
+    return event && typeof event === "object" ? event as Record<string, unknown> : {};
+}
+
+function hasTextDelta(event: unknown): boolean {
+    const choices = eventRecord(event).choices;
+    if (!Array.isArray(choices)) {
+        return false;
+    }
+    const first = choices[0];
+    if (!first || typeof first !== "object") {
+        return false;
+    }
+    const delta = (first as { delta?: unknown }).delta;
+    return Boolean(delta && typeof delta === "object" && typeof (delta as { content?: unknown }).content === "string");
 }
 
 async function warmAgentRuntimeOrTimeout(walletAddress: string): Promise<boolean> {
@@ -248,6 +274,7 @@ router.post(
 router.post(
     "/:walletAddress/stream",
     asyncHandler(async (req: Request, res: Response) => {
+        const requestReceivedAt = Date.now();
         const identifier = getParam(req.params.walletAddress);
 
         // Validate agent
@@ -279,6 +306,12 @@ router.post(
         } = parseResult.data;
         const composeRunId = requestedRunId || createComposeRunId();
         res.setHeader("x-compose-run-id", composeRunId);
+        const markTiming = createTimingLogger("agent-stream-timing", {
+            runId: composeRunId,
+            agentWallet: agent.walletAddress,
+            identifier,
+        }, requestReceivedAt);
+        markTiming("request_received", requestReceivedAt);
 
         const runtimeSession = extractRuntimeSessionHeaders(req);
         if (bodyUserId && runtimeSession.sessionUserAddress && bodyUserId.toLowerCase() !== runtimeSession.sessionUserAddress.toLowerCase()) {
@@ -319,92 +352,58 @@ router.post(
         res.setHeader("Keep-Alive", "timeout=120"); // Tell proxies to wait 120s
         res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering for real-time streaming
         res.setHeader("X-Content-Type-Options", "nosniff"); // Prevent MIME sniffing
+        if (typeof res.flushHeaders === "function") {
+            res.flushHeaders();
+        }
+        markTiming("sse_headers_flushed");
 
         const heartbeat = setInterval(() => {
             if (!res.writableEnded) {
                 res.write(": ping\n\n");
             }
         }, JSON_KEEPALIVE_INTERVAL_MS);
-        res.on("close", () => clearInterval(heartbeat));
-
-        const effectiveThreadId = threadId || `thread-${agent.walletAddress}`;
+        res.on("close", () => {
+            clearInterval(heartbeat);
+            markTiming("close");
+        });
 
         console.log(`[agent] Streaming ${agent.name} (${identifier}) run=${composeRunId}: "${message.slice(0, 50)}..." [User: ${userAddress || 'anon'}]`);
 
         try {
             async function writeEvent(event: unknown): Promise<void> {
+                markTiming("first_runtime_event");
+                const type = eventRecord(event).type;
+                if (hasTextDelta(event)) {
+                    markTiming("first_text_delta");
+                }
+                if (type === "tool_start") {
+                    markTiming("first_tool_start");
+                }
+                if (type === "done") {
+                    markTiming("done");
+                }
                 res.write(`data: ${safeStringify(event)}\n\n`);
             }
 
-            await writeEvent({
-                type: "thinking_start",
-                message: "Thinking...",
-            });
-
-            const handle = await startAgentRun({
+            const stream = streamAgent(agent.walletAddress, message, {
+                threadId,
+                userAddress,
+                workflowWallet,
+                attachment,
                 composeRunId,
-                agentWallet: agent.walletAddress,
-                message,
-                options: {
-                    threadId,
-                    userAddress,
-                    workflowWallet,
-                    attachment,
-                    sessionContext: {
-                        sessionActive,
-                        sessionBudgetRemaining,
-                        sessionGrants,
-                        cloudPermissions,
-                        backpackAccounts,
-                    },
+                sessionContext: {
+                    sessionActive,
+                    sessionBudgetRemaining,
+                    sessionGrants,
+                    cloudPermissions,
+                    backpackAccounts,
                 },
             });
 
-            let missingStateCount = 0;
-            const pollStartedAt = Date.now();
-            while (true) {
-                const state = await getAgentRunState(agent.walletAddress, effectiveThreadId, composeRunId);
-                if (!state) {
-                    missingStateCount += 1;
-                    const pollTimedOut = Date.now() - pollStartedAt >= AGENT_STREAM_POLL_TIMEOUT_MS;
-                    if (missingStateCount >= AGENT_STREAM_STATE_MISS_LIMIT || pollTimedOut) {
-                        throw new Error(pollTimedOut ? "Agent run state polling timed out" : "Agent run state unavailable");
-                    }
-                    await new Promise((resolve) => setTimeout(resolve, AGENT_STREAM_POLL_INTERVAL_MS));
-                    continue;
-                }
-
-                missingStateCount = 0;
-                if (state.status === "success" || state.status === "error" || state.status === "cancelled") {
-                    break;
-                }
-                if (Date.now() - pollStartedAt >= AGENT_STREAM_POLL_TIMEOUT_MS) {
-                    throw new Error("Agent run state polling timed out");
-                }
-                await new Promise((resolve) => setTimeout(resolve, AGENT_STREAM_POLL_INTERVAL_MS));
+            for await (const event of stream) {
+                await writeEvent(event);
             }
-
-            const result = await handle.result() as ExecutionResult;
-            await writeEvent({ type: "thinking_end" });
-
-            if (!result.success) {
-                throw new Error(result.error || "Agent execution failed");
-            }
-
-            if (typeof result.output === "string" && result.output.length > 0) {
-                await writeEvent({
-                    choices: [{ delta: { content: result.output } }],
-                });
-            }
-
-            await writeEvent({
-                type: "done",
-                model: agent.model,
-                usage: result.usage,
-                promptTokens: result.promptTokens,
-                completionTokens: result.completionTokens,
-                totalTokens: result.usage?.total_tokens,
-            });
+            res.write("data: [DONE]\n\n");
         } catch (err) {
             res.write(`data: ${safeStringify({ type: "error", content: String(err) })}\n\n`);
         }
@@ -478,6 +477,36 @@ router.get(
         }
 
         res.json(state);
+    }),
+);
+
+/**
+ * POST /agent/:walletAddress/runs/:runId/stop
+ *
+ * Aborts an in-flight stream for (agentWallet, runId). The LangGraph checkpoint
+ * remains intact: the conversation/CoT/memory for this thread can be resumed
+ * by issuing a new chat or stream call with the same threadId / composeRunId.
+ *
+ * Body (optional): { threadId?: string }
+ */
+router.post(
+    "/:walletAddress/runs/:runId/stop",
+    asyncHandler(async (req: Request, res: Response) => {
+        const agentWallet = getParam(req.params.walletAddress);
+        const runId = getParam(req.params.runId);
+        const threadId = typeof req.body?.threadId === "string" && req.body.threadId.trim()
+            ? req.body.threadId.trim()
+            : undefined;
+
+        const runKey = buildRunKey(agentWallet, runId, threadId);
+        const aborted = abortRun(runKey);
+
+        res.json({
+            walletAddress: agentWallet,
+            runId,
+            stopped: aborted,
+            ...(aborted ? {} : { reason: "no_active_run" }),
+        });
     }),
 );
 

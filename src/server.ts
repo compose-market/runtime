@@ -35,10 +35,11 @@ import type { ServerSpawnConfig } from "./mcps/mcp.js";
 import {
   resolveRuntimeHostMode,
   shouldInitializeWorkflowRuntime,
-} from "./framework/mode.js";
-import { runWithAgentExecutionContext } from "./framework/agent/context.js";
-import { createMemoryTools } from "./framework/agent/tools.js";
-import { warmMemoryCache } from "./framework/memory/cache.js";
+} from "./manowar/mode.js";
+import { runWithAgentExecutionContext } from "./manowar/agent/context.js";
+import { persistAgentConversationTurn } from "./manowar/agent/memory.js";
+import { createMemoryTools } from "./manowar/agent/tools.js";
+import { warmMemoryCache } from "./manowar/memory/cache.js";
 import { isA509, registerHai, verifyAnchor } from "./mesh/hai.js";
 import { anchorMeshState } from "./mesh/anchor.js";
 import { pinMeshArtifact } from "./mesh/filecoin-pin.js";
@@ -194,6 +195,23 @@ const LocalMeshToolRequestSchema = z.object({
   workflowWallet: walletAddressSchema.optional(),
 });
 
+const LocalMeshMemoryRequestSchema = z.object({
+  agentWallet: walletAddressSchema,
+  userAddress: walletAddressSchema.optional(),
+  workflowWallet: walletAddressSchema.optional(),
+  haiId: z.string().trim().min(1).max(64),
+  threadId: z.string().trim().min(1).max(128),
+  operation: z.enum(["search", "save", "searchAll", "recordTurn"]),
+  query: z.string().trim().min(1).optional(),
+  content: z.string().trim().min(1).optional(),
+  userMessage: z.string().trim().min(1).optional(),
+  assistantMessage: z.string().trim().min(1).optional(),
+  modelUsed: z.string().trim().min(1).optional(),
+  totalTokens: z.number().int().min(0).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives", "vectors"])).max(6).optional(),
+}).strict();
+
 const RegisterHaiRequestSchema = z.object({
   agentWallet: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
   userAddress: walletAddressSchema.transform((value) => value.toLowerCase() as `0x${string}`),
@@ -313,6 +331,54 @@ async function executeLocalMeshTool(input: z.infer<typeof LocalMeshToolRequestSc
   );
 }
 
+async function executeLocalMeshMemory(input: z.infer<typeof LocalMeshMemoryRequestSchema>): Promise<unknown> {
+  if (input.operation === "recordTurn") {
+    if (!input.userMessage || !input.assistantMessage) {
+      throw new Error("Local mesh memory recordTurn requires userMessage and assistantMessage");
+    }
+
+    await persistAgentConversationTurn({
+      scope: {
+        agentWallet: input.agentWallet,
+        userId: input.userAddress,
+        threadId: input.threadId,
+        metadata: input.metadata || {},
+        mode: "local",
+        haiId: input.haiId,
+      },
+      sessionId: input.threadId,
+      userMessage: input.userMessage,
+      assistantMessage: input.assistantMessage,
+      modelUsed: input.modelUsed || "unknown",
+      totalTokens: input.totalTokens || 0,
+      metadata: input.metadata,
+    });
+
+    return { saved: true };
+  }
+
+  const toolName = input.operation === "search"
+    ? "search_memory"
+    : input.operation === "save"
+      ? "save_memory"
+      : "search_all_memory";
+  const args = input.operation === "search"
+    ? { query: input.query }
+    : input.operation === "save"
+      ? { content: input.content }
+      : { query: input.query, layers: input.layers };
+
+  return executeLocalMeshTool({
+    agentWallet: input.agentWallet,
+    userAddress: input.userAddress,
+    workflowWallet: input.workflowWallet,
+    haiId: input.haiId,
+    threadId: input.threadId,
+    toolName,
+    args,
+  });
+}
+
 function sendValidationError(res: Response, label: string, error: z.ZodError): void {
   res.status(400).json({
     error: label,
@@ -339,6 +405,30 @@ app.post("/mesh/tools/execute", asyncHandler(async (req: Request, res: Response)
     res.status(200).json({ result });
   } catch (error) {
     sendRuntimeError(res, error, "Failed to execute local mesh tool");
+  }
+}));
+
+app.post("/mesh/memory", asyncHandler(async (req: Request, res: Response) => {
+  if (!authorizeLocalMeshRequest(req, res)) {
+    return;
+  }
+
+  const parsed = LocalMeshMemoryRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendValidationError(res, "Invalid local mesh memory payload", parsed.error);
+    return;
+  }
+
+  try {
+    const result = await executeLocalMeshMemory(parsed.data);
+    res.status(200).json({
+      operation: parsed.data.operation,
+      haiId: parsed.data.haiId,
+      threadId: parsed.data.threadId,
+      result,
+    });
+  } catch (error) {
+    sendRuntimeError(res, error, "Failed to execute local mesh memory operation");
   }
 }));
 
@@ -1150,7 +1240,7 @@ export async function startRuntimeServer(port?: number): Promise<HttpServer> {
   return await runtimeServerPromise;
 }
 
-export { resolveRuntimeHostMode, shouldInitializeWorkflowRuntime } from "./framework/mode.js";
+export { resolveRuntimeHostMode, shouldInitializeWorkflowRuntime } from "./manowar/mode.js";
 
 if (shouldAutoStartRuntimeServer()) {
   startRuntimeServer().catch((error) => {
