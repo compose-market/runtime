@@ -5,8 +5,8 @@
  * Uses viem for contract interaction.
  */
 import { type Address } from "viem";
-import type { WorkflowStep } from "./framework/workflow/types.js";
-import { registerAgent, hasAgent } from "./framework/runtime.js";
+import type { WorkflowStep } from "./manowar/workflow/types.js";
+import { registerAgent, hasAgent } from "./manowar/runtime.js";
 import { buildPinataGatewayIpfsUrl } from "./auth.js";
 import { getPublicClient } from "./chains.js";
 
