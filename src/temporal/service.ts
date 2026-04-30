@@ -2,10 +2,10 @@ import { randomUUID } from "crypto";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
 import type { WorkflowHandle } from "@temporalio/client";
 import type { Client } from "@temporalio/client";
-import type { ExecutionResult } from "../framework/manowar.js";
-import type { TriggerDefinition } from "../framework/workflow/types.js";
-import type { OrchestratorResult } from "../framework/workflow/orchestrator.js";
-import type { ExecutorOptions, Workflow as WorkflowWorkflow, StepApprovalDecision, StepApprovalStatus } from "../framework/workflow/types.js";
+import type { ExecutionResult } from "../manowar/framework.js";
+import type { TriggerDefinition } from "../manowar/workflow/types.js";
+import type { OrchestratorResult } from "../manowar/workflow/orchestrator.js";
+import type { ExecutorOptions, Workflow as WorkflowWorkflow, StepApprovalDecision, StepApprovalStatus } from "../manowar/workflow/types.js";
 import {
     AGENT_TASK_QUEUE,
     AGENT_WORKFLOW_TYPE,

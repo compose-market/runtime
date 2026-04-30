@@ -24,7 +24,7 @@ import {
     syncArchiveToPinata,
     updateMemoryDecayScores,
     validateExtractedPattern as validateExtractedPatternStore,
-} from "../../framework/memory/index.js";
+} from "../../manowar/memory/index.js";
 
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 30000;
 

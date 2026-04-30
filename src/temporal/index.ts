@@ -45,3 +45,7 @@ export {
     triggerMemorySchedule,
     type MemoryScheduleStatus,
 } from "./memory/schedules.js";
+export {
+    getMemoryJob as getTemporalMemoryJob,
+    runMemoryMaintenanceJob as runTemporalMemoryMaintenanceJob,
+} from "./memory/service.js";

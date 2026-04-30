@@ -3,7 +3,7 @@ import {
     QUERY_GET_APPROVAL_DECISION,
     QUERY_GET_RUN_STATE,
 } from "./constants.js";
-import type { StepApprovalDecision } from "../framework/workflow/types.js";
+import type { StepApprovalDecision } from "../manowar/workflow/types.js";
 import type { TemporalAgentExecutionState, TemporalExecutionState } from "./types.js";
 
 export const TemporalQueries = {

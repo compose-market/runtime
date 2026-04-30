@@ -5,8 +5,8 @@ import type {
     StepApprovalDecision,
     StepApprovalRequest,
     Workflow,
-} from "../framework/workflow/types.js";
-import type { OrchestratorResult } from "../framework/workflow/orchestrator.js";
+} from "../manowar/workflow/types.js";
+import type { OrchestratorResult } from "../manowar/workflow/orchestrator.js";
 
 export type SerializableExecutorOptions = Omit<
     Partial<ExecutorOptions>,
@@ -109,13 +109,13 @@ export interface MemoryConsolidationInput {
 
 export interface PatternExtractionInput {
     agentWallet: string;
-    timeRange: { start: number; end: number };
+    timeRange?: { start: number; end: number };
     options?: MemoryActivityOptions;
 }
 
 export interface ArchiveCreationInput {
     agentWallet: string;
-    dateRange: { start: number; end: number };
+    dateRange?: { start: number; end: number };
     options?: MemoryActivityOptions;
 }
 
@@ -143,6 +143,7 @@ export interface MemoryActivityOptions {
     compress?: boolean;
     syncToIpfs?: boolean;
     dryRun?: boolean;
+    windowDays?: number;
 }
 
 export interface MemoryWorkflowResult {

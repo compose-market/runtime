@@ -13,6 +13,8 @@ import type {
     MemoryConsolidationInput,
     ArchiveCreationInput,
     DecayUpdateInput,
+    PatternExtractionInput,
+    MemoryCleanupInput,
 } from "../types.js";
 
 export const MEMORY_SCHEDULE_OVERLAP_POLICY = ScheduleOverlapPolicy.SKIP;
@@ -20,6 +22,9 @@ export const MEMORY_SCHEDULE_OVERLAP_POLICY = ScheduleOverlapPolicy.SKIP;
 export const MEMORY_DAILY_CONSOLIDATION_SCHEDULE_ID = `${MEMORY_WORKFLOW_ID_PREFIX}daily-consolidation`;
 export const MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID = `${MEMORY_WORKFLOW_ID_PREFIX}weekly-archive`;
 export const MEMORY_HOURLY_DECAY_SCHEDULE_ID = `${MEMORY_WORKFLOW_ID_PREFIX}hourly-decay`;
+export const MEMORY_DAILY_PATTERN_SCHEDULE_ID_PREFIX = `${MEMORY_WORKFLOW_ID_PREFIX}daily-patterns`;
+export const MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID_PREFIX = `${MEMORY_WORKFLOW_ID_PREFIX}weekly-archive`;
+export const MEMORY_DAILY_CLEANUP_SCHEDULE_ID = `${MEMORY_WORKFLOW_ID_PREFIX}daily-cleanup`;
 
 interface MemoryScheduleConfig {
     scheduleId: string;
@@ -79,24 +84,53 @@ function buildMemoryConsolidationSchedule(agentWallets: string[]): MemorySchedul
     };
 }
 
-function buildWeeklyArchiveSchedule(agentWallets: string[]): MemoryScheduleConfig {
-    const now = Date.now();
-    const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
-
-    const input: ArchiveCreationInput = {
-        agentWallet: agentWallets[0],
-        dateRange: {
-            start: weekAgo,
-            end: now,
-        },
+function buildAgentPatternSchedule(agentWallet: string): MemoryScheduleConfig {
+    const input: PatternExtractionInput = {
+        agentWallet,
         options: {
+            windowDays: 1,
+        },
+    };
+
+    return {
+        scheduleId: `${MEMORY_DAILY_PATTERN_SCHEDULE_ID_PREFIX}:${agentWallet.toLowerCase()}`,
+        spec: {
+            cronExpressions: [MEMORY_DAILY_CONSOLIDATION_CRON],
+            timezone: "UTC",
+        },
+        action: {
+            type: "startWorkflow",
+            workflowType: "patternExtractionWorkflow",
+            taskQueue: MEMORY_ACTIVITY_TASK_QUEUE,
+            args: [input],
+        },
+        memo: {
+            type: "memory-patterns",
+            agentWallet,
+        },
+        policies: {
+            overlap: ScheduleOverlapPolicy.SKIP,
+            catchupWindow: MEMORY_SCHEDULE_CATCHUP_WINDOW_MS,
+        },
+        state: {
+            paused: false,
+            note: `Daily memory pattern extraction for ${agentWallet}`,
+        },
+    };
+}
+
+function buildAgentArchiveSchedule(agentWallet: string): MemoryScheduleConfig {
+    const input: ArchiveCreationInput = {
+        agentWallet,
+        options: {
+            windowDays: 7,
             compress: true,
             syncToIpfs: true,
         },
     };
 
     return {
-        scheduleId: MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID,
+        scheduleId: `${MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID_PREFIX}:${agentWallet.toLowerCase()}`,
         spec: {
             cronExpressions: [MEMORY_WEEKLY_ARCHIVE_CRON],
             timezone: "UTC",
@@ -109,6 +143,7 @@ function buildWeeklyArchiveSchedule(agentWallets: string[]): MemoryScheduleConfi
         },
         memo: {
             type: "memory-archive",
+            agentWallet,
         },
         policies: {
             overlap: ScheduleOverlapPolicy.BUFFER_ONE,
@@ -116,7 +151,7 @@ function buildWeeklyArchiveSchedule(agentWallets: string[]): MemoryScheduleConfi
         },
         state: {
             paused: false,
-            note: "Weekly archive creation on Sundays at 3 AM UTC",
+            note: `Weekly memory archive creation for ${agentWallet}`,
         },
     };
 }
@@ -152,38 +187,91 @@ function buildHourlyDecaySchedule(): MemoryScheduleConfig {
     };
 }
 
+function buildDailyCleanupSchedule(): MemoryScheduleConfig {
+    const input: MemoryCleanupInput = {
+        olderThanDays: 90,
+    };
+
+    return {
+        scheduleId: MEMORY_DAILY_CLEANUP_SCHEDULE_ID,
+        spec: {
+            cronExpressions: [MEMORY_DAILY_CONSOLIDATION_CRON],
+            timezone: "UTC",
+        },
+        action: {
+            type: "startWorkflow",
+            workflowType: "memoryCleanupWorkflow",
+            taskQueue: MEMORY_ACTIVITY_TASK_QUEUE,
+            args: [input],
+        },
+        memo: {
+            type: "memory-cleanup",
+        },
+        policies: {
+            overlap: ScheduleOverlapPolicy.SKIP,
+            catchupWindow: MEMORY_SCHEDULE_CATCHUP_WINDOW_MS,
+        },
+        state: {
+            paused: false,
+            note: "Daily memory cleanup",
+        },
+    };
+}
+
+async function upsertSchedule(client: Client, scheduleConfig: MemoryScheduleConfig): Promise<void> {
+    try {
+        await client.schedule.getHandle(scheduleConfig.scheduleId).delete();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.toLowerCase().includes("not found")) {
+            console.warn(`[memory-schedules] Failed to delete existing schedule ${scheduleConfig.scheduleId}:`, error);
+        }
+    }
+
+    await client.schedule.create(scheduleConfig);
+    console.log(`[memory-schedules] Created schedule: ${scheduleConfig.scheduleId}`);
+}
+
 export async function createMemorySchedules(agentWallets: string[]): Promise<void> {
     const client = await getTemporalClient();
+    const normalizedWallets = normalizeAgentWallets(agentWallets);
 
     const schedules = [
-        buildMemoryConsolidationSchedule(agentWallets),
-        buildWeeklyArchiveSchedule(agentWallets),
+        buildMemoryConsolidationSchedule(normalizedWallets),
         buildHourlyDecaySchedule(),
+        buildDailyCleanupSchedule(),
+        ...normalizedWallets.flatMap((wallet) => [
+            buildAgentPatternSchedule(wallet),
+            buildAgentArchiveSchedule(wallet),
+        ]),
     ];
 
     for (const scheduleConfig of schedules) {
-        try {
-            await client.schedule.getHandle(scheduleConfig.scheduleId).delete();
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            if (!message.toLowerCase().includes("not found")) {
-                console.warn(`[memory-schedules] Failed to delete existing schedule ${scheduleConfig.scheduleId}:`, error);
-            }
-        }
-
-        await client.schedule.create(scheduleConfig);
-        console.log(`[memory-schedules] Created schedule: ${scheduleConfig.scheduleId}`);
+        await upsertSchedule(client, scheduleConfig);
     }
 }
 
-export async function deleteMemorySchedules(): Promise<void> {
-    const client = await getTemporalClient();
+function normalizeAgentWallets(agentWallets: string[]): string[] {
+    return [...new Set(agentWallets.map((wallet) => wallet.trim().toLowerCase()).filter(Boolean))];
+}
 
-    const scheduleIds = [
+function memoryScheduleIds(agentWallets: string[] = []): string[] {
+    const normalizedWallets = normalizeAgentWallets(agentWallets);
+    return [
         MEMORY_DAILY_CONSOLIDATION_SCHEDULE_ID,
         MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID,
         MEMORY_HOURLY_DECAY_SCHEDULE_ID,
+        MEMORY_DAILY_CLEANUP_SCHEDULE_ID,
+        ...normalizedWallets.flatMap((agentWallet) => [
+            `${MEMORY_DAILY_PATTERN_SCHEDULE_ID_PREFIX}:${agentWallet}`,
+            `${MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID_PREFIX}:${agentWallet}`,
+        ]),
     ];
+}
+
+export async function deleteMemorySchedules(agentWallets: string[] = []): Promise<void> {
+    const client = await getTemporalClient();
+    const scheduleIds = memoryScheduleIds(agentWallets);
 
     for (const scheduleId of scheduleIds) {
         try {
@@ -207,14 +295,9 @@ export interface MemoryScheduleStatus {
     note?: string;
 }
 
-export async function getMemoryScheduleStatus(): Promise<MemoryScheduleStatus[]> {
+export async function getMemoryScheduleStatus(agentWallets: string[] = []): Promise<MemoryScheduleStatus[]> {
     const client = await getTemporalClient();
-
-    const scheduleIds = [
-        MEMORY_DAILY_CONSOLIDATION_SCHEDULE_ID,
-        MEMORY_WEEKLY_ARCHIVE_SCHEDULE_ID,
-        MEMORY_HOURLY_DECAY_SCHEDULE_ID,
-    ];
+    const scheduleIds = memoryScheduleIds(agentWallets);
 
     const statuses: MemoryScheduleStatus[] = [];
 

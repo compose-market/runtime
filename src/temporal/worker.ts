@@ -180,7 +180,7 @@ export async function startWorkflowTemporalWorkers(): Promise<void> {
         maxConcurrentWorkflowTaskExecutions: 100,
         workerDeploymentOptions: {
             version: getTemporalDeploymentVersion(),
-            useWorkerVersioning: true,
+            useWorkerVersioning: true as const,
             defaultVersioningBehavior: VersioningBehavior.PINNED,
         },
     };

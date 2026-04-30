@@ -1,8 +1,8 @@
 import { Context } from "@temporalio/activity";
-import { executeAgent } from "../framework/manowar.js";
-import { getWorkflow, resolveAgent } from "../framework/runtime.js";
-import { WorkflowOrchestrator } from "../framework/workflow/orchestrator.js";
-import type { ExecutionRunStateProjection, StepApprovalDecision, StepApprovalRequest, WorkflowStep, ExecutorOptions } from "../framework/workflow/types.js";
+import { executeAgent } from "../manowar/framework.js";
+import { getWorkflow, resolveAgent } from "../manowar/runtime.js";
+import { WorkflowOrchestrator } from "../manowar/workflow/orchestrator.js";
+import type { ExecutionRunStateProjection, StepApprovalDecision, StepApprovalRequest, WorkflowStep, ExecutorOptions } from "../manowar/workflow/types.js";
 import {
     APPROVAL_BLOCKED_POLL_INTERVAL_MS,
     APPROVAL_POLL_INTERVAL_MS,

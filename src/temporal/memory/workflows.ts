@@ -29,6 +29,7 @@ import type {
 const MAX_BATCH_SIZE = 50;
 const MAX_CONTINUOUS_ITERATIONS = 100;
 const BATCH_DELAY_MS = 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const memoryWorkflowStateQuery = defineQuery<MemoryWorkflowState>(QUERY_GET_MEMORY_WORKFLOW_STATE);
 const pauseMemoryWorkflowSignal = defineSignal(SIGNAL_PAUSE_MEMORY_WORKFLOW);
@@ -50,6 +51,22 @@ const memoryActivities = proxyActivities<typeof import("./activities.js")>({
         ],
     },
 });
+
+function resolveWindow(
+    explicitRange: { start: number; end: number } | undefined,
+    windowDays: number | undefined,
+    defaultDays: number,
+): { start: number; end: number } {
+    if (explicitRange) {
+        return explicitRange;
+    }
+    const end = Date.now();
+    const days = Number.isFinite(windowDays) && windowDays && windowDays > 0 ? windowDays : defaultDays;
+    return {
+        start: end - days * DAY_MS,
+        end,
+    };
+}
 
 export async function memoryConsolidationWorkflow(
     input: MemoryConsolidationInput
@@ -172,7 +189,7 @@ export async function patternExtractionWorkflow(
     try {
         const result = await memoryActivities.extractExecutionPatterns({
             agentWallet: input.agentWallet,
-            timeRange: input.timeRange,
+            timeRange: resolveWindow(input.timeRange, input.options?.windowDays, 1),
             options: input.options,
         });
 
@@ -230,7 +247,7 @@ export async function archiveCreationWorkflow(
     try {
         const result = await memoryActivities.createMemoryArchive({
             agentWallet: input.agentWallet,
-            dateRange: input.dateRange,
+            dateRange: resolveWindow(input.dateRange, input.options?.windowDays, 7),
             options: input.options,
         });
 
