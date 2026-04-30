@@ -10,7 +10,7 @@ import {
     WORKFLOW_PRICES,
     type Workflow,
     type PaymentContext,
-} from "./framework/workflow/index.js";
+} from "./manowar/workflow/index.js";
 import {
     cancelWorkflowRun,
     createComposeRunId,
@@ -28,7 +28,7 @@ import {
     deleteTriggerFromMemory,
     registerTrigger,
     unregisterTrigger,
-} from "./framework/workflow/triggers.js";
+} from "./manowar/workflow/triggers.js";
 import {
     getTemporalWorkerRuntimeStatus,
     isTemporalWorkerReady,
@@ -38,40 +38,74 @@ import {
     ensureRegisteredWorkflowByWallet,
     markWorkflowExecuted,
     resolveAgent,
-} from "./framework/runtime.js";
-import type { WorkflowStep, TriggerDefinition } from "./framework/workflow/types.js";
+} from "./manowar/runtime.js";
+import type { WorkflowStep, TriggerDefinition } from "./manowar/workflow/types.js";
 import {
     addMemory as addGraphMemory,
+    AgentMemoryInputError,
+    assembleAgentMemoryContext,
     cleanupExpiredMemories,
+    compressSession,
     consolidateAgentMemories,
     createMemoryArchive,
+    deleteMemoryItem,
     extractExecutionPatterns,
     getEmbedding,
     getAllMemories,
+    getLearnedSkill,
+    getMemoryItem,
     getMemoryVectorsCollection,
     getMemoryStats,
+    getMemoryWorkflowManifest,
+    getMemoryWorkflowManifests,
+    getProceduralPattern,
     getTranscriptBySessionId,
     getTranscriptByThreadId,
+    getWorkingSessionMemory,
     hybridVectorSearch,
+    indexSessionTranscript,
     indexMemoryContent,
     indexVector,
+    listActiveMemoryAgentWallets,
+    listLearnedSkills,
+    listProceduralPatterns,
+    normalizeAgentMemoryScope,
     promotePatternToSkill,
+    recordAgentMemoryTurn,
     rerankDocuments,
+    rememberAgentMemory,
+    resolveMemoryConflict,
+    runMemoryEval,
+    runAgentMemoryLoop,
     searchMemory as searchGraphMemory,
     searchMemoryLayers,
     searchVectors,
     storeTranscript,
     syncArchiveToPinata,
+    updateWorkingSessionMemory,
+    updateMemoryItem,
     updateMemoryDecayScores,
     validateExtractedPattern,
-} from "./framework/memory/index.js";
+} from "./manowar/memory/index.js";
+import {
+    getMemoryJob,
+    runMemoryMaintenanceJob,
+} from "./temporal/memory/service.js";
+import {
+    createMemorySchedules,
+    deleteMemorySchedules,
+    getMemoryScheduleStatus,
+    pauseMemorySchedule,
+    resumeMemorySchedule,
+    triggerMemorySchedule,
+} from "./temporal/memory/schedules.js";
 import { extractRuntimeSessionHeaders, isRuntimeInternalRequest } from "./auth.js";
 import {
     indexWorkspaceDocuments,
     normalizeKnowledgeLimit,
     normalizeWorkspaceDocuments,
     searchWorkspaceDocuments,
-} from "./framework/knowledge/index.js";
+} from "./manowar/knowledge/index.js";
 
 const activeRunIds = new Map<string, string>();
 const SSE_HEARTBEAT_INTERVAL_MS = 10000;
@@ -123,6 +157,18 @@ function asyncHandler(
     };
 }
 
+async function sendAgentMemoryJson<T>(res: Response, action: () => Promise<T>): Promise<void> {
+    try {
+        res.json(await action());
+    } catch (error) {
+        if (error instanceof AgentMemoryInputError) {
+            res.status(error.statusCode).json({ error: error.message });
+            return;
+        }
+        throw error;
+    }
+}
+
 /**
  * Helper to extract string from route params (Express v5 types them as string | string[])
  */
@@ -131,11 +177,19 @@ function getParam(value: string | string[] | undefined): string {
     return value || "";
 }
 
+function getStringList(value: unknown): string[] {
+    if (Array.isArray(value)) {
+        return value.filter((item): item is string => typeof item === "string").flatMap((item) => item.split(","));
+    }
+    return typeof value === "string" ? value.split(",") : [];
+}
+
 type RouteRegistrar = {
     use: (...args: any[]) => unknown;
     get: (...args: any[]) => unknown;
     post: (...args: any[]) => unknown;
     put: (...args: any[]) => unknown;
+    patch: (...args: any[]) => unknown;
     delete: (...args: any[]) => unknown;
 };
 
@@ -386,53 +440,265 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     // Memory Routes (Workflow Local Authority)
     // ============================================================================
 
-    app.post("/api/memory/add", asyncHandler(async (req: Request, res: Response) => {
-        const { messages, agentWallet, agent_id, userAddress, user_id, runId, run_id, metadata, enableGraph, enable_graph } = req.body || {};
-        const agentId = agentWallet || agent_id;
-        const user = userAddress || user_id;
-        const run = runId || run_id;
-        const enableGraphValue = enableGraph ?? enable_graph ?? true;
+    app.post("/api/memory/context/assemble", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => assembleAgentMemoryContext(req.body));
+    }));
 
-        if (!Array.isArray(messages) || !agentId) {
-            res.status(400).json({ error: "messages and (agentWallet or agent_id) are required" });
+    app.post("/api/memory/turns/record", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => recordAgentMemoryTurn(req.body));
+    }));
+
+    app.post("/api/memory/remember", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => rememberAgentMemory(req.body));
+    }));
+
+    app.post("/api/memory/loop", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => runAgentMemoryLoop(req.body));
+    }));
+
+    app.get("/api/memory/workflows", asyncHandler(async (_req: Request, res: Response) => {
+        res.json({ workflows: getMemoryWorkflowManifests() });
+    }));
+
+    app.get("/api/memory/workflows/:workflowId", asyncHandler(async (req: Request, res: Response) => {
+        const workflowId = getParam(req.params.workflowId);
+        const workflow = getMemoryWorkflowManifest(workflowId);
+        if (!workflow) {
+            res.status(404).json({ error: "Memory workflow not found" });
             return;
         }
+        res.json({ workflow });
+    }));
 
-        const result = await addGraphMemory({
-            messages,
-            agent_id: agentId,
-            user_id: user,
-            run_id: run,
-            metadata,
-            enable_graph: Boolean(enableGraphValue),
+    app.get("/api/memory/patterns", asyncHandler(async (req: Request, res: Response) => {
+        const patternType = typeof req.query.patternType === "string"
+            && ["workflow", "decision", "response", "tool_sequence"].includes(req.query.patternType)
+            ? req.query.patternType as "workflow" | "decision" | "response" | "tool_sequence"
+            : undefined;
+        const result = await listProceduralPatterns({
+            agentWallet: typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined,
+            patternType,
+            minSuccessRate: typeof req.query.minSuccessRate === "string" ? Number(req.query.minSuccessRate) : undefined,
+            limit: typeof req.query.limit === "string" ? Number(req.query.limit) : undefined,
         });
-
         res.json(result);
     }));
 
-    app.post("/api/memory/search", asyncHandler(async (req: Request, res: Response) => {
-        const { query, agentWallet, agent_id, userAddress, user_id, runId, run_id, limit, filters, enableGraph, enable_graph, rerank } = req.body || {};
-        const agentId = agentWallet || agent_id;
-        const user = userAddress || user_id;
-        const run = runId || run_id;
-
-        if (typeof query !== "string" || !agentId) {
-            res.status(400).json({ error: "query and (agentWallet or agent_id) are required" });
+    app.get("/api/memory/patterns/:patternId", asyncHandler(async (req: Request, res: Response) => {
+        const patternId = getParam(req.params.patternId);
+        const result = await getProceduralPattern({
+            patternId,
+            agentWallet: typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined,
+        });
+        if (!result.pattern) {
+            res.status(404).json({ error: "Memory pattern not found" });
             return;
         }
-
-        const result = await searchGraphMemory({
-            query,
-            agent_id: agentId,
-            user_id: user,
-            run_id: run,
-            limit: typeof limit === "number" ? limit : 10,
-            filters: typeof filters === "object" && filters ? filters : undefined,
-            enable_graph: Boolean(enableGraph ?? enable_graph ?? true),
-            rerank: Boolean(rerank ?? true),
-        });
-
         res.json(result);
+    }));
+
+    app.post("/api/memory/patterns/:patternId/validate", asyncHandler(async (req: Request, res: Response) => {
+        const patternId = getParam(req.params.patternId);
+        const result = await validateExtractedPattern({ patternId });
+        res.json(result);
+    }));
+
+    app.post("/api/memory/patterns/:patternId/promote", asyncHandler(async (req: Request, res: Response) => {
+        const patternId = getParam(req.params.patternId);
+        const { skillName, validationData } = req.body || {};
+        if (typeof skillName !== "string" || !validationData) {
+            res.status(400).json({ error: "skillName and validationData are required" });
+            return;
+        }
+        const result = await promotePatternToSkill({ patternId, skillName, validationData });
+        res.json(result);
+    }));
+
+    app.get("/api/memory/skills", asyncHandler(async (req: Request, res: Response) => {
+        const result = await listLearnedSkills({
+            agentWallet: typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined,
+            category: typeof req.query.category === "string" ? req.query.category : undefined,
+            limit: typeof req.query.limit === "string" ? Number(req.query.limit) : undefined,
+        });
+        res.json(result);
+    }));
+
+    app.get("/api/memory/skills/:skillId", asyncHandler(async (req: Request, res: Response) => {
+        const skillId = getParam(req.params.skillId);
+        const result = await getLearnedSkill({
+            skillId,
+            agentWallet: typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined,
+        });
+        if (!result.skill) {
+            res.status(404).json({ error: "Memory skill not found" });
+            return;
+        }
+        res.json(result);
+    }));
+
+    app.post("/api/memory/transcripts/index", asyncHandler(async (req: Request, res: Response) => {
+        const { sessionId, threadId, agentWallet, userAddress, mode, haiId, messages, modelUsed, model, totalTokens, tokenCount, rememberWorkingMemory } = req.body || {};
+        if (typeof sessionId !== "string" || typeof threadId !== "string" || typeof agentWallet !== "string" || !Array.isArray(messages)) {
+            res.status(400).json({ error: "sessionId, threadId, agentWallet, and messages are required" });
+            return;
+        }
+        const result = await indexSessionTranscript({
+            sessionId,
+            threadId,
+            agentWallet,
+            userAddress,
+            mode,
+            haiId,
+            messages,
+            modelUsed: typeof modelUsed === "string" ? modelUsed : typeof model === "string" ? model : "unknown",
+            totalTokens: typeof totalTokens === "number" ? totalTokens : typeof tokenCount === "number" ? tokenCount : 0,
+            rememberWorkingMemory: rememberWorkingMemory !== false,
+        });
+        res.json(result);
+    }));
+
+    app.get("/api/memory/sessions/:sessionId/working", asyncHandler(async (req: Request, res: Response) => {
+        const sessionId = getParam(req.params.sessionId);
+        const agentWallet = typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined;
+        if (!agentWallet) {
+            res.status(400).json({ error: "agentWallet is required" });
+            return;
+        }
+        const session = await getWorkingSessionMemory({ sessionId, agentWallet });
+        if (!session) {
+            res.status(404).json({ error: "Working memory session not found" });
+            return;
+        }
+        res.json({ session });
+    }));
+
+    app.patch("/api/memory/sessions/:sessionId/working", asyncHandler(async (req: Request, res: Response) => {
+        const sessionId = getParam(req.params.sessionId);
+        const { agentWallet, userAddress, threadId, mode, haiId, context, entities, state, metadata, replace } = req.body || {};
+        if (typeof agentWallet !== "string") {
+            res.status(400).json({ error: "agentWallet is required" });
+            return;
+        }
+        const result = await updateWorkingSessionMemory({
+            sessionId,
+            agentWallet,
+            userAddress,
+            threadId,
+            mode,
+            haiId,
+            context: Array.isArray(context) ? context.filter((item): item is string => typeof item === "string") : undefined,
+            entities: entities && typeof entities === "object" && !Array.isArray(entities) ? entities : undefined,
+            state: state && typeof state === "object" && !Array.isArray(state) ? state : undefined,
+            metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : undefined,
+            replace: replace === true,
+        });
+        res.json(result);
+    }));
+
+    app.post("/api/memory/sessions/:sessionId/compress", asyncHandler(async (req: Request, res: Response) => {
+        const sessionId = getParam(req.params.sessionId);
+        const { agentWallet, coordinatorModel } = req.body || {};
+        if (typeof agentWallet !== "string" || typeof coordinatorModel !== "string") {
+            res.status(400).json({ error: "agentWallet and coordinatorModel are required" });
+            return;
+        }
+        const result = await compressSession({ sessionId, agentWallet, coordinatorModel });
+        res.json(result);
+    }));
+
+    app.post("/api/memory/archives/:archiveId/sync", asyncHandler(async (req: Request, res: Response) => {
+        const archiveId = getParam(req.params.archiveId);
+        const { agentWallet } = req.body || {};
+        if (typeof agentWallet !== "string") {
+            res.status(400).json({ error: "agentWallet is required" });
+            return;
+        }
+        const result = await syncArchiveToPinata({ archiveId, agentWallet });
+        res.json(result);
+    }));
+
+    app.get("/api/memory/schedules", asyncHandler(async (req: Request, res: Response) => {
+        const requestedWallets = getStringList(req.query.agentWallets);
+        const agentWallets = requestedWallets.length > 0
+            ? requestedWallets
+            : (await listActiveMemoryAgentWallets()).agentWallets;
+        const schedules = await getMemoryScheduleStatus(agentWallets);
+        res.json({ schedules });
+    }));
+
+    app.post("/api/memory/schedules", asyncHandler(async (req: Request, res: Response) => {
+        const { agentWallets } = req.body || {};
+        if (!Array.isArray(agentWallets) || !agentWallets.every((wallet) => typeof wallet === "string")) {
+            res.status(400).json({ error: "agentWallets is required" });
+            return;
+        }
+        await createMemorySchedules(agentWallets);
+        res.json({ created: true });
+    }));
+
+    app.delete("/api/memory/schedules", asyncHandler(async (req: Request, res: Response) => {
+        const requestedWallets = getStringList(req.query.agentWallets);
+        const agentWallets = requestedWallets.length > 0
+            ? requestedWallets
+            : (await listActiveMemoryAgentWallets()).agentWallets;
+        await deleteMemorySchedules(agentWallets);
+        res.json({ deleted: true });
+    }));
+
+    app.post("/api/memory/schedules/:scheduleId/pause", asyncHandler(async (req: Request, res: Response) => {
+        const scheduleId = getParam(req.params.scheduleId);
+        await pauseMemorySchedule(scheduleId);
+        res.json({ paused: true });
+    }));
+
+    app.post("/api/memory/schedules/:scheduleId/resume", asyncHandler(async (req: Request, res: Response) => {
+        const scheduleId = getParam(req.params.scheduleId);
+        await resumeMemorySchedule(scheduleId);
+        res.json({ resumed: true });
+    }));
+
+    app.post("/api/memory/schedules/:scheduleId/trigger", asyncHandler(async (req: Request, res: Response) => {
+        const scheduleId = getParam(req.params.scheduleId);
+        await triggerMemorySchedule(scheduleId);
+        res.json({ triggered: true });
+    }));
+
+    app.post("/api/memory/add", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => {
+            const { messages } = req.body || {};
+            if (!Array.isArray(messages)) {
+                throw new AgentMemoryInputError("messages is required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
+            return addGraphMemory({
+                messages,
+                agent_id: scope.agentWallet,
+                user_id: scope.userAddress,
+                run_id: scope.threadId,
+                mode: scope.mode,
+                haiId: scope.haiId,
+                metadata: scope.metadata,
+            });
+        });
+    }));
+
+    app.post("/api/memory/search", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => {
+            const { query } = req.body || {};
+            if (typeof query !== "string") {
+                throw new AgentMemoryInputError("query is required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
+            return searchGraphMemory({
+                query,
+                agent_id: scope.agentWallet,
+                user_id: scope.userAddress,
+                run_id: scope.threadId,
+                mode: scope.mode,
+                haiId: scope.haiId,
+                filters: scope.filters,
+            });
+        });
     }));
 
     app.get("/api/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
@@ -442,7 +708,6 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         const memories = await getAllMemories({
             agent_id: agentWallet,
             user_id: userAddress,
-            enable_graph: true,
         });
 
         res.json(memories);
@@ -452,81 +717,92 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         const {
             query,
             queryEmbedding,
-            agentWallet,
-            userAddress,
-            threadId,
             limit,
             threshold,
         } = req.body || {};
 
-        if (typeof query !== "string" || typeof agentWallet !== "string") {
-            res.status(400).json({ error: "query and agentWallet are required" });
-            return;
-        }
+        await sendAgentMemoryJson(res, async () => {
+            if (typeof query !== "string") {
+                throw new AgentMemoryInputError("query is required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
 
-        if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
-            const results = await hybridVectorSearch({
+            if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
+                const results = await hybridVectorSearch({
+                    query,
+                    queryEmbedding,
+                    agentWallet: scope.agentWallet,
+                    userAddress: scope.userAddress,
+                    threadId: scope.threadId,
+                    mode: scope.mode,
+                    haiId: scope.haiId,
+                    filters: scope.filters,
+                    limit: typeof limit === "number" ? limit : 10,
+                    threshold: typeof threshold === "number" ? threshold : undefined,
+                    applyDecay: true,
+                });
+                return { results };
+            }
+
+            const results = await searchVectors({
                 query,
-                queryEmbedding,
-                agentWallet,
-                userAddress,
-                threadId,
+                agentWallet: scope.agentWallet,
+                userAddress: scope.userAddress,
+                threadId: scope.threadId,
+                mode: scope.mode,
+                haiId: scope.haiId,
+                filters: scope.filters,
                 limit: typeof limit === "number" ? limit : 10,
                 threshold: typeof threshold === "number" ? threshold : undefined,
-                applyDecay: true,
+                options: {
+                    temporalDecay: true,
+                    rerank: true,
+                    mmr: true,
+                    mmrLambda: 0.7,
+                },
             });
-            res.json({ results });
-            return;
-        }
-
-        const results = await searchVectors({
-            query,
-            agentWallet,
-            userAddress,
-            threadId,
-            limit: typeof limit === "number" ? limit : 10,
-            threshold: typeof threshold === "number" ? threshold : undefined,
-            options: {
-                temporalDecay: true,
-                rerank: true,
-                mmr: true,
-                mmrLambda: 0.7,
-            },
+            return { results };
         });
-
-        res.json({ results });
     }));
 
     app.post("/api/memory/vector-index", asyncHandler(async (req: Request, res: Response) => {
-        const { content, embedding, agentWallet, userAddress, threadId, source, metadata } = req.body || {};
+        const { content, embedding, source, metadata } = req.body || {};
         const validSources = new Set(["session", "knowledge", "pattern", "archive", "fact"]);
 
-        if (
-            typeof content !== "string"
-            || !Array.isArray(embedding)
-            || typeof agentWallet !== "string"
-            || typeof source !== "string"
-            || !validSources.has(source)
-        ) {
-            res.status(400).json({ error: "content, embedding, agentWallet, and source are required" });
-            return;
-        }
+        await sendAgentMemoryJson(res, async () => {
+            if (typeof content !== "string" || typeof source !== "string" || !validSources.has(source)) {
+                throw new AgentMemoryInputError("content, agentWallet, and source are required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
+            const result = Array.isArray(embedding) && embedding.length > 0
+                ? await indexVector({
+                    content,
+                    embedding,
+                    agentWallet: scope.agentWallet,
+                    userAddress: scope.userAddress,
+                    threadId: scope.threadId,
+                    mode: scope.mode,
+                    haiId: scope.haiId,
+                    source: source as "session" | "knowledge" | "pattern" | "archive" | "fact",
+                    metadata,
+                })
+                : await indexMemoryContent({
+                    content,
+                    agentWallet: scope.agentWallet,
+                    userAddress: scope.userAddress,
+                    threadId: scope.threadId,
+                    mode: scope.mode,
+                    haiId: scope.haiId,
+                    source: source as "session" | "knowledge" | "pattern" | "archive" | "fact",
+                    metadata,
+                });
 
-        const result = await indexVector({
-            content,
-            embedding,
-            agentWallet,
-            userAddress,
-            threadId,
-            source: source as "session" | "knowledge" | "pattern" | "archive" | "fact",
-            metadata,
+            return { success: true, vectorId: result.vectorId };
         });
-
-        res.json({ success: true, vectorId: result.vectorId });
     }));
 
     app.post("/api/memory/transcript-store", asyncHandler(async (req: Request, res: Response) => {
-        const { sessionId, threadId, agentWallet, userAddress, messages, tokenCount, summary, summaryEmbedding, metadata } = req.body || {};
+        const { sessionId, threadId, agentWallet, userAddress, mode, haiId, messages, tokenCount, summary, summaryEmbedding, metadata } = req.body || {};
         if (!sessionId || !threadId || !agentWallet || !Array.isArray(messages) || typeof tokenCount !== "number") {
             res.status(400).json({ error: "sessionId, threadId, agentWallet, messages, and tokenCount are required" });
             return;
@@ -537,6 +813,8 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             threadId,
             agentWallet,
             userAddress,
+            mode,
+            haiId,
             messages,
             tokenCount,
             summary,
@@ -554,8 +832,14 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
         const transcript = type === "threadId"
             ? await getTranscriptByThreadId(id)
             : await getTranscriptBySessionId(id);
+        const agentWallet = typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined;
+        const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
 
-        if (!transcript) {
+        if (
+            !transcript
+            || (agentWallet && transcript.agentWallet !== agentWallet)
+            || (userAddress && transcript.userAddress !== userAddress)
+        ) {
             res.status(404).json({ error: "Transcript not found" });
             return;
         }
@@ -575,32 +859,149 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     }));
 
     app.post("/api/memory/layers/search", asyncHandler(async (req: Request, res: Response) => {
-        const { query, agentWallet, agent_id, userAddress, user_id, threadId, thread_id, layers, limit } = req.body || {};
-        const wallet = agentWallet || agent_id;
-        const user = userAddress || user_id;
-        const thread = threadId || thread_id;
-
-        if (typeof query !== "string" || typeof wallet !== "string") {
-            res.status(400).json({ error: "query and (agentWallet or agent_id) are required" });
-            return;
-        }
-
-        const result = await searchMemoryLayers({
-            query,
-            agentWallet: wallet,
-            userAddress: user,
-            threadId: thread,
-            layers: Array.isArray(layers) ? layers : ["working", "scene", "graph", "patterns", "archives", "vectors"],
-            limit: typeof limit === "number" ? limit : 5,
+        await sendAgentMemoryJson(res, async () => {
+            const { query, layers, limit } = req.body || {};
+            if (typeof query !== "string") {
+                throw new AgentMemoryInputError("query is required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
+            return searchMemoryLayers({
+                query,
+                agentWallet: scope.agentWallet,
+                userAddress: scope.userAddress,
+                threadId: scope.threadId,
+                mode: scope.mode,
+                haiId: scope.haiId,
+                filters: scope.filters,
+                layers: Array.isArray(layers) ? layers : ["working", "scene", "graph", "patterns", "archives", "vectors"],
+                limit: typeof limit === "number" ? limit : 5,
+            });
         });
-
-        res.json(result);
     }));
 
     app.get("/api/memory/stats/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
         const agentWallet = getParam(req.params.agentWallet);
         const stats = await getMemoryStats(agentWallet);
         res.json(stats);
+    }));
+
+    app.post("/api/memory/items/search", asyncHandler(async (req: Request, res: Response) => {
+        await sendAgentMemoryJson(res, async () => {
+            const { query, layers, limit } = req.body || {};
+            if (typeof query !== "string") {
+                throw new AgentMemoryInputError("query is required");
+            }
+            const scope = normalizeAgentMemoryScope(req.body || {});
+            return searchMemoryLayers({
+                query,
+                agentWallet: scope.agentWallet,
+                userAddress: scope.userAddress,
+                threadId: scope.threadId,
+                mode: scope.mode,
+                haiId: scope.haiId,
+                filters: scope.filters,
+                layers: Array.isArray(layers) ? layers : ["working", "scene", "graph", "patterns", "archives", "vectors"],
+                limit: typeof limit === "number" ? limit : 5,
+            });
+        });
+    }));
+
+    app.get("/api/memory/items/:id", asyncHandler(async (req: Request, res: Response) => {
+        const id = getParam(req.params.id);
+        const agentWallet = typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined;
+        const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
+        const item = await getMemoryItem({ id, agentWallet, userAddress });
+        if (!item) {
+            res.status(404).json({ error: "Memory item not found" });
+            return;
+        }
+        res.json({ item });
+    }));
+
+    app.patch("/api/memory/items/:id", asyncHandler(async (req: Request, res: Response) => {
+        const id = getParam(req.params.id);
+        const { agentWallet, userAddress, threadId, content, metadata, retention, confidence, status, filters } = req.body || {};
+        const result = await updateMemoryItem({
+            id,
+            agentWallet,
+            userAddress,
+            threadId,
+            content,
+            metadata,
+            retention,
+            confidence,
+            status,
+            filters: typeof filters === "object" && filters ? filters : undefined,
+        });
+        if (!result.updated) {
+            res.status(404).json({ error: "Memory item not found" });
+            return;
+        }
+        res.json(result);
+    }));
+
+    app.delete("/api/memory/items/:id", asyncHandler(async (req: Request, res: Response) => {
+        const id = getParam(req.params.id);
+        const agentWallet = typeof req.query.agentWallet === "string" ? req.query.agentWallet : undefined;
+        const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
+        const hardDelete = req.query.hardDelete === "true";
+        const result = await deleteMemoryItem({ id, agentWallet, userAddress, hardDelete });
+        if (!result.deleted) {
+            res.status(404).json({ error: "Memory item not found" });
+            return;
+        }
+        res.json(result);
+    }));
+
+    app.post("/api/memory/conflicts/:id/resolve", asyncHandler(async (req: Request, res: Response) => {
+        const memoryId = getParam(req.params.id);
+        const { agentWallet, resolution, winningMemoryId, reason } = req.body || {};
+        if (resolution !== "supersede" && resolution !== "keep" && resolution !== "merge" && resolution !== "ignore") {
+            res.status(400).json({ error: "resolution must be supersede, keep, merge, or ignore" });
+            return;
+        }
+        const result = await resolveMemoryConflict({
+            memoryId,
+            agentWallet,
+            resolution,
+            winningMemoryId,
+            reason,
+        });
+        res.json(result);
+    }));
+
+    app.post("/api/memory/jobs", asyncHandler(async (req: Request, res: Response) => {
+        const { type } = req.body || {};
+        if (type !== "consolidate" && type !== "patterns_extract" && type !== "archive_create" && type !== "decay_update" && type !== "cleanup") {
+            res.status(400).json({ error: "type must be consolidate, patterns_extract, archive_create, decay_update, or cleanup" });
+            return;
+        }
+        const result = await runMemoryMaintenanceJob({ ...req.body, type });
+        res.json(result);
+    }));
+
+    app.get("/api/memory/jobs/:jobId", asyncHandler(async (req: Request, res: Response) => {
+        const jobId = getParam(req.params.jobId);
+        const job = await getMemoryJob(jobId);
+        if (!job) {
+            res.status(404).json({ error: "Memory job not found" });
+            return;
+        }
+        res.json(job);
+    }));
+
+    app.post("/api/memory/evals/runs", asyncHandler(async (req: Request, res: Response) => {
+        const { agentWallet, agent_id, testCases } = req.body || {};
+        if (typeof (agentWallet || agent_id) !== "string" || !Array.isArray(testCases)) {
+            res.status(400).json({ error: "agentWallet and testCases are required" });
+            return;
+        }
+        const result = await runMemoryEval({
+            ...req.body,
+            agentWallet: agentWallet || agent_id,
+            testCases,
+        });
+        res.json(result);
     }));
 
     app.post("/internal/memory/consolidate", asyncHandler(async (req: Request, res: Response) => {
@@ -1108,6 +1509,18 @@ function isTemporalReady(): boolean {
     return isTemporalWorkerReady();
 }
 
+async function ensureMemoryMaintenanceSchedules(): Promise<void> {
+    if (process.env.MEMORY_AUTO_SCHEDULES === "false") {
+        return;
+    }
+    const limit = Number.parseInt(process.env.MEMORY_AUTO_SCHEDULE_LIMIT || "250", 10);
+    const { agentWallets } = await listActiveMemoryAgentWallets({
+        limit: Number.isFinite(limit) && limit > 0 ? limit : 250,
+    });
+    await createMemorySchedules(agentWallets);
+    console.log(`[workflow] Memory maintenance schedules ready for ${agentWallets.length} active agents`);
+}
+
 // ============================================================================
 // Server Startup
 // ============================================================================
@@ -1126,6 +1539,9 @@ export function initializeWorkflowRuntime(): void {
     void startWorkflowTemporalWorkers()
         .then(() => {
             console.log("[workflow] Temporal workers ready");
+            void ensureMemoryMaintenanceSchedules().catch((error) => {
+                console.error("[workflow] Failed to initialize memory maintenance schedules:", error);
+            });
         })
         .catch((error) => {
             console.error("[workflow] Failed to start Temporal workers:", error);
