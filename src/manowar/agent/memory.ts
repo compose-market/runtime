@@ -9,7 +9,7 @@ import type { ResolvedMemoryScope } from "./memory-scope.js";
 
 export { DEFAULT_AGENT_MEMORY_LAYERS, summarizeLayeredMemory } from "../memory/summary.js";
 
-const AGENT_TURN_MEMORY_LAYERS = ["working", "vectors", "graph", "patterns"] as const;
+const AGENT_TURN_MEMORY_LAYERS = ["working", "scene", "graph", "patterns", "archives", "vectors"] as const;
 
 function summarizeContextItems(items: AgentMemoryContextResponse["items"]): string | null {
     const summary = items.map((item) => `[${item.layer.toUpperCase()}] ${item.text}`).join("\n\n").trim();

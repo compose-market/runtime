@@ -1,4 +1,4 @@
-import { searchIdentityKnowledge } from "./identity.js";
+import { searchGenesisKnowledge } from "./genesis.js";
 import {
   indexWorkspaceDocuments,
   normalizeKnowledgeLimit,
@@ -14,7 +14,7 @@ export {
   indexWorkspaceDocuments,
   normalizeKnowledgeLimit,
   normalizeWorkspaceDocuments,
-  searchIdentityKnowledge,
+  searchGenesisKnowledge,
   searchWorkspaceDocuments,
 };
 
@@ -41,15 +41,15 @@ export async function searchKnowledge(params: {
   agentWallet: string;
   userAddress?: string;
   query: string;
-  scope?: "identity" | "workspace" | "all";
+  scope?: "genesis" | "workspace" | "all";
   limit?: number;
 }): Promise<KnowledgeSearchResult[]> {
   const limit = normalizeKnowledgeLimit(params.limit);
-  const scope = params.scope || (params.userAddress ? "all" : "identity");
+  const scope = params.scope || (params.userAddress ? "all" : "genesis");
   const searches: Array<Promise<KnowledgeSearchResult[]>> = [];
 
-  if (scope === "identity" || scope === "all") {
-    searches.push(searchIdentityKnowledge({
+  if (scope === "genesis" || scope === "all") {
+    searches.push(searchGenesisKnowledge({
       agentWallet: params.agentWallet,
       query: params.query,
       limit,

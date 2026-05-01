@@ -6,6 +6,7 @@ data
 src/data/build-progress.json
 scripts
 templates
+docs
 
 .DS_Store
 **/.DS_Store

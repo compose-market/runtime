@@ -1,49 +1,39 @@
 /**
- * Memory Tests
- * 
- * Unit tests for Mem0 Platform API integration.
- * Tests utility functions and type exports.
- * 
- * NOTE: SLIDING_WINDOW_SIZE and getDynamicThresholdPercent moved to context.ts
+ * Workflow memory tests — first-party graph layer (no mem0).
+ *
+ * Verifies the core type contract that workflow consumers depend on:
+ *   MemoryItem and GraphMemoryResult.
  */
 
-import { describe, it, expect, vi } from "vitest";
-import {
-    isMem0Available,
-    type MemoryItem,
-    type GraphMemoryResult,
+import { describe, it, expect } from "vitest";
+import type {
+    GraphMemoryResult,
 } from "../../src/manowar/workflow/memory.js";
-
-describe("isMem0Available", () => {
-    it("should return boolean", () => {
-        const result = isMem0Available();
-        expect(typeof result).toBe("boolean");
-    });
-});
+import type { MemoryItem } from "../../src/manowar/memory/index.js";
 
 describe("Type Exports", () => {
     it("should export MemoryItem type correctly", () => {
         const item: MemoryItem = {
             id: "m1",
-            memory: "Test memory",
-            agent_id: "wf-1",
-            user_id: "u1",
-            run_id: "r1",
-            metadata: { key: "value" },
+            memory: "User's favorite color is azure.",
+            agent_id: "0xagent",
+            user_id: "0xuser",
+            run_id: "thread-1",
+            metadata: { layer: "graph", factType: "preference" },
             created_at: new Date().toISOString(),
         };
 
         expect(item.id).toBe("m1");
+        expect(item.memory).toContain("azure");
     });
 
-    it("should export GraphMemoryResult type correctly", () => {
+    it("should export GraphMemoryResult shape correctly", () => {
         const result: GraphMemoryResult = {
-            memories: [{ id: "m1", memory: "Test" }],
-            entities: [{ name: "Entity", type: "test" }],
-            relations: [{ source: "A", target: "B", relation: "related" }],
+            memories: [{ id: "m1", memory: "User likes jazz." }],
+            relations: [{ source: "user", target: "jazz", relation: "likes" }],
         };
 
         expect(result.memories).toHaveLength(1);
-        expect(result.entities).toHaveLength(1);
+        expect(result.memories[0].memory).toBe("User likes jazz.");
     });
 });

@@ -55,7 +55,11 @@ function buildVectorFilter(params: {
     haiId?: string;
     filters?: Record<string, unknown>;
 }): Record<string, unknown> {
-    return buildScopedMemoryFilter(params, { activeOnly: true });
+    // Vectors are a DURABLE, cross-thread layer scoped by (agentWallet, userAddress).
+    // We deliberately drop threadId from the filter so a fact stored in turn N of
+    // thread A can be recalled in turn N+1 of thread B for the same user. Thread
+    // scoping for short-term recall lives in the working+scene layers, not here.
+    return buildScopedMemoryFilter(params, { durable: true, activeOnly: true });
 }
 
 function buildAtlasVectorPrefilter(filter: Record<string, unknown>): Record<string, unknown> | undefined {

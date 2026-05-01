@@ -8,6 +8,18 @@ import {
 
 const CLOUDFLARE_RERANK_MODEL_ID = process.env.MEMORY_RERANK_MODEL_ID || "@cf/baai/bge-reranker-base";
 const RERANK_TIMEOUT_MS = Number(process.env.MEMORY_RERANK_TIMEOUT_MS || 3000);
+/**
+ * Skip the cross-encoder reranker entirely when the bi-encoder ordering is
+ * already decisive. If `score(top1) - score(top2) >= RERANK_DOMINANCE_DELTA`
+ * the top result is unambiguous; calling the reranker would burn ~120ms +
+ * a Cloudflare AI call without changing the order. Tuned conservatively at
+ * 0.05 cosine on bge-large-1024d.
+ */
+const RERANK_DOMINANCE_DELTA = Number.parseFloat(process.env.MEMORY_RERANK_DOMINANCE_DELTA || "0.05");
+/**
+ * Minimum candidate set for reranking. Below this we just trust the bi-encoder.
+ */
+const RERANK_MIN_CANDIDATES = Math.max(2, Number.parseInt(process.env.MEMORY_RERANK_MIN_CANDIDATES || "3", 10));
 
 interface CloudflareRerankResponse {
     success?: boolean;
@@ -142,20 +154,36 @@ export async function applyVectorRanking(params: {
     }
 
     if (params.options?.rerank ?? true) {
-        // Fail-soft: a rerank outage MUST NOT break agent memory retrieval.
-        // If Cloudflare is down, missing creds, or returns empty scores, we
-        // log + fall through to the decayed ordering.
-        try {
-            const reranked = await rerankDocuments({
-                query: params.query,
-                documents: ranked.map((item) => ({ content: item.content, score: item.score })),
-                topK: ranked.length,
-            });
+        // Skip reranker when the bi-encoder ordering is already decisive: we save
+        // ~120ms + one Cloudflare AI call without changing the result. Two skip
+        // conditions:
+        //   1. Fewer than RERANK_MIN_CANDIDATES — not enough to reorder meaningfully.
+        //   2. Top-1 score dominates top-2 by >= RERANK_DOMINANCE_DELTA.
+        const sorted = [...ranked].sort((a, b) => b.score - a.score);
+        const top1 = sorted[0]?.score ?? 0;
+        const top2 = sorted[1]?.score ?? 0;
+        const dominant = sorted.length >= 2 && (top1 - top2) >= RERANK_DOMINANCE_DELTA;
+        const enoughCandidates = sorted.length >= RERANK_MIN_CANDIDATES;
+        const shouldRerank = enoughCandidates && !dominant;
 
-            const byContent = new Map(reranked.map((item) => [item.content, item.score]));
-            ranked = ranked.map((item) => ({ ...item, score: byContent.get(item.content) ?? item.score }));
-        } catch (error) {
-            console.warn(`[memory:rerank] rerank failed, falling back to decayed ordering: ${error instanceof Error ? error.message : String(error)}`);
+        if (shouldRerank) {
+            // Fail-soft: a rerank outage MUST NOT break agent memory retrieval.
+            // If Cloudflare is down, missing creds, or returns empty scores, we
+            // log + fall through to the decayed ordering.
+            try {
+                const reranked = await rerankDocuments({
+                    query: params.query,
+                    documents: ranked.map((item) => ({ content: item.content, score: item.score })),
+                    topK: ranked.length,
+                });
+
+                const byContent = new Map(reranked.map((item) => [item.content, item.score]));
+                ranked = ranked.map((item) => ({ ...item, score: byContent.get(item.content) ?? item.score }));
+            } catch (error) {
+                console.warn(`[memory:rerank] rerank failed, falling back to decayed ordering: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        } else {
+            console.log(`[memory:rerank] skip reason=${dominant ? "top1-dominates" : "few-candidates"} top1=${top1.toFixed(3)} top2=${top2.toFixed(3)} candidates=${sorted.length}`);
         }
     }
 

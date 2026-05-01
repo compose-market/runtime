@@ -144,7 +144,6 @@ export {
     getRelevantContext,
     recordConversationTurn,
     type EmbeddingResult,
-    type StoredEmbedding,
 } from "./embeddings.js";
 
 // Delegation

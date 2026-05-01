@@ -1,4 +1,4 @@
-import { addMemory } from "./mem0.js";
+import { indexAgentMemoryFacts } from "./graph.js";
 import {
     DEFAULT_AGENT_MEMORY_LAYERS,
     extractLayeredMemoryItems,
@@ -237,29 +237,6 @@ function buildCompactTurnSummary(messages: SessionTranscript["messages"]): strin
         .slice(0, 1_800);
 }
 
-function buildGraphTurnMessages(messages: SessionTranscript["messages"]): Array<{ role: string; content: string }> {
-    const conversational = messages
-        .filter((message) => message.role === "user" || message.role === "assistant")
-        .slice(-6)
-        .map((message) => ({
-            role: message.role,
-            content: message.content.replace(/\s+/g, " ").trim().slice(0, 1_200),
-        }))
-        .filter((message) => message.content.length > 0);
-
-    if (conversational.length >= 2) {
-        return conversational;
-    }
-
-    const summary = buildCompactTurnSummary(messages);
-    return summary
-        ? [
-            { role: "user", content: `Remember the useful durable facts from this agent turn:\n${summary}` },
-            { role: "assistant", content: "I will retain the stable facts and ignore transient execution noise." },
-        ]
-        : [];
-}
-
 function buildRecordSessionId(scope: AgentMemoryScope, explicitSessionId?: string): string {
     if (explicitSessionId) {
         return explicitSessionId;
@@ -416,7 +393,6 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
         },
     });
 
-    const graphMessages = buildGraphTurnMessages(messages);
     const [vectorResult, graphResult, sessionResult] = await Promise.allSettled([
         indexMemoryContent({
             content: turnContent,
@@ -428,18 +404,20 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
             source: "session",
             metadata,
         }),
-        graphMessages.length > 0 ? addMemory({
-            messages: graphMessages,
-            agent_id: scope.agentWallet,
-            user_id: scope.userAddress,
-            run_id: threadId,
+        // First-party graph layer: extract durable facts via gemini-3.1-flash-lite-preview
+        // and index them as source:"fact" vectors. Replaces the old mem0 cloud round-trip.
+        indexAgentMemoryFacts({
+            agentWallet: scope.agentWallet,
+            userAddress: scope.userAddress,
+            threadId,
             mode: scope.mode,
             haiId: scope.haiId,
+            messages,
             metadata: {
                 ...metadata,
                 type: "agent_memory_turn_graph",
             },
-        }) : Promise.resolve([]),
+        }),
         rememberSessionMessages({
             sessionId: buildThreadSessionId({ ...scope, threadId }),
             threadId,
@@ -473,7 +451,8 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
             transcript: true,
             working: sessionResult.status === "fulfilled",
             vector: vectorResult.status === "fulfilled" && Boolean(vectorResult.value.vectorId),
-            graph: graphResult.status === "fulfilled" && graphResult.value.length > 0,
+            graph: graphResult.status === "fulfilled"
+                && (graphResult.value.factsIndexed > 0 || graphResult.value.factsBumped > 0),
         },
     };
 }
@@ -485,45 +464,42 @@ export async function rememberAgentMemory(input: unknown): Promise<AgentMemoryRe
     if (!content) {
         throw new AgentMemoryInputError("content is required");
     }
-
+    const factHash = createContentHash(`${scope.agentWallet}|${(scope.userAddress || "_").toLowerCase()}|${content.toLowerCase().trim()}`);
+    const VALID_FACT_TYPES = new Set(["preference", "identity", "context", "skill", "relationship", "event", "other"]);
+    const requestedType = asString(body.type);
+    const factType = requestedType && VALID_FACT_TYPES.has(requestedType) ? requestedType : "other";
     const metadata = {
-        type: asString(body.type) ?? "explicit_save",
+        type: requestedType ?? "explicit_save",
         source: "agent_loop",
+        layer: "graph",
+        factHash,
+        factType,
         retention: asString(body.retention),
         scope: asString(body.scope),
         conflictPolicy: asString(body.conflictPolicy) ?? asString(body.conflict_policy),
-        confidence: asNumber(body.confidence),
+        confidence: asNumber(body.confidence) ?? 1,
+        extractor: "explicit",
         ...scope.metadata,
         ...asObject(body.metadata),
     };
 
-    const [graphResult, vectorResult] = await Promise.allSettled([
-        addMemory({
-            messages: [
-                { role: "user", content: `Remember this durable fact for future agent turns: ${content}` },
-                { role: "assistant", content: "Stored. I will use this fact only when it is relevant." },
-            ],
-            agent_id: scope.agentWallet,
-            user_id: scope.userAddress,
-            run_id: scope.threadId,
-            mode: scope.mode,
-            haiId: scope.haiId,
-            metadata,
-        }),
-        indexMemoryContent({
-            content,
-            agentWallet: scope.agentWallet,
-            userAddress: scope.userAddress,
-            threadId: scope.threadId,
-            mode: scope.mode,
-            haiId: scope.haiId,
-            source: "fact",
-            metadata,
-        }),
-    ]);
+    // Explicit user-saved fact: no LLM extraction needed. Index directly as
+    // source:"fact" so the graph layer surfaces it, and the cross-layer ranker
+    // treats it like any other graph row via summary.ts:summarizeLayerItem.
+    const vectorResult = await indexMemoryContent({
+        content,
+        agentWallet: scope.agentWallet,
+        userAddress: scope.userAddress,
+        threadId: scope.threadId,
+        mode: scope.mode,
+        haiId: scope.haiId,
+        source: "fact",
+        metadata,
+    }).then((value) => ({ status: "fulfilled" as const, value }))
+        .catch((reason) => ({ status: "rejected" as const, reason }));
 
-    const graphSaved = graphResult.status === "fulfilled" && graphResult.value.length > 0;
-    const vectorSaved = vectorResult.status === "fulfilled" && vectorResult.value.success;
+    const graphSaved = vectorResult.status === "fulfilled" && Boolean(vectorResult.value?.success);
+    const vectorSaved = graphSaved;
 
     return {
         workflow: {

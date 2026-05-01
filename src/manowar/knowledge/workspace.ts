@@ -1,10 +1,8 @@
 import {
-  addKnowledge,
   getEmbedding,
   getMemoryVectorsCollection,
   indexMemoryContent,
   indexVector,
-  searchMemory,
 } from "../memory/index.js";
 
 export type WorkspaceDocument = {
@@ -18,7 +16,7 @@ export type WorkspaceDocument = {
 export type KnowledgeSearchResult = {
   content: string;
   score: number;
-  scope: "identity" | "workspace";
+  scope: "genesis" | "workspace";
 };
 
 export function normalizeWorkspaceDocuments(input: unknown): WorkspaceDocument[] {
@@ -62,14 +60,6 @@ function dedupeWorkspaceResults(results: KnowledgeSearchResult[], limit: number)
   return deduped;
 }
 
-function normalizeWorkspaceGraphResults(items: Array<{ memory: string }>): KnowledgeSearchResult[] {
-  return items.map((item, index) => ({
-    content: item.memory,
-    score: Math.max(0.2, 0.68 - index * 0.04),
-    scope: "workspace",
-  }));
-}
-
 export async function indexWorkspaceDocuments(params: {
   agentWallet: string;
   userAddress: string;
@@ -80,16 +70,9 @@ export async function indexWorkspaceDocuments(params: {
       ...(document.metadata || {}),
       scope: "workspace",
       type: "knowledge",
-    };
-
-    await addKnowledge({
-      content: document.content,
-      agent_id: params.agentWallet,
-      user_id: params.userAddress,
       key: document.key,
-      source: document.source || "file",
-      metadata,
-    });
+      sourceFormat: document.source || "file",
+    };
 
     if (Array.isArray(document.embedding) && document.embedding.length > 0) {
       await indexVector({
@@ -206,22 +189,10 @@ export async function searchWorkspaceDocuments(params: {
   userAddress: string;
   limit: number;
 }): Promise<KnowledgeSearchResult[]> {
-  const [graphResults, vectorResults] = await Promise.all([
-    searchMemory({
-      query: params.query,
-      agent_id: params.agentWallet,
-      user_id: params.userAddress,
-      limit: params.limit,
-      filters: {
-        type: "knowledge",
-        scope: "workspace",
-      },
-    }),
-    searchWorkspaceVectors(params),
-  ]);
-
-  return dedupeWorkspaceResults([
-    ...normalizeWorkspaceGraphResults(graphResults),
-    ...vectorResults,
-  ], params.limit);
+  // Workspace knowledge lives entirely in the vector layer (source:"knowledge",
+  // metadata.scope:"workspace"). Mongo Atlas $vectorSearch covers semantic +
+  // keyword fallback in `searchWorkspaceVectors`. The cross-layer ranker
+  // handles ordering when this is composed with other layers.
+  const vectorResults = await searchWorkspaceVectors(params);
+  return dedupeWorkspaceResults(vectorResults, params.limit);
 }

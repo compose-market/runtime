@@ -12,7 +12,7 @@ import { getAgentExecutionContext, runWithAgentExecutionContext } from "./agent/
 import { persistAgentConversationTurn, retrieveAgentMemory } from "./agent/memory.js";
 import { resolveMemoryScope } from "./agent/memory-scope.js";
 import { peekAgentIdentity, renderIdentitySection, resolveAgentIdentity, type AgentIdentity } from "./agent/identity.js";
-import { ensureIdentityKnowledge } from "./knowledge/identity.js";
+import { ensureGenesisKnowledge } from "./knowledge/genesis.js";
 import {
   buildApiInternalHeaders,
   requireApiInternalToken,
@@ -154,8 +154,8 @@ export interface ManagedAgentExecutionResult {
   skillsRevision: string;
 }
 
-export interface AgentResponsesRequest extends Record<string, unknown> {}
-export interface AgentResponsesResult extends Record<string, unknown> {}
+export interface AgentResponsesRequest extends Record<string, unknown> { }
+export interface AgentResponsesResult extends Record<string, unknown> { }
 
 const agents = new Map<string, AgentInstance>();
 const workers = new Map<string, CloudAgentWorker>();
@@ -350,14 +350,14 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   };
   agents.set(id, instance);
 
-  // Fire-and-forget warmups: hydrate IPFS identity + index identity knowledge.
+  // Fire-and-forget warmups: hydrate IPFS identity + index genesis knowledge.
   // First turn doesn't block on these; subsequent turns benefit.
   void resolveAgentIdentity(config.agentWallet).catch((err) => {
     console.warn(`[manowar] Identity hydration failed for ${config.agentWallet}:`, err instanceof Error ? err.message : err);
   });
   if (config.memory !== false) {
-    void ensureIdentityKnowledge(config.agentWallet).catch((err) => {
-      console.warn(`[manowar] Identity knowledge index failed for ${config.agentWallet}:`, err instanceof Error ? err.message : err);
+    void ensureGenesisKnowledge(config.agentWallet).catch((err) => {
+      console.warn(`[manowar] Genesis knowledge index failed for ${config.agentWallet}:`, err instanceof Error ? err.message : err);
     });
   }
 
@@ -707,12 +707,12 @@ function extractStreamToolCalls(value: unknown): Array<{ id: string; name: strin
       const fn = call ? asRecord(call.function) : null;
       const name = call
         ? readRecordString(call, "name")
-          ?? (fn ? readRecordString(fn, "name") : undefined)
+        ?? (fn ? readRecordString(fn, "name") : undefined)
         : undefined;
       if (!name) return;
       const id = call
         ? readRecordString(call, "id", "tool_call_id")
-          ?? `${name}:${index}`
+        ?? `${name}:${index}`
         : `${name}:${index}`;
       const args = call
         ? call.args ?? call.arguments ?? (fn ? parseToolArgs(fn.arguments) : undefined)
@@ -939,17 +939,20 @@ async function executeAgentCore(
       result,
       trackedMetrics
         ? {
-            inputTokens: trackedMetrics.inputTokens,
-            outputTokens: trackedMetrics.outputTokens,
-            reasoningTokens: 0,
-            totalTokens: trackedMetrics.totalTokens,
-          }
+          inputTokens: trackedMetrics.inputTokens,
+          outputTokens: trackedMetrics.outputTokens,
+          reasoningTokens: 0,
+          totalTokens: trackedMetrics.totalTokens,
+        }
         : null,
     );
     const output = resolveMessageText(lastMessage);
 
     if (agent.config.memory !== false) {
-      await persistConversationTurnSafely({
+      // Fire-and-forget: post-turn persistence (transcript + working +
+      // vector + graph fact extraction) must NEVER block the agent response.
+      // Errors are logged inside persistConversationTurnSafely.
+      void persistConversationTurnSafely({
         agentWallet,
         threadId,
         options,
@@ -1150,11 +1153,11 @@ async function* streamAgentCore(
         lastUsageCandidate ?? { messages: [] },
         trackedMetrics
           ? {
-              inputTokens: trackedMetrics.inputTokens,
-              outputTokens: trackedMetrics.outputTokens,
-              reasoningTokens: 0,
-              totalTokens: trackedMetrics.totalTokens,
-            }
+            inputTokens: trackedMetrics.inputTokens,
+            outputTokens: trackedMetrics.outputTokens,
+            reasoningTokens: 0,
+            totalTokens: trackedMetrics.totalTokens,
+          }
           : null,
       );
       usageTotals.promptTokens = authoritativeTokens.inputTokens;

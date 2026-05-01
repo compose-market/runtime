@@ -348,12 +348,12 @@ export function createKnowledgeTools(input: {
             description: "Search the agent identity knowledge from the creator and, when a user is present, the private workspace knowledge for this specific user-agent pair. This does not inject documents by default; use it only when you need reference material.",
             schema: z.object({
                 query: z.string().min(1).describe("Knowledge question or retrieval query"),
-                scope: z.enum(["identity", "workspace", "all"]).optional().describe("Limit search to creator identity knowledge, private workspace knowledge, or both"),
+                scope: z.enum(["genesis", "workspace", "all"]).optional().describe("Limit search to creator-baked genesis knowledge, private workspace knowledge, or both"),
                 limit: z.number().int().min(1).max(8).optional().describe("Maximum number of knowledge hits to return"),
             }),
             func: async ({ query, scope, limit }: {
                 query: string;
-                scope?: "identity" | "workspace" | "all";
+                scope?: "genesis" | "workspace" | "all";
                 limit?: number;
             }) => {
                 const results = await searchKnowledge({
@@ -1135,6 +1135,14 @@ function createBackpackTools(input: {
 // Memory / Built-in Tools
 // =============================================================================
 
+/**
+ * Compose memory tools — minimal 0-fuck-ups surface.
+ *
+ * Two tools, one each for recall and remember. The cross-layer ranker behind
+ * `memory_recall` automatically considers all 6 layers (working, scene,
+ * graph, patterns, archives, vectors) and shortlists the top items into a
+ * <900-char prompt block. Agents do NOT pick layers; the framework does.
+ */
 export function createMemoryTools(agentWallet: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
     function resolveToolText(value: string | undefined, field: "content" | "query"): string {
         const trimmed = value?.trim();
@@ -1147,16 +1155,16 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
             return fallback;
         }
 
-        throw new Error(`Runtime memory tool requires ${field} or lastUserMessage`);
+        throw new Error(`memory tool requires ${field} (or a non-empty user message in scope)`);
     }
 
-    const searchKnowledge = new DynamicStructuredTool({
-        name: "search_memory",
-        description: "Search the full runtime memory stack for past interactions or learned facts across working memory, transcripts, vectors, graph memory, patterns, and archives.",
+    const memoryRecall = new DynamicStructuredTool({
+        name: "memory_recall",
+        description: "Recall what you remember about the user. Searches all 6 memory layers (working, scene, graph, patterns, archives, vectors) in parallel and returns the top-ranked durable facts and recent context. Use this whenever the user asks 'what do you remember', 'do you know', 'who am I', or anything that benefits from prior conversational context.",
         schema: z.object({
-            query: z.string().optional().describe("Search query. Always pass the user recall request here; if omitted, the runtime falls back to the latest user message."),
+            query: z.string().describe("What you want to recall. Free-form natural language; the framework handles ranking across layers."),
         }),
-        func: async ({ query }: { query?: string }) => {
+        func: async ({ query }: { query: string }) => {
             try {
                 const effectiveQuery = resolveToolText(query, "query");
                 const scope = resolveMemoryScope({
@@ -1170,21 +1178,20 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
                     scope,
                     limit: 8,
                 });
-                if (!summary) return "No relevant memories found.";
-                return summary;
+                return summary || "No relevant memories found.";
             } catch (error) {
                 return `Runtime memory unavailable: ${error instanceof Error ? error.message : String(error)}`;
             }
         },
     });
 
-    const storeKnowledge = new DynamicStructuredTool({
-        name: "save_memory",
-        description: "Explicitly save an important fact or user preference to your long-term memory. Entities and relations are automatically extracted.",
+    const memoryRemember = new DynamicStructuredTool({
+        name: "memory_remember",
+        description: "Save a durable fact, preference, or rule about the user. Use when the user volunteers stable information ('my name is X', 'I work at Y', 'I prefer Z'). Stored as a graph-layer fact and surfaced automatically on future turns.",
         schema: z.object({
-            content: z.string().optional().describe("Fact to remember. Always pass the durable fact here; if omitted, the runtime falls back to the latest user message."),
+            content: z.string().describe("The durable fact in plain language. One fact per call; keep it under 200 characters."),
         }),
-        func: async ({ content }: { content?: string }) => {
+        func: async ({ content }: { content: string }) => {
             const effectiveContent = resolveToolText(content, "content");
             const scope = resolveMemoryScope({
                 agentWallet,
@@ -1199,49 +1206,9 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
                     workflow_wallet: workflowWallet,
                 },
             });
-            if (!saved) return "Failed to save memory.";
-            return "Memory saved.";
+            return saved ? "Memory saved." : "Failed to save memory.";
         },
     });
 
-    const hybridSearch = new DynamicStructuredTool({
-        name: "search_all_memory",
-        description: "Hybrid search across all runtime memory layers including working, scene, graph, patterns, archives, and vectors.",
-        schema: z.object({
-            query: z.string().optional().describe("Search query. Always pass the user recall request here; if omitted, the runtime falls back to the latest user message."),
-            layers: z.array(z.enum(["working", "scene", "graph", "patterns", "archives", "vectors"])).optional(),
-        }),
-        func: async ({ query, layers }: { query?: string; layers?: string[] }) => {
-            try {
-                const effectiveQuery = resolveToolText(query, "query");
-                const scope = resolveMemoryScope({
-                    agentWallet,
-                    userAddress,
-                    workflowWallet,
-                    context: getAgentExecutionContext(),
-                });
-                const results = await searchMemoryLayers({
-                    query: effectiveQuery,
-                    agentWallet: scope.agentWallet,
-                    userAddress: scope.userId,
-                    threadId: scope.threadId,
-                    mode: scope.mode,
-                    haiId: scope.haiId,
-                    filters: scope.filters,
-                    layers: (layers as Array<"working" | "scene" | "graph" | "patterns" | "archives" | "vectors"> | undefined) || [...DEFAULT_AGENT_MEMORY_LAYERS],
-                    limit: 5,
-                });
-                return formatToolResultForAgent(results);
-            } catch (error) {
-                return JSON.stringify({
-                    query: query || getAgentExecutionContext()?.lastUserMessage || "",
-                    layers: {},
-                    totals: {},
-                    error: error instanceof Error ? error.message : String(error),
-                });
-            }
-        },
-    });
-
-    return [searchKnowledge, storeKnowledge, hybridSearch];
+    return [memoryRecall, memoryRemember];
 }

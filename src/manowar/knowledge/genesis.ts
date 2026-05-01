@@ -1,10 +1,8 @@
 import { buildPinataGatewayIpfsUrl } from "../../auth.js";
 import {
-  addKnowledge,
   getEmbedding,
   getMemoryVectorsCollection,
   indexMemoryContent,
-  searchMemory,
 } from "../memory/index.js";
 import { resolveAgent } from "../runtime.js";
 import type { KnowledgeSearchResult } from "./workspace.js";
@@ -13,7 +11,7 @@ type AgentCardKnowledge = {
   knowledge?: string[];
 };
 
-const identityWarmups = new Map<string, Promise<void>>();
+const genesisWarmups = new Map<string, Promise<void>>();
 
 function toCid(uri: string): string {
   return uri.replace(/^ipfs:\/\//i, "").replace(/^\/+/, "").split("/")[0] || uri;
@@ -92,7 +90,7 @@ async function extractDocumentText(response: Response, uri: string): Promise<str
   return response.text();
 }
 
-async function resolveIdentityUris(agentWallet: string): Promise<string[]> {
+async function resolveGenesisUris(agentWallet: string): Promise<string[]> {
   const agent = resolveAgent(agentWallet);
   const agentCardUri = agent?.agentCardUri;
   if (!agentCardUri?.startsWith("ipfs://")) {
@@ -101,7 +99,7 @@ async function resolveIdentityUris(agentWallet: string): Promise<string[]> {
 
   const response = await fetch(buildPinataGatewayIpfsUrl(toCid(agentCardUri)));
   if (!response.ok) {
-    throw new Error(`Failed to fetch agent card for identity knowledge (${response.status})`);
+    throw new Error(`Failed to fetch agent card for genesis knowledge (${response.status})`);
   }
 
   const card = await response.json() as AgentCardKnowledge;
@@ -110,12 +108,12 @@ async function resolveIdentityUris(agentWallet: string): Promise<string[]> {
     : [];
 }
 
-async function isIdentityIndexed(agentWallet: string, cid: string): Promise<boolean> {
+async function isGenesisIndexed(agentWallet: string, cid: string): Promise<boolean> {
   const vectors = await getMemoryVectorsCollection();
   const existing = await vectors.findOne({
     agentWallet,
     source: "knowledge",
-    "metadata.scope": "identity",
+    "metadata.scope": "genesis",
     "metadata.cid": cid,
   }, {
     projection: { _id: 1 },
@@ -123,15 +121,15 @@ async function isIdentityIndexed(agentWallet: string, cid: string): Promise<bool
   return Boolean(existing);
 }
 
-async function indexIdentityUri(agentWallet: string, uri: string): Promise<void> {
+async function indexGenesisUri(agentWallet: string, uri: string): Promise<void> {
   const cid = toCid(uri);
-  if (!cid || await isIdentityIndexed(agentWallet, cid)) {
+  if (!cid || await isGenesisIndexed(agentWallet, cid)) {
     return;
   }
 
   const response = await fetch(buildPinataGatewayIpfsUrl(cid));
   if (!response.ok) {
-    throw new Error(`Failed to fetch identity document ${cid} (${response.status})`);
+    throw new Error(`Failed to fetch genesis document ${cid} (${response.status})`);
   }
 
   const text = (await extractDocumentText(response, uri)).trim();
@@ -142,21 +140,12 @@ async function indexIdentityUri(agentWallet: string, uri: string): Promise<void>
   const chunks = chunkText(text);
   await Promise.all(chunks.map(async (chunk, index) => {
     const metadata = {
-      scope: "identity",
+      scope: "genesis",
       type: "knowledge",
       cid,
       uri,
       chunk: index + 1,
     };
-    const key = `${cid}#${index + 1}`;
-
-    await addKnowledge({
-      content: chunk,
-      agent_id: agentWallet,
-      key,
-      source: "file",
-      metadata,
-    });
 
     await indexMemoryContent({
       agentWallet,
@@ -167,26 +156,26 @@ async function indexIdentityUri(agentWallet: string, uri: string): Promise<void>
   }));
 }
 
-export async function ensureIdentityKnowledge(agentWallet: string): Promise<void> {
-  const existing = identityWarmups.get(agentWallet);
+export async function ensureGenesisKnowledge(agentWallet: string): Promise<void> {
+  const existing = genesisWarmups.get(agentWallet);
   if (existing) {
     return existing;
   }
 
   const warmup = (async () => {
-    const uris = await resolveIdentityUris(agentWallet);
+    const uris = await resolveGenesisUris(agentWallet);
     for (const uri of uris) {
-      await indexIdentityUri(agentWallet, uri);
+      await indexGenesisUri(agentWallet, uri);
     }
   })().finally(() => {
-    identityWarmups.delete(agentWallet);
+    genesisWarmups.delete(agentWallet);
   });
 
-  identityWarmups.set(agentWallet, warmup);
+  genesisWarmups.set(agentWallet, warmup);
   return warmup;
 }
 
-function dedupeIdentityResults(results: KnowledgeSearchResult[], limit: number): KnowledgeSearchResult[] {
+function dedupeGenesisResults(results: KnowledgeSearchResult[], limit: number): KnowledgeSearchResult[] {
   const seen = new Set<string>();
   const deduped: KnowledgeSearchResult[] = [];
 
@@ -205,7 +194,7 @@ function dedupeIdentityResults(results: KnowledgeSearchResult[], limit: number):
   return deduped;
 }
 
-async function searchIdentityVectors(params: {
+async function searchGenesisVectors(params: {
   query: string;
   agentWallet: string;
   limit: number;
@@ -229,7 +218,7 @@ async function searchIdentityVectors(params: {
           filter: {
             agentWallet: params.agentWallet,
             source: "knowledge",
-            "metadata.scope": "identity",
+            "metadata.scope": "genesis",
           },
         },
       },
@@ -250,16 +239,16 @@ async function searchIdentityVectors(params: {
     return rawResults.slice(0, params.limit).map((item) => ({
       content: item.content,
       score: item.rawScore,
-      scope: "identity",
+      scope: "genesis",
     }));
   } catch (error) {
-    console.warn("[knowledge:identity] vector search unavailable, falling back to keyword search", error);
+    console.warn("[knowledge:genesis] vector search unavailable, falling back to keyword search", error);
     const terms = params.query.toLowerCase().split(/\s+/).filter(Boolean);
     const docs = await vectors
       .find({
         agentWallet: params.agentWallet,
         source: "knowledge",
-        "metadata.scope": "identity",
+        "metadata.scope": "genesis",
       })
       .sort({ createdAt: -1 })
       .limit(candidateLimit)
@@ -273,7 +262,7 @@ async function searchIdentityVectors(params: {
         return {
           content: item.content,
           score: keywordScore * 0.7 + (item.decayScore || 1) * 0.3,
-          scope: "identity" as const,
+          scope: "genesis" as const,
         };
       })
       .filter((item) => item.score > 0)
@@ -282,34 +271,16 @@ async function searchIdentityVectors(params: {
   }
 }
 
-export async function searchIdentityKnowledge(params: {
+export async function searchGenesisKnowledge(params: {
   query: string;
   agentWallet: string;
   limit: number;
 }): Promise<KnowledgeSearchResult[]> {
-  await ensureIdentityKnowledge(params.agentWallet);
+  await ensureGenesisKnowledge(params.agentWallet);
 
-  const [graphResults, vectorResults] = await Promise.all([
-    searchMemory({
-      query: params.query,
-      agent_id: params.agentWallet,
-      limit: params.limit,
-      filters: {
-        type: "knowledge",
-        scope: "identity",
-      },
-    }),
-    searchIdentityVectors(params),
-  ]);
-
-  const normalizedGraphResults = graphResults.map((item, index) => ({
-    content: item.memory,
-    score: Math.max(0.2, 0.68 - index * 0.04),
-    scope: "identity" as const,
-  }));
-
-  return dedupeIdentityResults([
-    ...normalizedGraphResults,
-    ...vectorResults,
-  ], params.limit);
+  // Genesis knowledge lives entirely in the vector layer (source:"knowledge").
+  // The cross-layer ranker handles ordering when this is composed with other
+  // layers; here we just return the vector search results directly.
+  const vectorResults = await searchGenesisVectors(params);
+  return dedupeGenesisResults(vectorResults, params.limit);
 }

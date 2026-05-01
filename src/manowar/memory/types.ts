@@ -1,9 +1,14 @@
 import type { IndexDirection, ObjectId } from "mongodb";
 
 // =============================================================================
-// Mem0 Domain
+// Graph Layer Domain (first-party fact storage; replaces mem0)
 // =============================================================================
 
+/**
+ * Lightweight item shape returned by the `graph` layer in the cross-layer
+ * ranker. The `memory` field carries the distilled fact text — the ranker's
+ * `summarizeLayerItem("graph", ...)` reads it directly.
+ */
 export interface MemoryItem {
     id: string;
     memory: string;
@@ -13,61 +18,6 @@ export interface MemoryItem {
     metadata?: Record<string, unknown>;
     created_at?: string;
     updated_at?: string;
-    relations?: Array<{ source: string; target: string; relation: string }>;
-}
-
-export interface FilterCondition {
-    key: string;
-    value: string | number | boolean;
-    operator?: "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "contains" | "icontains";
-}
-
-export interface V2Filters {
-    AND?: FilterCondition[];
-    OR?: FilterCondition[];
-    NOT?: FilterCondition[];
-}
-
-export interface MemorySearchParams {
-    query: string;
-    user_id?: string;
-    agent_id?: string;
-    run_id?: string;
-    mode?: "global" | "local";
-    haiId?: string;
-    /**
-     * Provider-specific scoped filters. For Mem0 v3 these are merged into the
-     * `filters` object alongside the entity IDs. Our framework's CF rerank /
-     * decay / MMR / top_k live on the Atlas vector layer (see ./ranking.ts
-     * and ./vector.ts) — Mem0 owns its own retrieval defaults (top_k=10,
-     * threshold=0.1, hybrid retrieval always on) and we do NOT thread them
-     * through this type.
-     */
-    filters?: Record<string, unknown>;
-    /**
-     * Reserved for potential future de-coupling from Mem0; not wired today.
-     * Mem0 v3 has built-in top_k (default 10) and we let it own that.
-     */
-    limit?: number;
-}
-
-export interface MemoryAddParams {
-    messages: Array<{ role: string; content: string }>;
-    user_id?: string;
-    agent_id?: string;
-    run_id?: string;
-    mode?: "global" | "local";
-    haiId?: string;
-    metadata?: Record<string, unknown>;
-}
-
-export interface KnowledgeAddParams {
-    content: string;
-    agent_id: string;
-    user_id?: string;
-    key?: string;
-    source?: "file" | "url" | "paste";
-    metadata?: Record<string, unknown>;
 }
 
 // =============================================================================
@@ -76,7 +26,7 @@ export interface KnowledgeAddParams {
 
 export interface EmbeddingResult {
     embedding: number[];
-    provider: "voyage" | "cloudflare";
+    provider: "voyage";
     cached: boolean;
     dimensions: number;
 }

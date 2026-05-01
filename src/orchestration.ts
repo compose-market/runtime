@@ -41,7 +41,6 @@ import {
 } from "./manowar/runtime.js";
 import type { WorkflowStep, TriggerDefinition } from "./manowar/workflow/types.js";
 import {
-    addMemory as addGraphMemory,
     AgentMemoryInputError,
     assembleAgentMemoryContext,
     cleanupExpiredMemories,
@@ -51,7 +50,6 @@ import {
     deleteMemoryItem,
     extractExecutionPatterns,
     getEmbedding,
-    getAllMemories,
     getLearnedSkill,
     getMemoryItem,
     getMemoryVectorsCollection,
@@ -63,6 +61,7 @@ import {
     getTranscriptByThreadId,
     getWorkingSessionMemory,
     hybridVectorSearch,
+    indexAgentMemoryFacts,
     indexSessionTranscript,
     indexMemoryContent,
     indexVector,
@@ -77,7 +76,7 @@ import {
     resolveMemoryConflict,
     runMemoryEval,
     runAgentMemoryLoop,
-    searchMemory as searchGraphMemory,
+    searchAgentMemoryFacts,
     searchMemoryLayers,
     searchVectors,
     storeTranscript,
@@ -670,13 +669,24 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
                 throw new AgentMemoryInputError("messages is required");
             }
             const scope = normalizeAgentMemoryScope(req.body || {});
-            return addGraphMemory({
-                messages,
-                agent_id: scope.agentWallet,
-                user_id: scope.userAddress,
-                run_id: scope.threadId,
+            type AgentMessageRole = "user" | "assistant" | "system" | "tool";
+            const normalised = (messages as Array<{ role?: string; content?: string }>).map((m, i) => {
+                const role: AgentMessageRole = (m.role === "user" || m.role === "assistant" || m.role === "system" || m.role === "tool")
+                    ? m.role
+                    : "user";
+                return {
+                    role,
+                    content: typeof m.content === "string" ? m.content : "",
+                    timestamp: Date.now() + i,
+                };
+            }).filter((m) => m.content.length > 0);
+            return indexAgentMemoryFacts({
+                agentWallet: scope.agentWallet,
+                userAddress: scope.userAddress,
+                threadId: scope.threadId,
                 mode: scope.mode,
                 haiId: scope.haiId,
+                messages: normalised,
                 metadata: scope.metadata,
             });
         });
@@ -684,19 +694,21 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
 
     app.post("/api/memory/search", asyncHandler(async (req: Request, res: Response) => {
         await sendAgentMemoryJson(res, async () => {
-            const { query } = req.body || {};
+            const { query, limit } = req.body || {};
             if (typeof query !== "string") {
                 throw new AgentMemoryInputError("query is required");
             }
             const scope = normalizeAgentMemoryScope(req.body || {});
-            return searchGraphMemory({
+            return searchAgentMemoryFacts({
                 query,
-                agent_id: scope.agentWallet,
-                user_id: scope.userAddress,
-                run_id: scope.threadId,
+                agentWallet: scope.agentWallet,
+                userAddress: scope.userAddress,
+                threadId: scope.threadId,
                 mode: scope.mode,
                 haiId: scope.haiId,
                 filters: scope.filters,
+                layers: ["graph"],
+                limit: typeof limit === "number" ? limit : 5,
             });
         });
     }));
@@ -704,12 +716,30 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     app.get("/api/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
         const agentWallet = getParam(req.params.agentWallet);
         const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
+        const limitParam = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
 
-        const memories = await getAllMemories({
-            agent_id: agentWallet,
-            user_id: userAddress,
-        });
-
+        const vectors = await getMemoryVectorsCollection();
+        const filter: Record<string, unknown> = {
+            agentWallet,
+            source: "fact",
+        };
+        if (userAddress) filter.userAddress = userAddress;
+        const docs = await vectors
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(Math.max(1, Math.min(200, limitParam ?? 50)))
+            .project({ embedding: 0 })
+            .toArray();
+        const memories = docs.map((doc) => ({
+            id: doc.vectorId,
+            memory: doc.content,
+            agent_id: doc.agentWallet,
+            user_id: doc.userAddress,
+            run_id: doc.threadId,
+            metadata: doc.metadata,
+            created_at: doc.createdAt ? new Date(doc.createdAt).toISOString() : undefined,
+            updated_at: doc.updatedAt ? new Date(doc.updatedAt).toISOString() : undefined,
+        }));
         res.json(memories);
     }));
 
@@ -1417,16 +1447,27 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             return;
         }
 
-        const result = await addGraphMemory({
-            messages,
-            agent_id: agentId,
-            user_id: user,
-            run_id: run,
+        const normalised: Array<{ role: "user" | "assistant" | "system" | "tool"; content: string; timestamp: number }> = (messages as Array<{ role?: string; content?: string }>).map((m, i) => {
+            const role: "user" | "assistant" | "system" | "tool" = (m.role === "user" || m.role === "assistant" || m.role === "system" || m.role === "tool")
+                ? m.role
+                : "user";
+            return {
+                role,
+                content: typeof m.content === "string" ? m.content : "",
+                timestamp: Date.now() + i,
+            };
+        }).filter((m) => m.content.length > 0);
+
+        const result = await indexAgentMemoryFacts({
+            agentWallet: agentId,
+            userAddress: user,
+            threadId: run,
+            messages: normalised,
             metadata: typeof metadata === "object" && metadata ? metadata : undefined,
         });
 
-        console.log(`[Local Memory] Added ${result.length} memories for agent ${agentId}`);
-        res.json({ success: true, count: result.length, memories: result });
+        console.log(`[Local Memory] Indexed ${result.factsIndexed} facts (${result.factsBumped} bumped) for agent ${agentId}`);
+        res.json({ success: true, ...result });
     }));
 
     app.post("/api/local/memory/search", asyncHandler(async (req: Request, res: Response) => {
@@ -1440,11 +1481,12 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             return;
         }
 
-        const memories = await searchGraphMemory({
+        const memories = await searchAgentMemoryFacts({
             query,
-            agent_id: agentId,
-            user_id: user,
-            run_id: run,
+            agentWallet: agentId,
+            userAddress: user,
+            threadId: run,
+            layers: ["graph"],
             limit: typeof limit === "number" ? limit : 10,
         });
 
@@ -1458,11 +1500,30 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
     app.get("/api/local/memory/:agentWallet", asyncHandler(async (req: Request, res: Response) => {
         const agentWallet = getParam(req.params.agentWallet);
         const userAddress = typeof req.query.userAddress === "string" ? req.query.userAddress : undefined;
+        const limitParam = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
 
-        const memories = await getAllMemories({
-            agent_id: agentWallet,
-            user_id: userAddress,
-        });
+        const vectors = await getMemoryVectorsCollection();
+        const filter: Record<string, unknown> = {
+            agentWallet,
+            source: "fact",
+        };
+        if (userAddress) filter.userAddress = userAddress;
+        const docs = await vectors
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(Math.max(1, Math.min(200, limitParam ?? 50)))
+            .project({ embedding: 0 })
+            .toArray();
+        const memories = docs.map((doc) => ({
+            id: doc.vectorId,
+            memory: doc.content,
+            agent_id: doc.agentWallet,
+            user_id: doc.userAddress,
+            run_id: doc.threadId,
+            metadata: doc.metadata,
+            created_at: doc.createdAt ? new Date(doc.createdAt).toISOString() : undefined,
+            updated_at: doc.updatedAt ? new Date(doc.updatedAt).toISOString() : undefined,
+        }));
 
         res.json({
             agentWallet,
@@ -1482,20 +1543,28 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
             return;
         }
 
-        const memories = await getAllMemories({
-            agent_id: agentId,
-            user_id: user,
-            run_id: run,
-        });
+        const vectors = await getMemoryVectorsCollection();
+        const filter: Record<string, unknown> = {
+            agentWallet: agentId,
+            source: "fact",
+        };
+        if (user) filter.userAddress = user;
+        if (run) filter.threadId = run;
+        const docs = await vectors
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(20)
+            .project({ embedding: 0 })
+            .toArray();
 
-        const contextText = memories
+        const contextText = docs
             .slice(0, 10)
-            .map(m => m.memory)
+            .map((doc) => doc.content)
             .join("\n\n");
 
         res.json({
             context: contextText || "No prior context found.",
-            memoryCount: memories.length,
+            memoryCount: docs.length,
         });
     }));
 

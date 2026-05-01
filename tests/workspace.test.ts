@@ -42,10 +42,8 @@ const mcpMock = vi.hoisted(() => ({
 }));
 
 const memoryMock = vi.hoisted(() => ({
-  addKnowledge: vi.fn(async () => []),
   indexMemoryContent: vi.fn(async () => ({ success: true, vectorId: "vec_1" })),
   indexVector: vi.fn(async () => ({ vectorId: "vec_1" })),
-  searchMemory: vi.fn(async () => []),
   getEmbedding: vi.fn(async () => ({
     embedding: [0.1, 0.2],
     provider: "voyage",
@@ -72,10 +70,8 @@ vi.mock("../src/manowar/memory/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/manowar/memory/index.js")>();
   return {
     ...actual,
-    addKnowledge: memoryMock.addKnowledge,
     indexMemoryContent: memoryMock.indexMemoryContent,
     indexVector: memoryMock.indexVector,
-    searchMemory: memoryMock.searchMemory,
     getEmbedding: memoryMock.getEmbedding,
     getMemoryVectorsCollection: memoryMock.getMemoryVectorsCollection,
   };
@@ -105,7 +101,7 @@ describe("workspace routes", () => {
     expect(response.body.error).toContain("active session");
   });
 
-  it("indexes workspace documents against the session user", async () => {
+  it("indexes workspace documents against the session user via vector layer only (no mem0)", async () => {
     const response = await request(app)
       .post("/api/workspace/index")
       .set("x-session-active", "true")
@@ -116,26 +112,19 @@ describe("workspace routes", () => {
       });
 
     expect(response.status).toBe(200);
-    expect(memoryMock.addKnowledge).toHaveBeenCalledWith(expect.objectContaining({
-      agent_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      user_id: "0x1111111111111111111111111111111111111111",
+    expect(memoryMock.indexMemoryContent).toHaveBeenCalledWith(expect.objectContaining({
+      agentWallet: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      userAddress: "0x1111111111111111111111111111111111111111",
+      source: "knowledge",
       metadata: expect.objectContaining({
         scope: "workspace",
         type: "knowledge",
       }),
     }));
-    expect(memoryMock.indexMemoryContent).toHaveBeenCalledWith(expect.objectContaining({
-      agentWallet: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      userAddress: "0x1111111111111111111111111111111111111111",
-      source: "knowledge",
-    }));
     expect(response.body.indexed).toBe(1);
   });
 
-  it("searches workspace documents for the session user", async () => {
-    memoryMock.searchMemory.mockResolvedValueOnce([
-      { memory: "Private workspace note" },
-    ]);
+  it("searches workspace documents via Atlas vector search (no mem0 graph leg)", async () => {
     memoryMock.getMemoryVectorsCollection.mockResolvedValueOnce({
       aggregate: vi.fn(() => ({
         toArray: vi.fn(async () => [
@@ -149,7 +138,7 @@ describe("workspace routes", () => {
           })),
         })),
       })),
-    });
+    } as never);
 
     const response = await request(app)
       .post("/api/workspace/search")
@@ -162,13 +151,8 @@ describe("workspace routes", () => {
       });
 
     expect(response.status).toBe(200);
-    expect(memoryMock.searchMemory).toHaveBeenCalledWith(expect.objectContaining({
-      agent_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      user_id: "0x1111111111111111111111111111111111111111",
-    }));
     expect(response.body.results).toEqual([
       { content: "Vector workspace note", score: 0.91, scope: "workspace" },
-      { content: "Private workspace note", score: 0.68, scope: "workspace" },
     ]);
   });
 });

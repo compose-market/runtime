@@ -1,8 +1,5 @@
 export type {
     MemoryItem,
-    MemorySearchParams,
-    MemoryAddParams,
-    KnowledgeAddParams,
     EmbeddingResult,
     SearchResult,
     HybridSearchParams,
@@ -57,11 +54,9 @@ export {
 } from "./mongo.js";
 
 export {
-    addMemory,
-    addKnowledge,
-    searchMemory,
-    getAllMemories,
-} from "./mem0.js";
+    indexAgentMemoryFacts,
+    searchAgentMemoryFacts,
+} from "./graph.js";
 
 export {
     getEmbedding,

@@ -11,7 +11,7 @@ import {
     getSessionsCollection,
     getSessionTranscriptsCollection,
 } from "./mongo.js";
-import { searchMemory } from "./mem0.js";
+import { searchAgentMemoryFacts } from "./graph.js";
 import { searchVectors } from "./vector.js";
 import { buildScopedMemoryFilter } from "./utils.js";
 import type {
@@ -169,14 +169,19 @@ export async function searchMemoryLayers(params: LayeredSearchParams): Promise<L
 
     if (layers.includes("graph")) {
         tasks.push((async () => {
-            const memories = await searchMemory({
+            // First-party graph layer: durable facts indexed as source:"fact"
+            // vectors, retrieved via Atlas $vectorSearch + CF BAAI rerank.
+            // Returns MemoryItem[] with `.memory` populated for ranker compat.
+            const memories = await searchAgentMemoryFacts({
                 query: params.query,
-                agent_id: params.agentWallet,
-                user_id: params.userAddress,
-                run_id: params.threadId,
+                agentWallet: params.agentWallet,
+                userAddress: params.userAddress,
+                threadId: params.threadId,
                 mode: params.mode,
                 haiId: params.haiId,
                 filters: params.filters,
+                layers: ["graph"],
+                limit,
             });
 
             result.layers.graph = memories;
