@@ -33,13 +33,19 @@ const mcpMock = vi.hoisted(() => ({
     getSessionTools = vi.fn(() => []);
     terminateSession = vi.fn();
   },
-  McpRuntimeError: class MockMcpRuntimeError extends Error {
+  ConnectorsError: class MockConnectorsError extends Error {
     statusCode = 500;
     code = "MCP_ERROR";
     retryable = false;
   },
   executeServerTool: vi.fn(async () => ({ ok: true })),
   getServerTools: vi.fn(async () => []),
+  normalizeConnectorBinding: vi.fn((input: { registryId?: string; origin?: string }) => {
+    const raw = input.registryId || "";
+    const origin = input.origin === "goat" || input.origin === "onchain" ? "onchain" : "tools";
+    const slug = raw.replace(/^(mcp|goat|tools|onchain)[:\-]/, "");
+    return { origin, slug, registryId: `${origin}:${slug}`, original: raw };
+  }),
 }));
 
 const contextMock = vi.hoisted(() => {
@@ -174,8 +180,7 @@ const sandboxMock = vi.hoisted(() => ({
   persistConclaveReceipt: vi.fn(async () => "/tmp/conclave-123.json"),
 }));
 
-vi.mock("../src/mcps/goat.js", () => goatMock);
-vi.mock("../src/mcps/mcp.js", () => mcpMock);
+vi.mock("../src/connectors/index.js", () => ({ ...goatMock, ...mcpMock }));
 vi.mock("../src/manowar/agent/context.js", () => contextMock);
 vi.mock("../src/manowar/agent/tools.js", () => toolsMock);
 vi.mock("../src/mesh/hai.js", () => haiMock);

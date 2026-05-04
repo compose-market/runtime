@@ -3,9 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 const goatMock = vi.hoisted(() => ({
     getPlugin: vi.fn(),
     executeGoatTool: vi.fn(),
+    normalizeConnectorBinding: vi.fn((input: string) => {
+        const slug = input.replace(/^(goat|onchain)[:\-]/, "");
+        return { origin: "onchain", slug, registryId: `onchain:${slug}`, original: input };
+    }),
 }));
 
-vi.mock("../src/mcps/goat.js", () => goatMock);
+vi.mock("../src/connectors/index.js", () => goatMock);
 
 import { createAgentTools } from "../src/manowar/agent/tools.js";
 

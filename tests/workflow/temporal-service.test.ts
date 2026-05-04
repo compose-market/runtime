@@ -45,6 +45,8 @@ vi.mock("../../src/temporal/client.js", () => ({
 }));
 
 import {
+    buildConnectorCatalogScheduleId,
+    buildConnectorCatalogScheduleInput,
     buildAgentRunWorkflowId,
     buildTriggerScheduleId,
     buildWorkflowRunWorkflowId,
@@ -53,6 +55,7 @@ import {
     signalStepApproval,
     startAgentRun,
     startWorkflowRun,
+    upsertConnectorCatalogSchedule,
     upsertTriggerSchedule,
 } from "../../src/temporal/service.js";
 
@@ -87,6 +90,21 @@ function createTrigger(overrides: Partial<TriggerDefinition> = {}): TriggerDefin
 describe("temporal/service", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        for (const name of [
+            "CONNECTOR_CATALOG_DAILY_CRON",
+            "CONNECTOR_DAILY_SEED_MAX_PAGES",
+            "CONNECTOR_DAILY_SEED_ITERATIONS",
+            "CONNECTOR_DAILY_VERIFY_LIMIT",
+            "CONNECTOR_DAILY_VERIFY_ITERATIONS",
+            "CONNECTOR_DAILY_METADATA_LIMIT",
+            "CONNECTOR_DAILY_METADATA_ITERATIONS",
+            "CONNECTOR_DAILY_PUBLISH_LIMIT",
+            "CONNECTOR_DAILY_PUBLISH_ITERATIONS",
+            "CONNECTOR_DAILY_EMBED_LIMIT",
+            "CONNECTOR_SHARD_COUNT",
+        ]) {
+            delete process.env[name];
+        }
         workflowHandle.result.mockResolvedValue({ success: true });
         workflowHandle.query.mockResolvedValue({ runId: "run-1" });
         workflowHandle.signal.mockResolvedValue(undefined);
@@ -182,6 +200,40 @@ describe("temporal/service", () => {
 
     it("builds trigger schedule ids with workflow prefix", () => {
         expect(buildTriggerScheduleId("0xABCDEF", "trigger-9")).toBe("workflow-trigger-0xABCDEF-trigger-9");
+    });
+
+    it("builds the connector catalog maintenance schedule input from safe defaults", () => {
+        expect(buildConnectorCatalogScheduleId()).toBe("connector-catalog-maintenance");
+        expect(buildConnectorCatalogScheduleInput()).toEqual({
+            seedMaxPages: 8,
+            seedIterations: 1,
+            verifyLimit: 5,
+            verifyIterations: 1,
+            metadataLimit: 25,
+            metadataIterations: 1,
+            publishLimit: 250,
+            publishIterations: 1,
+            embedLimit: 250,
+            shardCount: 3,
+        });
+    });
+
+    it("upserts the daily connector catalog maintenance schedule", async () => {
+        await upsertConnectorCatalogSchedule();
+
+        expect(scheduleHandle.delete).toHaveBeenCalledTimes(1);
+        expect(mockScheduleCreate).toHaveBeenCalledTimes(1);
+        const [args] = mockScheduleCreate.mock.calls[0];
+        expect(args.scheduleId).toBe("connector-catalog-maintenance");
+        expect(args.spec.cronExpressions).toEqual(["0 1 * * *"]);
+        expect(args.action.workflowType).toBe("connectorCatalogMaintenanceWorkflow");
+        expect(args.action.taskQueue).toBe("compose.connector.workflow");
+        expect(args.action.args[0].metadataLimit).toBe(25);
+        expect(args.action.args[0].publishLimit).toBe(250);
+        expect(args.action.args[0].compileLimit).toBeUndefined();
+        expect(args.policies.overlap).toBe(ScheduleOverlapPolicy.SKIP);
+        expect(args.policies.catchupWindow).toBe(30 * 60 * 1000);
+        expect(args.state.paused).toBe(false);
     });
 
     it("upserts schedules with workflow queue defaults", async () => {

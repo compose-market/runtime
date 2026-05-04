@@ -6,7 +6,7 @@ import { createMemoryTools } from "../src/manowar/agent/tools.js";
 describe("createMemoryTools context resolution", () => {
   it("reads local scope from the live execution context when the tool is invoked", async () => {
     const tool = createMemoryTools("0x1111111111111111111111111111111111111111")
-      .find((candidate) => candidate.name === "search_memory");
+      .find((candidate) => candidate.name === "memory_recall");
 
     expect(tool).toBeDefined();
 

@@ -25,6 +25,12 @@
   ],
   "exclude": [
     "node_modules",
-    "dist"
+    "dist",
+    "src/connectors/worker",
+    "src/connectors/workflows",
+    "src/connectors/container",
+    "src/connectors/catalog",
+    "src/connectors/compiler",
+    "src/connectors/schema"
   ]
 }

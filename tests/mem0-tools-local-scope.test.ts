@@ -6,7 +6,7 @@ import { createMemoryTools } from "../src/manowar/agent/tools.js";
 describe("createMemoryTools", () => {
   it("allows local agents to invoke runtime memory tools with haiId-only scope", async () => {
     const tool = createMemoryTools("0x1111111111111111111111111111111111111111")
-      .find((candidate) => candidate.name === "search_memory");
+      .find((candidate) => candidate.name === "memory_recall");
 
     expect(tool).toBeDefined();
 
@@ -24,7 +24,7 @@ describe("createMemoryTools", () => {
 
   it("recovers from empty memory-tool arguments by falling back to the latest user message", async () => {
     const tool = createMemoryTools("0x1111111111111111111111111111111111111111")
-      .find((candidate) => candidate.name === "save_memory");
+      .find((candidate) => candidate.name === "memory_remember");
 
     expect(tool).toBeDefined();
 

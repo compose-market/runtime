@@ -1,162 +1,146 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const clientConnect = vi.fn();
-const clientListTools = vi.fn();
-const clientCallTool = vi.fn();
-const clientClose = vi.fn();
-
-const transportClose = vi.fn();
-
-class MockClient {
-  connect = clientConnect;
-  listTools = clientListTools;
-  callTool = clientCallTool;
-  close = clientClose;
-
-  constructor() {
-    // no-op
-  }
-}
-
-class MockTransport {
-  close = transportClose;
-}
-
-vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
-  Client: MockClient,
-}));
-
-vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
-  StdioClientTransport: MockTransport,
-}));
-
-vi.mock("../src/mcps/transports/http.js", () => ({
-  HttpSseClientTransport: MockTransport,
-}));
-
-vi.mock("../src/mcps/transports/docker.js", () => ({
-  DockerClientTransport: MockTransport,
-}));
-
-vi.mock("../src/mcps/transports/npx.js", () => ({
-  NpxClientTransport: MockTransport,
-}));
-
-describe("runtime mcp runtime", () => {
+describe("connectors client", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
-    process.env.CONNECTOR_URL = "http://connector.test";
+    process.env.CONNECTORS_URL = "http://connectors.test";
+    process.env.RUNTIME_INTERNAL_SECRET = "test-secret";
     vi.stubGlobal("fetch", vi.fn());
   });
 
-  afterEach(async () => {
-    const module = await import("../src/mcps/mcp.js");
-    await module.__resetMcpRuntimeForTests();
+  afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("reuses cached session when still alive", async () => {
+  it("getServerTools issues GET /tools/:slug/tools and returns the broker payload", async () => {
     const fetchMock = vi.mocked(fetch);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ transport: "http", remoteUrl: "http://remote.test" }),
-    } as Response);
-
-    clientListTools.mockResolvedValue({
+    const payload = {
+      serverId: "github",
+      sessionId: "sess-1",
+      cached: false,
+      toolCount: 1,
       tools: [{ name: "search", description: "Search", inputSchema: {} }],
-    });
+    };
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(payload),
+    } as Response);
 
-    const { getServerTools } = await import("../src/mcps/mcp.js");
+    const { getServerTools } = await import("../src/connectors/index.js");
+    const result = await getServerTools("github");
 
-    const first = await getServerTools("github");
-    const second = await getServerTools("github");
-
-    expect(first.cached).toBe(false);
-    expect(second.cached).toBe(true);
-    expect(second.sessionId).toBe(first.sessionId);
+    expect(result).toEqual(payload);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(clientConnect).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("http://connectors.test/tools/github/tools");
+    const initObj = init as RequestInit;
+    expect(initObj.method).toBe("GET");
+    expect(((initObj.headers as Record<string, string>) || {})["Authorization"]).toBe("Bearer test-secret");
   });
 
-  it("respawns when cached session is stale", async () => {
+  it("executeServerTool POSTs /tools/:slug/execute/:tool with body args", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => ({ transport: "http", remoteUrl: "http://remote.test" }),
+      text: async () => JSON.stringify({
+        ok: true,
+        result: { ok: true },
+        transportUsed: "http",
+        latencyMs: 12,
+      }),
     } as Response);
 
-    clientListTools
-      .mockResolvedValueOnce({
-        tools: [{ name: "search", description: "Search", inputSchema: {} }],
-      })
-      .mockRejectedValueOnce(new Error("Connection closed"))
-      .mockResolvedValueOnce({
-        tools: [{ name: "search", description: "Search", inputSchema: {} }],
-      });
-
-    const { getServerTools } = await import("../src/mcps/mcp.js");
-
-    const first = await getServerTools("github");
-    const second = await getServerTools("github");
-
-    expect(first.cached).toBe(false);
-    expect(second.cached).toBe(false);
-    expect(second.sessionId).not.toBe(first.sessionId);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(clientConnect).toHaveBeenCalledTimes(2);
-  });
-
-  it("respawns once and retries tool execution on invalid session", async () => {
-    const fetchMock = vi.mocked(fetch);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ transport: "http", remoteUrl: "http://remote.test" }),
-    } as Response);
-
-    clientListTools
-      .mockResolvedValueOnce({
-        tools: [{ name: "search", description: "Search", inputSchema: {} }],
-      })
-      .mockResolvedValueOnce({
-        tools: [{ name: "search", description: "Search", inputSchema: {} }],
-      });
-
-    clientCallTool
-      .mockRejectedValueOnce(new Error("Connection closed"))
-      .mockResolvedValueOnce({
-        isError: false,
-        content: [{ text: "{\"ok\":true}" }],
-      });
-
-    const { executeServerTool, getServerTools } = await import("../src/mcps/mcp.js");
-
-    await getServerTools("github");
+    const { executeServerTool } = await import("../src/connectors/index.js");
     const result = await executeServerTool("github", "search", { q: "compose" });
 
     expect(result).toEqual({ ok: true });
-    expect(clientCallTool).toHaveBeenCalledTimes(2);
-    expect(clientConnect).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("http://connectors.test/tools/github/execute/search");
+    const initObj = init as RequestInit;
+    expect(initObj.method).toBe("POST");
+    const body = JSON.parse((initObj.body as string) || "{}");
+    expect(body.args).toEqual({ q: "compose" });
   });
 
-  it("throws MCP_CONFIG_NOT_FOUND when server is unknown", async () => {
+  it("CREDENTIALS_REQUIRED is surfaced as ConnectorsError with the canonical message prefix", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        ok: false,
+        kind: "CREDENTIALS_REQUIRED",
+        serverId: "notion",
+        missing: [{ varName: "NOTION_API_KEY" }],
+      }),
+    } as Response);
+
+    const { executeServerTool, ConnectorsError } = await import("../src/connectors/index.js");
+    let caught: unknown = null;
+    try {
+      await executeServerTool("notion", "create_page", {});
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ConnectorsError);
+    expect((caught as InstanceType<typeof ConnectorsError>).code).toBe("CREDENTIALS_REQUIRED");
+    expect((caught as Error).message).toBe("MCP credentials required: NOTION_API_KEY");
+    expect((caught as InstanceType<typeof ConnectorsError>).retryable).toBe(false);
+  });
+
+  it("404 from the broker is mapped to MCP_CONFIG_NOT_FOUND", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue({
       ok: false,
       status: 404,
-      json: async () => ({}),
+      text: async () => JSON.stringify({ error: { message: "not found" } }),
     } as Response);
 
-    const { getServerTools, McpRuntimeError } = await import("../src/mcps/mcp.js");
+    const { getServerTools, ConnectorsError } = await import("../src/connectors/index.js");
 
-    await expect(getServerTools("unknown-server")).rejects.toBeInstanceOf(McpRuntimeError);
+    await expect(getServerTools("unknown-server")).rejects.toBeInstanceOf(ConnectorsError);
     await expect(getServerTools("unknown-server")).rejects.toMatchObject({
       code: "MCP_CONFIG_NOT_FOUND",
       statusCode: 404,
+    });
+  });
+
+  it("typed broker failure (RATE_LIMITED) round-trips with retryable=true", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        ok: false,
+        kind: "RATE_LIMITED",
+        message: "upstream limit",
+        retryable: true,
+      }),
+    } as Response);
+
+    const { executeServerTool, ConnectorsError } = await import("../src/connectors/index.js");
+    let caught: unknown = null;
+    try {
+      await executeServerTool("github", "search", {});
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ConnectorsError);
+    expect((caught as InstanceType<typeof ConnectorsError>).code).toBe("RATE_LIMITED");
+    expect((caught as InstanceType<typeof ConnectorsError>).retryable).toBe(true);
+  });
+
+  it("missing CONNECTORS_URL raises a non-retryable error", async () => {
+    delete process.env.CONNECTORS_URL;
+    const { getServerTools, ConnectorsError } = await import("../src/connectors/index.js");
+    await expect(getServerTools("github")).rejects.toBeInstanceOf(ConnectorsError);
+    await expect(getServerTools("github")).rejects.toMatchObject({
+      code: "MCP_RUNTIME_UNAVAILABLE",
+      retryable: false,
     });
   });
 });

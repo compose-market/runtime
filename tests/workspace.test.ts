@@ -32,13 +32,19 @@ const mcpMock = vi.hoisted(() => ({
     getSessionTools = vi.fn(() => []);
     terminateSession = vi.fn();
   },
-  McpRuntimeError: class McpRuntimeError extends Error {
+  ConnectorsError: class ConnectorsError extends Error {
     statusCode = 500;
     code = "MCP_ERROR";
     retryable = false;
   },
   executeServerTool: vi.fn(async () => ({ ok: true })),
   getServerTools: vi.fn(async () => []),
+  normalizeConnectorBinding: vi.fn((input: { registryId?: string; origin?: string }) => {
+    const raw = input.registryId || "";
+    const origin = input.origin === "goat" || input.origin === "onchain" ? "onchain" : "tools";
+    const slug = raw.replace(/^(mcp|goat|tools|onchain)[:\-]/, "");
+    return { origin, slug, registryId: `${origin}:${slug}`, original: raw };
+  }),
 }));
 
 const memoryMock = vi.hoisted(() => ({
@@ -64,8 +70,7 @@ const memoryMock = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("../src/mcps/goat.js", () => goatMock);
-vi.mock("../src/mcps/mcp.js", () => mcpMock);
+vi.mock("../src/connectors/index.js", () => ({ ...goatMock, ...mcpMock }));
 vi.mock("../src/manowar/memory/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/manowar/memory/index.js")>();
   return {
