@@ -13,8 +13,9 @@ import { searchKnowledge } from "../knowledge/index.js";
 import { DEFAULT_AGENT_MEMORY_LAYERS, persistExplicitAgentMemory, retrieveAgentMemory } from "./memory.js";
 import { searchMemoryLayers } from "../memory/index.js";
 import { shouldEnforceCloudPermissions } from "../mode.js";
-import { executeGoatTool, getPlugin } from "../../mcps/goat.js";
-import { executeServerTool, getServerTools } from "../../mcps/mcp.js";
+import { executeGoatTool, getPlugin } from "../../connectors/index.js";
+import { executeServerTool, getServerTools } from "../../connectors/index.js";
+import { normalizeConnectorBinding } from "../../connectors/index.js";
 import {
     buildApiInternalHeaders,
     requireApiInternalUrl,
@@ -504,10 +505,17 @@ async function enforceToolPermissions(input: {
 }
 
 function isRetryableToolFailure(status: number, errorText: string): boolean {
+    const normalized = errorText.toLowerCase();
+    if (
+        normalized.includes("credentials required") ||
+        normalized.includes("mcp credentials required") ||
+        normalized.includes("consent required")
+    ) {
+        return false;
+    }
     if (RETRYABLE_STATUSES.has(status)) {
         return true;
     }
-    const normalized = errorText.toLowerCase();
     return (
         normalized.includes("temporarily unavailable") ||
         normalized.includes("timeout") ||
@@ -809,31 +817,16 @@ export async function createAgentTools(
 
     for (const pluginId of pluginIds) {
         try {
-            // Normalize plugin ID to extract source and ID
-            // Supports: "goat-coingecko", "goat:coingecko", "goat:goat-coingecko", "coingecko"
-            //           "mcp-github", "mcp:github", "github"
-            let source = "goat"; // Default source
-            let id = pluginId;
-
-            // Strip ALL goat/mcp prefixes (handles double-prefix edge cases like "goat:goat-coingecko")
-            // Keep stripping until no more prefixes found
-            while (id.startsWith("goat-") || id.startsWith("goat:") ||
-                id.startsWith("mcp-") || id.startsWith("mcp:")) {
-                if (id.startsWith("goat-") || id.startsWith("goat:")) {
-                    source = "goat";
-                    id = id.replace(/^goat[-:]/, "");
-                } else if (id.startsWith("mcp-") || id.startsWith("mcp:")) {
-                    source = "mcp";
-                    id = id.replace(/^mcp[-:]/, "");
-                }
-            }
+            const binding = normalizeConnectorBinding(pluginId, { defaultOrigin: "onchain" });
+            const source = binding.origin;
+            const id = binding.slug;
 
             console.log(`[createAgentTools] Normalized "${pluginId}" → source="${source}", id="${id}"`);
 
-            if (source === "goat") {
+            if (source === "onchain") {
                 const pluginData = await getPlugin(id);
                 if (!pluginData) {
-                    console.warn(`[createAgentTools] GOAT plugin ${id} not found`);
+                    console.warn(`[createAgentTools] onchain plugin ${id} not found`);
                     continue;
                 }
 
@@ -866,7 +859,7 @@ export async function createAgentTools(
                     });
                     tools.push(tool);
                 }
-            } else if (source === "mcp") {
+            } else if (source === "tools") {
                 console.log(`[createAgentTools] Fetching tools for MCP server "${id}"`);
 
                 // Add timeout to prevent indefinite blocking on spawn failures
@@ -936,7 +929,8 @@ export async function createAgentTools(
                                 return formatToolResultForAgent(result);
                             } catch (err: any) {
                                 const errorMessage = err instanceof Error ? err.message : String(err);
-                                if (isRetryableToolFailure(503, errorMessage)) {
+                                const statusCode = typeof err?.statusCode === "number" ? err.statusCode : 503;
+                                if (isRetryableToolFailure(statusCode, errorMessage)) {
                                     markToolFailed(toolKey, errorMessage);
                                 }
                                 throw new Error(`MCP tool "${toolDef.name}" failed: ${errorMessage}`);
@@ -1162,9 +1156,9 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
         name: "memory_recall",
         description: "Recall what you remember about the user. Searches all 6 memory layers (working, scene, graph, patterns, archives, vectors) in parallel and returns the top-ranked durable facts and recent context. Use this whenever the user asks 'what do you remember', 'do you know', 'who am I', or anything that benefits from prior conversational context.",
         schema: z.object({
-            query: z.string().describe("What you want to recall. Free-form natural language; the framework handles ranking across layers."),
+            query: z.string().optional().describe("What you want to recall. Free-form natural language; the framework handles ranking across layers."),
         }),
-        func: async ({ query }: { query: string }) => {
+        func: async ({ query }: { query?: string }) => {
             try {
                 const effectiveQuery = resolveToolText(query, "query");
                 const scope = resolveMemoryScope({
@@ -1189,9 +1183,9 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
         name: "memory_remember",
         description: "Save a durable fact, preference, or rule about the user. Use when the user volunteers stable information ('my name is X', 'I work at Y', 'I prefer Z'). Stored as a graph-layer fact and surfaced automatically on future turns.",
         schema: z.object({
-            content: z.string().describe("The durable fact in plain language. One fact per call; keep it under 200 characters."),
+            content: z.string().optional().describe("The durable fact in plain language. One fact per call; keep it under 200 characters."),
         }),
-        func: async ({ content }: { content: string }) => {
+        func: async ({ content }: { content?: string }) => {
             const effectiveContent = resolveToolText(content, "content");
             const scope = resolveMemoryScope({
                 agentWallet,

@@ -12,6 +12,7 @@
  */
 
 import { buildPinataGatewayIpfsUrl } from "../../auth.js";
+import { normalizeConnectorBinding } from "../../connectors/bindings.js";
 import type { AgentCard, WorkflowCard } from "./types.js";
 
 // Re-export for consumers that import from registry
@@ -190,11 +191,10 @@ export function getCacheStats(): { size: number; keys: string[] } {
 }
 
 // =============================================================================
-// Tool Self-Discovery (via Connector Service)
+// Tool Self-Discovery (via the connectors broker)
 // =============================================================================
 
-const CONNECTOR_URL = process.env.CONNECTOR_URL;
-const TOOL_DISCOVERY_MODE = process.env.WORKFLOW_TOOL_DISCOVERY_MODE || "registry";
+const CONNECTORS_URL = process.env.CONNECTORS_URL;
 const TOOL_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 interface CachedTools {
@@ -205,7 +205,7 @@ interface CachedTools {
 const toolCache = new Map<string, CachedTools>();
 
 /**
- * Tool schema from connector service
+ * Tool schema as returned by the connectors broker.
  */
 export interface DiscoveredTool {
     name: string;
@@ -214,20 +214,15 @@ export interface DiscoveredTool {
 }
 
 /**
- * Discover tools for an agent's plugins via connector service.
- * 
- * Uses the connector's self-discovery endpoint which spawns MCP servers
- * on-demand and returns their tool schemas. This allows the planner
- * to understand what tools each agent can use.
- * 
- * @param agentCard - Agent card with plugins array
- * @returns Array of discovered tools (limited to top 10 per agent to save tokens)
+ * Discover the tools for an agent's plugins.
+ *
+ * Single path: GET ${CONNECTORS_URL}/tools/:slug returns the server card
+ * with its tool array. The broker's catalog is the source of truth — no
+ * spawn-then-list fallback, no auto-mode probing. If a slug is missing or
+ * the broker is unreachable, the plugin contributes zero tools.
  */
-export async function discoverAgentTools(
-    agentCard: AgentCard,
-    mode: "registry" | "runtime" | "auto" = (TOOL_DISCOVERY_MODE as "registry" | "runtime" | "auto")
-): Promise<DiscoveredTool[]> {
-    if (!agentCard.plugins?.length || !CONNECTOR_URL) {
+export async function discoverAgentTools(agentCard: AgentCard): Promise<DiscoveredTool[]> {
+    if (!agentCard.plugins?.length || !CONNECTORS_URL) {
         return [];
     }
 
@@ -243,63 +238,34 @@ export async function discoverAgentTools(
         }
 
         let tools: DiscoveredTool[] = [];
-
-        // Preferred: read-only registry lookup (no server spawn)
-        if (mode === "registry" || mode === "auto") {
-            try {
-                const response = await fetch(
-                    `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(plugin.registryId)}`,
-                    {
-                        headers: { Accept: "application/json" },
-                        signal: AbortSignal.timeout(5000),
-                    }
-                );
-
-                if (response.ok) {
-                    const data = await response.json();
-                    if (Array.isArray(data?.tools)) {
-                        tools = data.tools.map((tool: any) => ({
-                            name: tool.name,
-                            description: tool.description,
-                            inputSchema: tool.inputSchema,
-                        }));
-                    }
-                } else if (mode === "registry") {
-                    console.warn(`[registry] Registry lookup failed for ${plugin.registryId}: HTTP ${response.status}`);
+        try {
+            const binding = normalizeConnectorBinding(plugin, { defaultOrigin: "onchain" });
+            const path = binding.origin === "tools"
+                ? `/tools/${encodeURIComponent(binding.slug)}`
+                : `/onchain/${encodeURIComponent(binding.slug)}`;
+            const response = await fetch(
+                `${CONNECTORS_URL}${path}`,
+                {
+                    headers: { Accept: "application/json" },
+                    signal: AbortSignal.timeout(5000),
                 }
-            } catch (error) {
-                if (mode === "registry") {
-                    console.warn(`[registry] Registry lookup error for ${plugin.registryId}:`, error);
+            );
+            if (response.ok) {
+                const data = await response.json() as {
+                    tools?: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown>; parameters?: Record<string, unknown> }>;
+                };
+                if (Array.isArray(data.tools)) {
+                    tools = data.tools.map((tool) => ({
+                        name: tool.name,
+                        description: tool.description,
+                        inputSchema: tool.inputSchema || tool.parameters,
+                    }));
                 }
+            } else {
+                console.warn(`[registry] connectors lookup failed for ${plugin.registryId}: HTTP ${response.status}`);
             }
-        }
-
-        // Fallback: runtime tool listing (may spawn MCP servers)
-        if (tools.length === 0 && (mode === "runtime" || mode === "auto")) {
-            try {
-                const response = await fetch(
-                    `${CONNECTOR_URL}/mcp/servers/${encodeURIComponent(plugin.registryId)}/tools`,
-                    {
-                        headers: { Accept: "application/json" },
-                        signal: AbortSignal.timeout(5000),
-                    }
-                );
-
-                if (response.ok) {
-                    const data = await response.json();
-                    if (data.tools && Array.isArray(data.tools)) {
-                        tools = data.tools.map((tool: any) => ({
-                            name: tool.name,
-                            description: tool.description,
-                            inputSchema: tool.inputSchema,
-                        }));
-                    }
-                } else {
-                    console.warn(`[registry] Runtime tool discovery failed for ${plugin.name}: HTTP ${response.status}`);
-                }
-            } catch (error) {
-                console.warn(`[registry] Runtime tool discovery error for ${plugin.name}:`, error);
-            }
+        } catch (error) {
+            console.warn(`[registry] connectors lookup error for ${plugin.registryId}:`, error);
         }
 
         toolCache.set(plugin.registryId, { tools, fetchedAt: Date.now() });

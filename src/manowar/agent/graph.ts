@@ -191,6 +191,13 @@ function parseToolArgs(value: unknown): unknown {
     }
 }
 
+function toolCallDedupeKey(call: ToolCallSnapshot): string {
+    if (call.id) {
+        return `id:${call.id}`;
+    }
+    return `sig:${call.name}:${normalizeForSignature(call.args)}`;
+}
+
 function extractToolCalls(message: BaseMessage): ToolCallSnapshot[] {
     const candidate = message as {
         tool_calls?: Array<{ id?: unknown; name?: unknown; args?: unknown }>;
@@ -209,11 +216,19 @@ function extractToolCalls(message: BaseMessage): ToolCallSnapshot[] {
             : [];
 
     const calls: ToolCallSnapshot[] = [];
+    const seen = new Set<string>();
+    const push = (call: ToolCallSnapshot) => {
+        const key = toolCallDedupeKey(call);
+        if (seen.has(key)) return;
+        seen.add(key);
+        calls.push(call);
+    };
+
     for (const call of [...direct, ...lcDirect]) {
         if (typeof call.name !== "string") {
             continue;
         }
-        calls.push({
+        push({
             id: typeof call.id === "string" ? call.id : `${call.name}:${calls.length}`,
             name: call.name,
             args: call.args,
@@ -224,7 +239,7 @@ function extractToolCalls(message: BaseMessage): ToolCallSnapshot[] {
         if (typeof name !== "string") {
             continue;
         }
-        calls.push({
+        push({
             id: typeof call.id === "string" ? call.id : `${name}:${calls.length}`,
             name,
             args: parseToolArgs(call.function?.arguments),
@@ -495,3 +510,7 @@ export function createAgentGraph(
         checkpointer
     });
 }
+
+export const __test = {
+    extractToolCalls,
+};

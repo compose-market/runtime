@@ -327,7 +327,7 @@ export class TaskPlanner {
         if (this.agentCards?.length) {
             return Promise.all(this.agentCards.map(async (agent) => {
                 // Discover tools for this agent's plugins
-                const tools = await discoverAgentTools(agent as any, "registry");
+                const tools = await discoverAgentTools(agent as any);
 
                 // Get reliability from past executions (if workflowWallet provided)
                 let reliability: { avgQuality: number; successRate: number; totalRuns: number } | undefined;

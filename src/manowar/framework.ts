@@ -634,7 +634,12 @@ function parseToolArgs(value: unknown): unknown {
     return JSON.parse(value);
   } catch {
     return value;
-  }
+    }
+}
+
+function toolCallKey(call: { id: string; name: string; args?: unknown }): string {
+  if (call.id) return `id:${call.id}`;
+  return `sig:${call.name}:${normalizeMessageContent(call.args)}`;
 }
 
 function summarizeToolOutput(value: unknown): string | undefined {
@@ -688,6 +693,14 @@ function extractToolCallChunks(value: unknown): Array<{ id?: string; name?: stri
 
 function extractStreamToolCalls(value: unknown): Array<{ id: string; name: string; args?: unknown }> {
   const calls: Array<{ id: string; name: string; args?: unknown }> = [];
+  const seen = new Set<string>();
+  const push = (call: { id: string; name: string; args?: unknown }) => {
+    const key = toolCallKey(call);
+    if (seen.has(key)) return;
+    seen.add(key);
+    calls.push(call);
+  };
+
   for (const item of collectMessageLikeValues(value)) {
     const record = asRecord(item);
     if (!record) continue;
@@ -717,7 +730,7 @@ function extractStreamToolCalls(value: unknown): Array<{ id: string; name: strin
       const args = call
         ? call.args ?? call.arguments ?? (fn ? parseToolArgs(fn.arguments) : undefined)
         : undefined;
-      calls.push({ id, name, args });
+      push({ id, name, args });
     });
   }
   return calls;
@@ -1642,3 +1655,7 @@ export async function executeResponses(
   }
   return body as AgentResponsesResult;
 }
+
+export const __test = {
+  extractStreamToolCalls,
+};

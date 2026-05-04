@@ -14,6 +14,7 @@ import {
     type AgentConfig,
     type AgentInstance,
 } from "./framework.js";
+import { normalizeConnectorRegistryId, type ConnectorBindingInput } from "../connectors/bindings.js";
 import { deriveAgentWallet, type AgentWallet } from "../agent-wallet.js";
 import { buildPinataGatewayIpfsUrl, requireApiInternalUrl, requirePinataApiUrl } from "../auth.js";
 
@@ -164,12 +165,13 @@ export interface RegisterAgentParams {
     creator: string;
     model?: string;
     framework?: "manowar";
-    plugins?: string[];
+    plugins?: Array<string | ConnectorBindingInput>;
     systemPrompt?: string;
 }
 
 interface ApiAgentPlugin {
     registryId: string;
+    origin?: string;
 }
 
 interface ApiAgentCard {
@@ -378,7 +380,9 @@ function buildRuntimeConfig(
         throw new Error(`Model is required for agent ${params.name}`);
     }
 
-    const plugins = params.plugins || [];
+    const plugins = (params.plugins || []).map((pluginId) =>
+        normalizeConnectorRegistryId(pluginId, { defaultOrigin: "onchain" }),
+    );
     return {
         name: params.name,
         agentWallet: walletAddress,
@@ -603,7 +607,9 @@ export async function ensureRegisteredAgentByWallet(walletAddress: string): Prom
         creator: card.creator,
         model: card.model,
         framework: card.framework,
-        plugins: card.plugins.map((plugin) => plugin.registryId),
+        plugins: card.plugins.map((plugin) =>
+            normalizeConnectorRegistryId(plugin, { defaultOrigin: "onchain" }),
+        ),
     }, { waitForRuntime: false });
 }
 
