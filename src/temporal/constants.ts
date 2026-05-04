@@ -3,11 +3,14 @@ export const AGENT_TASK_QUEUE = "compose.agent.workflow";
 export const WORKFLOW_ACTIVITY_TASK_QUEUE = "compose.workflow.activities";
 export const AGENT_ACTIVITY_TASK_QUEUE = "compose.agent.activities";
 export const MEMORY_ACTIVITY_TASK_QUEUE = "compose.memory.activities";
+export const CONNECTOR_TASK_QUEUE = "compose.connector.workflow";
+export const CONNECTOR_ACTIVITY_TASK_QUEUE = "compose.connector.activities";
 
 export const WORKFLOW_WORKFLOW_TYPE = "executeWorkflowWorkflow";
 export const AGENT_WORKFLOW_TYPE = "executeAgentTurnWorkflow";
 
 export const MEMORY_WORKFLOW_ID_PREFIX = "memory-";
+export const CONNECTOR_CATALOG_WORKFLOW_TYPE = "connectorCatalogMaintenanceWorkflow";
 
 export const SIGNAL_REPORT_PROGRESS = "reportProgress";
 export const SIGNAL_CANCEL_EXECUTION = "cancelExecution";

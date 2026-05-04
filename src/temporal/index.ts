@@ -7,6 +7,8 @@ export * from "./signals.js";
 export * from "./types.js";
 export * from "./worker.js";
 export {
+    CONNECTOR_CATALOG_SCHEDULE_CATCHUP_WINDOW_MS,
+    CONNECTOR_CATALOG_SCHEDULE_OVERLAP_POLICY,
     TRIGGER_SCHEDULE_CATCHUP_WINDOW_MS,
     TRIGGER_SCHEDULE_OVERLAP_POLICY,
     buildTriggerScheduleId as buildTriggerScheduleIdFromScheduleModule,

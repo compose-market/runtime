@@ -12,8 +12,7 @@ import {
 } from "./constants.js";
 import { getTemporalClient } from "./client.js";
 import type { ExecuteAgentWorkflowInput, ExecuteWorkflowWorkflowInput, WorkflowWorkflowResult, ProgressSignalPayload } from "./types.js";
-import { executeServerTool } from "../mcps/mcp.js";
-import { executeGoatTool } from "../mcps/goat.js";
+import { executeServerTool, executeGoatTool } from "../connectors/index.js";
 
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 30000; // Optimized: 30s instead of 5s (6x cost reduction)
 const APPROVAL_MAX_WAIT_MS = 60 * 60 * 1000;
@@ -131,6 +130,7 @@ function startPeriodicHeartbeat(details: Record<string, unknown>): NodeJS.Timeou
 
 async function signalWorkflowProgress(payload: ProgressSignalPayload): Promise<void> {
     const info = Context.current().info;
+    if (!info.workflowExecution) return;
     try {
         const client = await getTemporalClient();
         const handle = client.workflow.getHandle(info.workflowExecution.workflowId);
@@ -145,6 +145,11 @@ async function waitForApproval(
     timeoutMs: number,
 ): Promise<StepApprovalDecision> {
     const info = Context.current().info;
+    if (!info.workflowExecution) {
+        const error = new Error("waitForApproval requires a workflowExecution context");
+        error.name = "ApprovalStateError";
+        throw error;
+    }
     const client = await getTemporalClient();
     const handle = client.workflow.getHandle(info.workflowExecution.workflowId);
 

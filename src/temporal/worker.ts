@@ -4,7 +4,7 @@ import { NativeConnection, Worker } from "@temporalio/worker";
 import * as fs from "fs";
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { AGENT_ACTIVITY_TASK_QUEUE, AGENT_TASK_QUEUE, WORKFLOW_ACTIVITY_TASK_QUEUE, WORKFLOW_TASK_QUEUE, MEMORY_ACTIVITY_TASK_QUEUE } from "./constants.js";
+import { AGENT_ACTIVITY_TASK_QUEUE, AGENT_TASK_QUEUE, CONNECTOR_ACTIVITY_TASK_QUEUE, CONNECTOR_TASK_QUEUE, WORKFLOW_ACTIVITY_TASK_QUEUE, WORKFLOW_TASK_QUEUE, MEMORY_ACTIVITY_TASK_QUEUE } from "./constants.js";
 import {
     createTemporalIdentity,
     getTemporalAddress,
@@ -27,6 +27,8 @@ const workerPollers: Record<string, number> = {
     [WORKFLOW_ACTIVITY_TASK_QUEUE]: 0,
     [AGENT_ACTIVITY_TASK_QUEUE]: 0,
     [MEMORY_ACTIVITY_TASK_QUEUE]: 0,
+    [CONNECTOR_TASK_QUEUE]: 0,
+    [CONNECTOR_ACTIVITY_TASK_QUEUE]: 0,
 };
 
 function resetWorkerPollers(): void {
@@ -162,7 +164,8 @@ export async function startWorkflowTemporalWorkers(): Promise<void> {
     const workflowBundle = resolveWorkflowBundle();
     const activities = await import("./activities.js");
     const memoryActivities = await import("./memory/activities.js");
-    const allActivities = { ...activities, ...memoryActivities };
+    const connectorActivities = await import("./connector-activities.js");
+    const allActivities = { ...activities, ...memoryActivities, ...connectorActivities };
     resetWorkerPollers();
 
     // Log encryption status (data converter integration ready for future SDK upgrade)
@@ -216,6 +219,18 @@ export async function startWorkflowTemporalWorkers(): Promise<void> {
             identity: createTemporalIdentity("workflow-worker", MEMORY_ACTIVITY_TASK_QUEUE),
             ...(workflowBundle ? { workflowBundle } : { workflowsPath }),
         }).then((worker) => ({ taskQueue: MEMORY_ACTIVITY_TASK_QUEUE, worker })),
+        Worker.create({
+            ...workerConfig,
+            taskQueue: CONNECTOR_TASK_QUEUE,
+            identity: createTemporalIdentity("workflow-worker", CONNECTOR_TASK_QUEUE),
+            ...(workflowBundle ? { workflowBundle } : { workflowsPath }),
+        }).then((worker) => ({ taskQueue: CONNECTOR_TASK_QUEUE, worker })),
+        Worker.create({
+            ...workerConfig,
+            taskQueue: CONNECTOR_ACTIVITY_TASK_QUEUE,
+            identity: createTemporalIdentity("workflow-worker", CONNECTOR_ACTIVITY_TASK_QUEUE),
+            ...(workflowBundle ? { workflowBundle } : { workflowsPath }),
+        }).then((worker) => ({ taskQueue: CONNECTOR_ACTIVITY_TASK_QUEUE, worker })),
     ]);
 
     running = true;
@@ -236,6 +251,6 @@ export async function startWorkflowTemporalWorkers(): Promise<void> {
         `[temporal] Workers started with deployment version ${getTemporalDeploymentMetadata().canonicalVersion}`,
     );
     console.log(
-        `[temporal] Active queues: ${WORKFLOW_TASK_QUEUE}, ${AGENT_TASK_QUEUE}, ${WORKFLOW_ACTIVITY_TASK_QUEUE}, ${AGENT_ACTIVITY_TASK_QUEUE}, ${MEMORY_ACTIVITY_TASK_QUEUE}`,
+        `[temporal] Active queues: ${WORKFLOW_TASK_QUEUE}, ${AGENT_TASK_QUEUE}, ${WORKFLOW_ACTIVITY_TASK_QUEUE}, ${AGENT_ACTIVITY_TASK_QUEUE}, ${MEMORY_ACTIVITY_TASK_QUEUE}, ${CONNECTOR_TASK_QUEUE}, ${CONNECTOR_ACTIVITY_TASK_QUEUE}`,
     );
 }

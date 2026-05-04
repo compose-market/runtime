@@ -12,6 +12,7 @@ import type { ExecutionResult } from "../manowar/framework.js";
 import type { ExecutionRunStateProjection, SSEProgressEvent, StepApprovalDecision } from "../manowar/workflow/types.js";
 import {
     AGENT_ACTIVITY_TASK_QUEUE,
+    CONNECTOR_ACTIVITY_TASK_QUEUE,
     WORKFLOW_ACTIVITY_TASK_QUEUE,
     APPROVAL_TIMEOUT_MS,
     QUERY_GET_AGENT_RUN_STATE,
@@ -73,9 +74,99 @@ const agentActivities = proxyActivities<typeof import("./activities.js")>({
         backoffCoefficient: 2,
         maximumInterval: "60s", // Optimized: increased from 30s to 60s for better backoff
         maximumAttempts: 3, // Optimized: reduced from 6 to 3 (50% cost reduction on failures)
+        nonRetryableErrorTypes: ["ValidationError", "ToolNonRetryableError"],
+    },
+});
+
+const connectorActivities = proxyActivities<typeof import("./connector-activities.js")>({
+    taskQueue: CONNECTOR_ACTIVITY_TASK_QUEUE,
+    startToCloseTimeout: "30m",
+    heartbeatTimeout: "90s",
+    retry: {
+        initialInterval: "10s",
+        backoffCoefficient: 2,
+        maximumInterval: "5m",
+        maximumAttempts: 5,
         nonRetryableErrorTypes: ["ValidationError"],
     },
 });
+
+export interface ConnectorCatalogMaintenanceInput {
+    seedMaxPages?: number;
+    seedIterations?: number;
+    verifyLimit?: number;
+    verifyIterations?: number;
+    metadataLimit?: number;
+    metadataIterations?: number;
+    publishLimit?: number;
+    publishIterations?: number;
+    embedLimit?: number;
+    shardCount?: number;
+    /**
+     * Legacy schedule input name; use metadataLimit/publishLimit for new runs.
+     */
+    compileLimit?: number;
+}
+
+export interface ConnectorCatalogMaintenanceResult {
+    seed: unknown[];
+    verify: unknown[][];
+    metadata: unknown[];
+    publish: unknown[];
+    embed: unknown;
+    health: unknown;
+    gc: unknown;
+}
+
+function clampWorkflowInt(value: number | undefined, fallback: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.max(min, Math.min(Math.floor(value as number), max));
+}
+
+function seedDone(report: unknown): boolean {
+    return Boolean(report && typeof report === "object" && "done" in report && (report as { done?: unknown }).done === true);
+}
+
+export async function connectorCatalogMaintenanceWorkflow(
+    input: ConnectorCatalogMaintenanceInput = {},
+): Promise<ConnectorCatalogMaintenanceResult> {
+    const shardCount = Math.max(1, Math.min(input.shardCount ?? 3, 64));
+    const seedIterations = clampWorkflowInt(input.seedIterations, 1, 1, 64);
+    const verifyIterations = clampWorkflowInt(input.verifyIterations, 1, 1, 32);
+    const metadataIterations = clampWorkflowInt(input.metadataIterations, 1, 1, 32);
+    const publishIterations = clampWorkflowInt(input.publishIterations, Math.max(1, metadataIterations), 1, 32);
+    const seed: unknown[] = [];
+    const verify: unknown[][] = [];
+    const metadata: unknown[] = [];
+    const publish: unknown[] = [];
+
+    for (let i = 0; i < seedIterations; i += 1) {
+        const report = await connectorActivities.seedConnectorCatalogActivity(input);
+        seed.push(report);
+        if (seedDone(report)) break;
+    }
+
+    for (let i = 0; i < verifyIterations; i += 1) {
+        verify.push(await Promise.all(
+            Array.from({ length: shardCount }, (_value, shardId) =>
+                connectorActivities.verifyConnectorCatalogShardActivity({ ...input, shardId, shardCount }),
+            ),
+        ));
+    }
+
+    for (let i = 0; i < metadataIterations; i += 1) {
+        metadata.push(await connectorActivities.runConnectorMetadataAgentsActivity(input));
+    }
+
+    for (let i = 0; i < publishIterations; i += 1) {
+        publish.push(await connectorActivities.publishConnectorCatalogActivity(input));
+    }
+
+    const embed = await connectorActivities.embedConnectorCatalogActivity(input);
+    const health = await connectorActivities.rollupConnectorHealthActivity();
+    const gc = await connectorActivities.gcConnectorCatalogActivity();
+    return { seed, verify, metadata, publish, embed, health, gc };
+}
 
 function pushEvent(state: TemporalExecutionState, event: SSEProgressEvent): void {
     state.events.push(event);

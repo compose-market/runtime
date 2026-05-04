@@ -9,6 +9,8 @@ import type { ExecutorOptions, Workflow as WorkflowWorkflow, StepApprovalDecisio
 import {
     AGENT_TASK_QUEUE,
     AGENT_WORKFLOW_TYPE,
+    CONNECTOR_CATALOG_WORKFLOW_TYPE,
+    CONNECTOR_TASK_QUEUE,
     WORKFLOW_TASK_QUEUE,
     WORKFLOW_WORKFLOW_TYPE,
     QUERY_GET_AGENT_RUN_STATE,
@@ -19,6 +21,8 @@ import {
 import { getTemporalClient, getTemporalPinnedVersioningOverride } from "./client.js";
 import {
     buildTriggerScheduleId as buildTriggerScheduleIdInternal,
+    CONNECTOR_CATALOG_SCHEDULE_CATCHUP_WINDOW_MS,
+    CONNECTOR_CATALOG_SCHEDULE_OVERLAP_POLICY,
     TRIGGER_SCHEDULE_CATCHUP_WINDOW_MS,
     TRIGGER_SCHEDULE_OVERLAP_POLICY,
 } from "./schedules.js";
@@ -35,6 +39,7 @@ import type {
 const DEFAULT_RUN_TIMEOUT = "6h";
 const DEFAULT_AGENT_TIMEOUT = "30m";
 const ENABLE_CUSTOM_SEARCH_ATTRIBUTES = process.env.TEMPORAL_ENABLE_CUSTOM_SEARCH_ATTRIBUTES === "true";
+const DEFAULT_CONNECTOR_CATALOG_CRON = "0 1 * * *";
 
 export class TemporalRunNotFoundError extends Error {
     readonly code = "TEMPORAL_RUN_NOT_FOUND";
@@ -64,6 +69,11 @@ function isWorkflowNotFoundError(error: unknown): boolean {
         message.includes("unknown execution") ||
         message.includes("workflow execution not found")
     );
+}
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+    const parsed = Number.parseInt(process.env[name] || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 export function buildWorkflowRunWorkflowId(walletAddress: string, runId: string): string {
@@ -436,4 +446,69 @@ export async function listTriggerSchedules(walletAddress: string): Promise<Trigg
     }
 
     return schedules;
+}
+
+export function buildConnectorCatalogScheduleId(): string {
+    return "connector-catalog-maintenance";
+}
+
+export function buildConnectorCatalogScheduleInput(): {
+    seedMaxPages: number;
+    seedIterations: number;
+    verifyLimit: number;
+    verifyIterations: number;
+    metadataLimit: number;
+    metadataIterations: number;
+    publishLimit: number;
+    publishIterations: number;
+    embedLimit: number;
+    shardCount: number;
+} {
+    return {
+        seedMaxPages: readPositiveIntEnv("CONNECTOR_DAILY_SEED_MAX_PAGES", 8),
+        seedIterations: readPositiveIntEnv("CONNECTOR_DAILY_SEED_ITERATIONS", 1),
+        verifyLimit: readPositiveIntEnv("CONNECTOR_DAILY_VERIFY_LIMIT", 5),
+        verifyIterations: readPositiveIntEnv("CONNECTOR_DAILY_VERIFY_ITERATIONS", 1),
+        metadataLimit: readPositiveIntEnv("CONNECTOR_DAILY_METADATA_LIMIT", 25),
+        metadataIterations: readPositiveIntEnv("CONNECTOR_DAILY_METADATA_ITERATIONS", 1),
+        publishLimit: readPositiveIntEnv("CONNECTOR_DAILY_PUBLISH_LIMIT", 250),
+        publishIterations: readPositiveIntEnv("CONNECTOR_DAILY_PUBLISH_ITERATIONS", 1),
+        embedLimit: readPositiveIntEnv("CONNECTOR_DAILY_EMBED_LIMIT", 250),
+        shardCount: readPositiveIntEnv("CONNECTOR_SHARD_COUNT", 3),
+    };
+}
+
+export async function upsertConnectorCatalogSchedule(): Promise<void> {
+    const client = await getTemporalClient();
+    const scheduleId = buildConnectorCatalogScheduleId();
+    const cronExpression = process.env.CONNECTOR_CATALOG_DAILY_CRON || DEFAULT_CONNECTOR_CATALOG_CRON;
+    try {
+        await client.schedule.getHandle(scheduleId).delete();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.toLowerCase().includes("not found")) {
+            throw error;
+        }
+    }
+    await client.schedule.create({
+        scheduleId,
+        spec: {
+            cronExpressions: [cronExpression],
+            timezone: "UTC",
+        },
+        action: {
+            type: "startWorkflow",
+            workflowType: CONNECTOR_CATALOG_WORKFLOW_TYPE,
+            taskQueue: CONNECTOR_TASK_QUEUE,
+            args: [buildConnectorCatalogScheduleInput()],
+        },
+        policies: {
+            overlap: CONNECTOR_CATALOG_SCHEDULE_OVERLAP_POLICY,
+            catchupWindow: CONNECTOR_CATALOG_SCHEDULE_CATCHUP_WINDOW_MS,
+        },
+        state: {
+            paused: false,
+            note: "Daily connector catalog seed/verify/metadata/publish/embed maintenance",
+        },
+    });
 }
