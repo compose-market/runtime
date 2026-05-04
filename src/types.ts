@@ -1,11 +1,11 @@
 /**
  * Compose Runtime - Unified Types
  * 
- * Shared type definitions for all runtime sources (GOAT, MCP, Eliza)
+ * Shared type definitions for all runtime sources.
  */
 
 // Runtime sources
-export type RuntimeSource = 'goat' | 'mcp' | 'eliza';
+export type RuntimeSource = 'tools' | 'onchain' | 'eliza';
 
 // Unified tool interface
 export interface ComposeTool {
@@ -24,9 +24,9 @@ export interface PluginConfig {
     description: string;
 }
 
-// Registry server (replaces scattered MCP references)
+// Registry server
 export interface RegistryServer {
-    registryId: string;  // "goat:coingecko", "mcp:github", "eliza:twitter"
+    registryId: string;  // "tools:github", "onchain:coingecko"
     slug: string;
     name: string;
     description: string;

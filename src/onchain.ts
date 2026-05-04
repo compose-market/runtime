@@ -429,7 +429,13 @@ export async function buildWorkflowWorkflow(chainId: number, workflowId: number)
                     creator: "0x0000000000000000000000000000000000000000",
                     model: metadata.model,
                     framework: metadata.framework || "manowar",
-                    plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
+                    plugins: metadata.plugins?.map((p: any) => typeof p === "string"
+                        ? p
+                        : {
+                            registryId: p.registryId || p.name || p.slug || p.id,
+                            origin: p.origin,
+                            slug: p.slug,
+                        }) || [],
                     systemPrompt: (metadata as any).systemPrompt,
                 });
                 console.log(`[onchain][chain:${chainId}] Successfully registered agent ${metadata.walletAddress}`);

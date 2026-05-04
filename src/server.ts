@@ -24,14 +24,13 @@ import {
   getWalletAddress,
   getPluginIds,
   executeGoatTool,
-} from "./mcps/goat.js";
-import {
-  McpRuntime,
-  McpRuntimeError,
+  ConnectorsError,
   executeServerTool,
   getServerTools,
-} from "./mcps/mcp.js";
-import type { ServerSpawnConfig } from "./mcps/mcp.js";
+  inspectServer,
+  normalizeConnectorBinding,
+} from "./connectors/index.js";
+import type { ServerSpawnConfig } from "./connectors/index.js";
 import {
   resolveRuntimeHostMode,
   shouldInitializeWorkflowRuntime,
@@ -112,7 +111,7 @@ function asyncHandler(
 }
 
 function sendRuntimeError(res: Response, error: unknown, fallback: string): void {
-  if (error instanceof McpRuntimeError) {
+  if (error instanceof ConnectorsError) {
     res.status(error.statusCode).json({
       error: {
         code: error.code,
@@ -144,6 +143,8 @@ function isProtectedRuntimeRoute(pathname: string): boolean {
   return (
     pathname.startsWith("/goat/") ||
     pathname.startsWith("/mcp/") ||
+    pathname.startsWith("/onchain/") ||
+    pathname.startsWith("/tools/") ||
     pathname.startsWith("/runtime/") ||
     pathname.startsWith("/internal/workflow/")
   );
@@ -740,6 +741,7 @@ function validateInspectCandidate(candidate: z.infer<typeof InspectCandidateSche
 
 app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
   const goatStatus = await getRuntimeStatus();
+  const goatPlugins = Array.isArray(goatStatus.plugins) ? goatStatus.plugins : [];
   const hostMode = resolveRuntimeHostMode();
   const temporalWorkersEnabled = shouldInitializeWorkflowRuntime();
 
@@ -755,8 +757,8 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
       mcp: true,
     },
     stats: {
-      goatPlugins: goatStatus.plugins.length,
-      goatTools: goatStatus.totalTools,
+      goatPlugins: goatPlugins.length,
+      goatTools: typeof goatStatus.totalTools === "number" ? goatStatus.totalTools : 0,
     },
     orchestration: {
       durabilityBoundary: "runtime",
@@ -935,28 +937,11 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
 // MCP Server Spawning Routes (On-Demand)
 // ============================================================================
 
-let inspectRuntimePromise: Promise<McpRuntime> | null = null;
-
-async function getInspectRuntime(): Promise<McpRuntime> {
-  if (inspectRuntimePromise) {
-    return await inspectRuntimePromise;
-  }
-
-  inspectRuntimePromise = (async () => {
-    const runtime = new McpRuntime({ maxSessions: 5, sessionTimeoutMs: 60 * 1000 });
-    await runtime.initialize();
-    return runtime;
-  })().catch((error) => {
-    inspectRuntimePromise = null;
-    throw error;
-  });
-
-  return await inspectRuntimePromise;
-}
-
 /**
  * POST /mcp/inspect
- * Internal-only: Spawn a server with candidate configs, list tools, then immediately terminate the session.
+ * Internal-only: delegates to the connectors broker, which spawns the server
+ * with the candidate configs in an ephemeral inspector container, lists
+ * tools, and terminates the session.
  */
 app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
   if (!isInspectEnabled()) {
@@ -998,58 +983,42 @@ app.post("/mcp/inspect", asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
-  for (const candidate of validCandidates) {
-    let sessionId: string | null = null;
-    try {
-      const inspectRuntime = await getInspectRuntime();
-      sessionId = await inspectRuntime.spawnServer(serverId, candidate);
-      const tools = inspectRuntime.getSessionTools(sessionId);
-
-      // Return a capped, minimal tool payload (name + description only).
-      const MAX_TOOLS = 500;
-      const trimmedTools = tools.slice(0, MAX_TOOLS).map((t: any) => ({
-        name: String(t?.name || ""),
-        description: typeof t?.description === "string" ? t.description : undefined,
-      })).filter((t: any) => t.name.length > 0);
-
+  try {
+    const result = await inspectServer(serverId, validCandidates);
+    if (result.ok) {
       res.status(200).json({
         ok: true,
-        serverId,
-        transportUsed: candidate.transport,
-        toolCount: trimmedTools.length,
-        tools: trimmedTools,
+        serverId: result.serverId,
+        transportUsed: result.transportUsed,
+        toolCount: result.toolCount,
+        tools: result.tools,
       });
       return;
-    } catch (error) {
-      if (error instanceof McpRuntimeError) {
-        errors.push({
-          transport: candidate.transport,
-          code: error.code,
-          message: error.message,
-          retryable: error.retryable,
-          statusCode: error.statusCode,
-        });
-      } else {
-        errors.push({
-          transport: candidate.transport,
-          code: "UNKNOWN",
-          message: error instanceof Error ? error.message : String(error),
-          retryable: false,
-        });
-      }
-    } finally {
-      if (sessionId) {
-        try {
-          const inspectRuntime = await getInspectRuntime();
-          await inspectRuntime.terminateSession(sessionId);
-        } catch {
-          // Ignore cleanup errors.
-        }
-      }
     }
+    res.status(200).json({
+      ok: false,
+      serverId: result.serverId,
+      errors: [...errors, ...result.errors],
+    });
+  } catch (error) {
+    if (error instanceof ConnectorsError) {
+      errors.push({
+        transport: "unknown",
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        statusCode: error.statusCode,
+      });
+    } else {
+      errors.push({
+        transport: "unknown",
+        code: "UNKNOWN",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      });
+    }
+    res.status(200).json({ ok: false, serverId, errors });
   }
-
-  res.status(200).json({ ok: false, serverId, errors });
 }));
 
 
@@ -1124,17 +1093,24 @@ app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) =>
 
   try {
     let resultData;
+    const binding = normalizeConnectorBinding(
+      {
+        registryId: source === "goat" || source === "onchain" ? pluginId : serverId,
+        origin: source,
+      },
+      { defaultOrigin: "onchain" },
+    );
 
-    if (source === 'goat') {
-      const result = await executeGoatTool(pluginId, toolName, args || {});
+    if (binding.origin === 'onchain') {
+      const result = await executeGoatTool(binding.slug, toolName, args || {});
       resultData = { success: result.success, result: result.result, error: result.error };
 
-    } else if (source === 'mcp') {
-      const result = await executeServerTool(serverId, toolName, args || {});
+    } else if (binding.origin === 'tools') {
+      const result = await executeServerTool(binding.slug, toolName, args || {});
       resultData = { success: true, result };
 
     } else {
-      res.status(400).json({ error: 'Invalid source. Must be "goat" or "mcp"' });
+      res.status(400).json({ error: 'Invalid source. Must be "onchain" or "tools"' });
       return;
     }
 

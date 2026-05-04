@@ -20,6 +20,7 @@ import {
     signalStepApproval,
     startWorkflowRun,
     TemporalRunNotFoundError,
+    upsertConnectorCatalogSchedule,
 } from "./temporal/service.js";
 import {
     parseTriggerFromNL,
@@ -1590,6 +1591,14 @@ async function ensureMemoryMaintenanceSchedules(): Promise<void> {
     console.log(`[workflow] Memory maintenance schedules ready for ${agentWallets.length} active agents`);
 }
 
+async function ensureConnectorCatalogMaintenanceSchedule(): Promise<void> {
+    if (process.env.CONNECTOR_CATALOG_AUTO_SCHEDULE === "false") {
+        return;
+    }
+    await upsertConnectorCatalogSchedule();
+    console.log("[workflow] Connector catalog daily maintenance schedule ready");
+}
+
 // ============================================================================
 // Server Startup
 // ============================================================================
@@ -1608,6 +1617,9 @@ export function initializeWorkflowRuntime(): void {
     void startWorkflowTemporalWorkers()
         .then(() => {
             console.log("[workflow] Temporal workers ready");
+            void ensureConnectorCatalogMaintenanceSchedule().catch((error) => {
+                console.error("[workflow] Failed to initialize connector catalog maintenance schedule:", error);
+            });
             void ensureMemoryMaintenanceSchedules().catch((error) => {
                 console.error("[workflow] Failed to initialize memory maintenance schedules:", error);
             });
