@@ -1,0 +1,128 @@
+export type ConnectorCatalogPipelineMode = "maintenance" | "first-pass";
+export type ConnectorCatalogPipelineStatus = "queued" | "running" | "complete" | "errored";
+export type ConnectorCatalogPipelineStage = "seed" | "verify" | "metadata" | "publish" | "embed" | "health";
+
+export interface ConnectorCatalogPipelineInput {
+    mode?: ConnectorCatalogPipelineMode;
+    stage?: ConnectorCatalogPipelineStage;
+    seedMaxPages?: number;
+    seedCandidateLimit?: number;
+    seedIterations?: number;
+    verifyLimit?: number;
+    verifyIterations?: number;
+    metadataLimit?: number;
+    metadataIterations?: number;
+    publishLimit?: number;
+    publishIterations?: number;
+    embedLimit?: number;
+    embedIterations?: number;
+    shardCount?: number;
+    resetSeed?: boolean;
+    retryRecent?: boolean;
+    force?: boolean;
+}
+
+export interface NormalizedPipelineInput extends Required<Omit<ConnectorCatalogPipelineInput, "force">> {
+    mode: ConnectorCatalogPipelineMode;
+    stage: ConnectorCatalogPipelineStage;
+}
+
+const FIRST_PASS_DEFAULTS: NormalizedPipelineInput = {
+    mode: "first-pass",
+    stage: "seed",
+    seedMaxPages: 1,
+    seedCandidateLimit: 10,
+    seedIterations: 60,
+    verifyLimit: 1,
+    verifyIterations: 40,
+    metadataLimit: 1,
+    metadataIterations: 80,
+    publishLimit: 100,
+    publishIterations: 40,
+    embedLimit: 100,
+    embedIterations: 40,
+    shardCount: 12,
+    resetSeed: false,
+    retryRecent: false,
+};
+
+const MAINTENANCE_DEFAULTS: NormalizedPipelineInput = {
+    mode: "maintenance",
+    stage: "seed",
+    seedMaxPages: 1,
+    seedCandidateLimit: 10,
+    seedIterations: 20,
+    verifyLimit: 1,
+    verifyIterations: 20,
+    metadataLimit: 1,
+    metadataIterations: 30,
+    publishLimit: 100,
+    publishIterations: 16,
+    embedLimit: 100,
+    embedIterations: 16,
+    shardCount: 6,
+    resetSeed: false,
+    retryRecent: false,
+};
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+    const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(min, Math.min(Math.floor(parsed), max));
+}
+
+export function normalizePipelineInput(input: ConnectorCatalogPipelineInput = {}): NormalizedPipelineInput {
+    const mode: ConnectorCatalogPipelineMode = input.mode === "maintenance" ? "maintenance" : "first-pass";
+    const stage: ConnectorCatalogPipelineStage =
+        input.stage === "verify" ||
+        input.stage === "metadata" ||
+        input.stage === "publish" ||
+        input.stage === "embed" ||
+        input.stage === "health"
+            ? input.stage
+            : "seed";
+    const defaults = mode === "maintenance" ? MAINTENANCE_DEFAULTS : FIRST_PASS_DEFAULTS;
+    return {
+        mode,
+        stage,
+        seedMaxPages: clampInt(input.seedMaxPages, defaults.seedMaxPages, 1, 64),
+        seedCandidateLimit: clampInt(input.seedCandidateLimit, defaults.seedCandidateLimit, 1, 25),
+        seedIterations: clampInt(input.seedIterations, defaults.seedIterations, 1, 80),
+        verifyLimit: clampInt(input.verifyLimit, defaults.verifyLimit, 1, 200),
+        verifyIterations: clampInt(input.verifyIterations, defaults.verifyIterations, 1, 2048),
+        metadataLimit: clampInt(input.metadataLimit, defaults.metadataLimit, 1, 100),
+        metadataIterations: clampInt(input.metadataIterations, defaults.metadataIterations, 1, 4096),
+        publishLimit: clampInt(input.publishLimit, defaults.publishLimit, 1, 500),
+        publishIterations: clampInt(input.publishIterations, defaults.publishIterations, 1, 1024),
+        embedLimit: clampInt(input.embedLimit, defaults.embedLimit, 1, 500),
+        embedIterations: clampInt(input.embedIterations, defaults.embedIterations, 1, 1024),
+        shardCount: clampInt(input.shardCount, defaults.shardCount, 1, 64),
+        resetSeed: input.resetSeed === true,
+        retryRecent: input.retryRecent === true,
+    };
+}
+
+export function createPipelineRunId(mode: ConnectorCatalogPipelineMode, now = new Date()): string {
+    const timestamp = now.toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+    const suffix = crypto.randomUUID().slice(0, 8);
+    return `connector-catalog-${mode}-${timestamp}-${suffix}`;
+}
+
+function parseProgressStage(stage: string | null): { name: string; index: number } | null {
+    if (!stage) return null;
+    const match = /^(seed|verify|metadata-agents|publish|embed):(\d+)$/.exec(stage);
+    if (!match) return null;
+    return { name: match[1], index: Number.parseInt(match[2], 10) };
+}
+
+export function isStageRegression(current: string | null, next: string): boolean {
+    const currentProgress = parseProgressStage(current);
+    const nextProgress = parseProgressStage(next);
+    if (!currentProgress || !nextProgress) return false;
+    return currentProgress.name === nextProgress.name && currentProgress.index > nextProgress.index;
+}
+
+export const __test = {
+    normalizePipelineInput,
+    isStageRegression,
+};
