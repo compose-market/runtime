@@ -1,0 +1,9 @@
+node_modules/
+package-lock.json
+# wrangler.toml is generated at deploy time from wrangler.toml.template
+# (envsubst'd with values from runtime/.env). Never commit it.
+wrangler.toml
+.wrangler/
+dist/
+.wrangler-logs
+.env

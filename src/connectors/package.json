@@ -1,0 +1,52 @@
+{
+    "name": "@compose/connectors",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "render-config": "set -a && . ../../.env && set +a && envsubst '${D1_SQL_ID} ${CF_ACCOUNT_ID}' < wrangler.toml.template > wrangler.toml",
+        "dev": "npm run render-config && set -a && . ../../.env && set +a && env -u CF_ACCOUNT_ID -u CF_API_TOKEN -u CF_API_KEY -u CLOUDFLARE_EMAIL -u CLOUDFLARE_EMAIL -u CLOUDFLARE_API_KEY CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN=$CF_GLOBAL_TOKEN wrangler dev",
+        "deploy": "npm run render-config && set -a && . ../../.env && set +a && env -u CF_ACCOUNT_ID -u CF_API_TOKEN -u CF_API_KEY -u CLOUDFLARE_EMAIL -u CLOUDFLARE_EMAIL -u CLOUDFLARE_API_KEY CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN=$CF_GLOBAL_TOKEN wrangler deploy",
+        "schema:apply": "npm run render-config && set -a && . ../../.env && set +a && env -u CF_ACCOUNT_ID -u CF_API_TOKEN -u CF_API_KEY -u CLOUDFLARE_EMAIL -u CLOUDFLARE_EMAIL -u CLOUDFLARE_API_KEY CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN=$CF_GLOBAL_TOKEN wrangler d1 execute catalog --file=schema/catalog.sql --remote",
+        "schema:apply:local": "npm run render-config && wrangler d1 execute catalog --file=schema/catalog.sql --local",
+        "secrets:put": "npm run render-config && set -a && . ../../.env && set +a && env -u CF_ACCOUNT_ID -u CF_API_TOKEN -u CF_API_KEY -u CLOUDFLARE_EMAIL -u CLOUDFLARE_EMAIL -u CLOUDFLARE_API_KEY CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN=$CF_GLOBAL_TOKEN bash -c 'for k in RUNTIME_INTERNAL_SECRET MONGO_DB_API_KEY GHCR_TOKEN CF_API_TOKEN SERVER_PRIVATE_KEY GOOGLE_GENERATIVE_AI_API_KEY FIREWORKS_API_KEY; do echo \"setting $k\"; printf %s \"${!k}\" | wrangler secret put $k; done; for k in COINGECKO_API_KEY ONEINCH_API_KEY ZEROX_API_KEY ETHERSCAN_API_KEY POLYMARKET_API_KEY UNISWAP_API_KEY; do if [ -n \"${!k}\" ]; then echo \"setting $k\"; printf %s \"${!k}\" | wrangler secret put $k; fi; done'",
+        "test": "vitest run --root ../.. tests/connectors"
+    },
+    "dependencies": {
+        "@cloudflare/containers": "^0.3.3",
+        "@goat-sdk/adapter-vercel-ai": "^0.2.10",
+        "@goat-sdk/core": "^0.5.0",
+        "@goat-sdk/plugin-0x": "^0.1.11",
+        "@goat-sdk/plugin-1inch": "^0.1.9",
+        "@goat-sdk/plugin-allora": "^0.1.7",
+        "@goat-sdk/plugin-coingecko": "^0.2.10",
+        "@goat-sdk/plugin-debridge": "^0.0.8",
+        "@goat-sdk/plugin-dexscreener": "^0.1.9",
+        "@goat-sdk/plugin-ens": "^0.1.4",
+        "@goat-sdk/plugin-erc1155": "^0.1.3",
+        "@goat-sdk/plugin-erc20": "^0.2.14",
+        "@goat-sdk/plugin-erc721": "^0.1.22",
+        "@goat-sdk/plugin-etherscan": "^0.1.4",
+        "@goat-sdk/plugin-farcaster": "^0.1.6",
+        "@goat-sdk/plugin-jsonrpc": "^0.1.6",
+        "@goat-sdk/plugin-lifi": "^0.1.0",
+        "@goat-sdk/plugin-nansen": "^0.1.7",
+        "@goat-sdk/plugin-opensea": "^0.1.6",
+        "@goat-sdk/plugin-polymarket": "^0.3.14",
+        "@goat-sdk/plugin-superfluid": "^0.1.10",
+        "@goat-sdk/plugin-uniswap": "^0.2.16",
+        "@goat-sdk/wallet-evm": "^0.3.0",
+        "@goat-sdk/wallet-viem": "^0.3.0",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "hono": "^4.12.16",
+        "viem": "^2.48.7",
+        "zod": "^4.4.2",
+        "zod-to-json-schema": "^3.25.2"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^4.20260501.1",
+        "typescript": "^6.0.3",
+        "vitest": "^4.1.5",
+        "wrangler": "^4.87.0"
+    }
+}

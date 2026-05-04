@@ -1,0 +1,110 @@
+name = "connectors"
+main = "worker/entry.ts"
+compatibility_date = "2026-05-03"
+compatibility_flags = ["nodejs_compat"]
+# Rendered from runtime/.env CF_ACCOUNT_ID by `npm run render-config`.
+account_id = "${CF_ACCOUNT_ID}"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Custom Domain `connectors.compose.market` is bound out-of-band via the
+# Cloudflare API (PUT /accounts/{acc}/workers/domains). Wrangler's
+# pre-deploy check would call GET /zones/{id}/workers/routes which
+# requires zone-level Workers Routes:Read on the API token; the cfat_*
+# token used here is account-scoped and that GET fails (code 10000),
+# blocking deploy. Binding the domain via the account-scoped Workers
+# Domains endpoint bypasses that check entirely.
+#
+# To attach (one-time) or re-attach the Custom Domain:
+#   curl -X PUT https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains \
+#     -H "Authorization: Bearer $CF_GLOBAL_TOKEN" \
+#     -H "Content-Type: application/json" \
+#     -d '{"environment":"production","hostname":"connectors.compose.market","service":"connectors","zone_id":"1e15c817645029697921095d54be2cec"}'
+#
+# After that initial bind, every `wrangler deploy` updates the Worker's
+# code and the existing Custom Domain stays bound automatically.
+
+# D1: catalog. database_id is read from the D1_SQL_ID env var via wrangler's
+# ${VAR} substitution (wrangler >= 4.76.0 supports this in wrangler.toml).
+[[d1_databases]]
+binding = "CATALOG"
+database_name = "catalog"
+database_id = "${D1_SQL_ID}"
+
+# R2 buckets (names match the pre-provisioned buckets on the account).
+[[r2_buckets]]
+binding = "RAW"
+bucket_name = "raw"
+
+[[r2_buckets]]
+binding = "SNAPSHOTS"
+bucket_name = "snapshots"
+
+[[r2_buckets]]
+binding = "CARDS"
+bucket_name = "cards"
+
+# Vectorize: card embeddings for semantic search
+[[vectorize]]
+binding = "EMBEDDINGS"
+index_name = "embeddings"
+
+# AI Gateway / Workers AI: routes compiler model calls
+[ai]
+binding = "AI"
+
+# Cloudflare Container runner for stdio/npx MCPs. The Worker remains the
+# control plane; this container is the process boundary that can run
+# Supergateway and the MCP child process for one inspect/call.
+[[durable_objects.bindings]]
+name = "MCP_RUNNER"
+class_name = "McpRunnerContainer"
+
+[[containers]]
+name = "mcp-runner"
+class_name = "McpRunnerContainer"
+image = "./runner/Dockerfile"
+image_build_context = "./runner"
+instance_type = "lite"
+max_instances = 32
+rollout_step_percentage = [100]
+
+[[workflows]]
+binding = "CATALOG_PIPELINE"
+name = "connector-catalog-pipeline"
+class_name = "ConnectorCatalogPipelineWorkflow"
+limits = { steps = 2048 }
+
+[[migrations]]
+tag = "v1-mcp-runner-container"
+new_sqlite_classes = ["McpRunnerContainer"]
+
+# Cron trigger — starts the full Cloudflare Workflow pipeline. The Workflow
+# performs seed → verify → metadata agents → publish → embed → health → gc.
+[triggers]
+crons = [
+  "0 2 * * *"       # daily full catalog maintenance
+]
+
+# Non-secret config. Read by the Worker as env.<NAME>.
+[vars]
+GHCR_NAMESPACE = "ghcr.io/compose-market/mcp"
+MCP_REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
+EMBEDDING_MODEL = "voyage-4-large"
+EMBEDDING_API_BASE = "https://ai.mongodb.com/v1"
+COMPILER_MODEL_PRIMARY = "gemini-2.5-flash"
+COMPILER_MODEL_SECONDARY = "@cf/openai/gpt-oss-120b"
+COMPILER_MODEL_TERTIARY = "deepseek-v3p2"
+MCP_RUNNER_INSTANCES = "32"
+MCP_RUNNER_SHUTDOWN_AFTER_REQUEST = "true"
+
+# Secrets (set via `wrangler secret put` against runtime/.env values):
+#   - RUNTIME_INTERNAL_SECRET   (Bearer auth, same value as runtime/.env line 64)
+#   - MONGO_DB_API_KEY          (Voyage embeddings via Mongo AI Gateway)
+#   - GHCR_TOKEN                (read GHCR images if needed)
+#   - CF_API_TOKEN              (admin Cloudflare ops)
+#   - SERVER_PRIVATE_KEY        (treasury wallet for GOAT path; same as runtime/.env)
+#   - GOOGLE_GENERATIVE_AI_API_KEY  (Gemini compiler model)
+#   - FIREWORKS_API_KEY              (DeepSeek compiler model)
