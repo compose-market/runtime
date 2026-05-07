@@ -10,8 +10,9 @@ import {
     type TransportRow,
 } from "../catalog/d1.js";
 import type { MetadataAgentArtifact } from "./metadata/agents.js";
-import type { CatalogCandidate, CatalogCandidateTransport } from "./candidates.js";
+import { cleanCandidateSlug, type CatalogCandidate, type CatalogCandidateTransport } from "./candidates.js";
 import { hashShard, type ObservedCandidateTool, type ScreenedTransport } from "./screening.js";
+import { clearStageItemError, recordStageItemError } from "./stage-errors.js";
 
 interface MetadataAgentReviewRow {
     server_slug: string;
@@ -24,6 +25,8 @@ interface MetadataAgentReviewRow {
     reviewed_at: string | null;
 }
 
+const PUBLISH_ERROR_LIMIT = 50;
+
 export interface PublishReport {
     started_at: string;
     finished_at: string;
@@ -31,6 +34,11 @@ export interface PublishReport {
     published: number;
     skipped: number;
     errors: Array<{ slug: string; message: string }>;
+}
+
+interface StageLaneOptions {
+    laneId?: number;
+    laneCount?: number;
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {
@@ -45,11 +53,23 @@ async function ensurePublishSchema(env: Env): Promise<void> {
         if (!/no such column/i.test(message)) throw error;
         await env.CATALOG.prepare(`ALTER TABLE metadata_agent_reviews ADD COLUMN canonical_agent_id INTEGER`).run();
     }
+    for (const column of [
+        ["runner_profile", "TEXT"],
+        ["deadline_ms", "INTEGER"],
+    ] as const) {
+        try {
+            await env.CATALOG.prepare(`SELECT ${column[0]} FROM transports LIMIT 1`).first();
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/no such column/i.test(message)) throw error;
+            await env.CATALOG.prepare(`ALTER TABLE transports ADD COLUMN ${column[0]} ${column[1]}`).run();
+        }
+    }
 }
 
 function validateArtifact(artifact: MetadataAgentArtifact): { ok: true; status: "live" | "credential_gated" } | { ok: false; reason: string } {
     if (artifact.status !== "complete") return { ok: false, reason: "artifact is not complete" };
-    if (!artifact.card?.name || !artifact.card.description || !Array.isArray(artifact.card.tags)) {
+    if (!artifact.card?.name || !artifact.card.slug || !artifact.card.description || !Array.isArray(artifact.card.tags)) {
         return { ok: false, reason: "artifact missing reviewed card" };
     }
     if (artifact.catalogStatus === "credential_gated") {
@@ -87,6 +107,8 @@ function toTransportRow(candidate: CatalogCandidate, observed: ScreenedTransport
         last_failure_at: null,
         failure_streak: 0,
         median_latency_ms: observed.latencyMs,
+        runner_profile: observed.runnerProfile ?? null,
+        deadline_ms: observed.deadlineMs ?? null,
         priority: transport.priority,
     };
 }
@@ -107,6 +129,8 @@ function toCredentialGatedTransportRow(candidate: CatalogCandidate, transport: C
         last_failure_at: new Date().toISOString(),
         failure_streak: 1,
         median_latency_ms: null,
+        runner_profile: null,
+        deadline_ms: null,
         priority: transport.priority,
     };
 }
@@ -142,18 +166,33 @@ async function readArtifact(env: Env, row: MetadataAgentReviewRow): Promise<Meta
     }
 }
 
-async function alreadyPublished(env: Env, row: MetadataAgentReviewRow): Promise<boolean> {
-    if (!row.card_version) return false;
-    const hit = await env.CATALOG.prepare(
-        `SELECT 1 AS ok
-         FROM servers s
-         JOIN metadata_reviews m ON m.server_slug = s.slug AND m.card_version = s.card_version
-         WHERE s.slug = ?1
-           AND s.card_version = ?2
-           AND s.status IN ('live', 'credential_gated')
-         LIMIT 1`,
-    ).bind(row.server_slug, row.card_version).first<{ ok: number }>();
-    return Boolean(hit);
+function recordPublishError(errors: PublishReport["errors"], slug: string, message: string): void {
+    if (errors.length < PUBLISH_ERROR_LIMIT) {
+        errors.push({ slug, message });
+    }
+}
+
+function publishableReviewRowsSql(): string {
+    return `SELECT r.server_slug, r.source_hash, r.source_version, r.agent_id, r.artifact_key, r.card_version, r.canonical_agent_id, r.reviewed_at
+         FROM metadata_agent_reviews r
+         WHERE r.status = 'complete'
+           AND r.artifact_key IS NOT NULL
+           AND r.card_version IS NOT NULL
+           AND (r.canonical_agent_id = r.agent_id OR r.canonical_agent_id IS NULL)
+	           AND NOT EXISTS (
+	                SELECT 1
+	                FROM servers s
+	                JOIN metadata_reviews m
+	                  ON m.server_slug = s.slug
+	                 AND m.card_version = s.card_version
+	                LEFT JOIN aliases a
+	                  ON a.server_slug = s.slug
+	                WHERE (s.slug = r.server_slug OR a.alias_id = r.server_slug)
+	                  AND s.card_version = r.card_version
+	                  AND s.status IN ('live', 'credential_gated')
+	           )
+         ORDER BY reviewed_at DESC
+         LIMIT ?1`;
 }
 
 async function markReviewRetryable(env: Env, row: MetadataAgentReviewRow, message: string): Promise<void> {
@@ -207,51 +246,84 @@ function selectLatestCanonicalRows(rows: MetadataAgentReviewRow[], limit: number
         .slice(0, limit);
 }
 
-export async function runPublish(env: Env, options: { limit?: number } = {}): Promise<PublishReport> {
+function normalizeLane(options: StageLaneOptions): { laneId: number; laneCount: number } {
+    const laneCount = Math.max(1, Math.min(Math.floor(options.laneCount ?? 1), 64));
+    const laneId = Math.max(0, Math.min(Math.floor(options.laneId ?? 0), laneCount - 1));
+    return { laneId, laneCount };
+}
+
+function publishLaneShard(row: Pick<MetadataAgentReviewRow, "server_slug" | "source_hash">, laneCount: number): number {
+    return hashShard(`${row.server_slug}:${row.source_hash}`, laneCount);
+}
+
+function publishIdentity(row: Pick<MetadataAgentReviewRow, "server_slug">, artifact: Pick<MetadataAgentArtifact, "slug" | "card" | "candidate">): {
+    canonicalSlug: string;
+    sourceSlug: string;
+    aliasIds: string[];
+} {
+    const sourceSlug = row.server_slug;
+    const reviewedSlug = cleanCandidateSlug(artifact.card.slug);
+    const nameSlug = cleanCandidateSlug(artifact.card.name);
+    const canonicalSlug = reviewedSlug || nameSlug || sourceSlug;
+    const aliasIds = [
+        sourceSlug,
+        canonicalSlug,
+        artifact.slug,
+        artifact.candidate.slug,
+        artifact.candidate.rawName,
+        nameSlug,
+        reviewedSlug,
+        `mcp:${sourceSlug}`,
+        `mcp-${sourceSlug}`,
+        `mcp:${canonicalSlug}`,
+        `mcp-${canonicalSlug}`,
+        nameSlug ? `mcp:${nameSlug}` : "",
+        nameSlug ? `mcp-${nameSlug}` : "",
+    ]
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+    return {
+        canonicalSlug,
+        sourceSlug,
+        aliasIds: [...new Set(aliasIds)],
+    };
+}
+
+export async function runPublish(env: Env, options: { limit?: number } & StageLaneOptions = {}): Promise<PublishReport> {
     const started = new Date().toISOString();
     await ensurePublishSchema(env);
     const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
+    const lane = normalizeLane(options);
     const errors: Array<{ slug: string; message: string }> = [];
     let examined = 0;
     let published = 0;
     let skipped = 0;
 
-    const pageSize = Math.min(Math.max(limit * 200, 10_000), 50_000);
-    const rows = await env.CATALOG.prepare(
-        `SELECT r.server_slug, r.source_hash, r.source_version, r.agent_id, r.artifact_key, r.card_version, r.canonical_agent_id, r.reviewed_at
-         FROM metadata_agent_reviews r
-         WHERE r.status = 'complete'
-           AND r.artifact_key IS NOT NULL
-           AND r.card_version IS NOT NULL
-           AND (r.canonical_agent_id = r.agent_id OR r.canonical_agent_id IS NULL)
-         ORDER BY reviewed_at DESC
-         LIMIT ?1`,
-    ).bind(pageSize).all<MetadataAgentReviewRow>();
+    const pageSize = Math.min(Math.max(limit * lane.laneCount * 200, 10_000), 50_000);
+    const rows = await env.CATALOG.prepare(publishableReviewRowsSql()).bind(pageSize).all<MetadataAgentReviewRow>();
 
     for (const row of selectLatestCanonicalRows(rows.results || [], pageSize)) {
         try {
-            if (await alreadyPublished(env, row)) {
-                skipped++;
-                continue;
-            }
+            if (publishLaneShard(row, lane.laneCount) !== lane.laneId) continue;
             if (examined >= limit) break;
             examined++;
             const artifact = await readArtifact(env, row);
             if (!artifact) {
                 const message = "metadata artifact missing or invalid";
                 await markReviewRetryable(env, row, message);
-                errors.push({ slug: row.server_slug, message });
+                recordPublishError(errors, row.server_slug, message);
                 continue;
             }
             const validation = validateArtifact(artifact);
             if (!validation.ok) {
                 await markReviewRetryable(env, row, validation.reason);
-                errors.push({ slug: row.server_slug, message: validation.reason });
+                recordPublishError(errors, row.server_slug, validation.reason);
                 continue;
             }
+            const identity = publishIdentity(row, artifact);
             const now = new Date().toISOString();
             const server: ServerRow = {
-                slug: artifact.slug,
+                slug: identity.canonicalSlug,
                 origin: "tools",
                 name: artifact.card.name,
                 namespace: artifact.candidate.namespace,
@@ -271,21 +343,23 @@ export async function runPublish(env: Env, options: { limit?: number } = {}): Pr
             const transportRows = validation.status === "live"
                 ? dedupeTransportRows(artifact.observedTransports.map((transport) => toTransportRow(artifact.candidate, transport)))
                 : dedupeTransportRows(artifact.candidate.transports.map((transport) => toCredentialGatedTransportRow(artifact.candidate, transport, artifact.credentialVars)));
-            const toolRows = validation.status === "live" ? toToolRows(artifact.slug, artifact.observedTools, artifact.cardVersion) : [];
+            const transportRowsForCanonicalSlug = transportRows.map((transport) => ({ ...transport, server_slug: identity.canonicalSlug }));
+            const toolRows = validation.status === "live" ? toToolRows(identity.canonicalSlug, artifact.observedTools, artifact.cardVersion) : [];
             const credentialRows = artifact.credentialVars.map((varName) => {
                 const declared = artifact.candidate.credentials.find((credential) => credential.varName === varName);
                 return upsertCredentialStmt(env, {
-                    server_slug: artifact.slug,
+                    server_slug: identity.canonicalSlug,
                     var_name: varName,
                     description: declared?.description ?? null,
                     obtain_url: declared?.obtainUrl ?? null,
                     evidence_key: artifact.sourceScreeningKey,
                 });
             });
-            const finalCardKey = `cards/${artifact.slug}/${artifact.cardVersion}.json`;
+            const finalCardKey = `cards/${identity.canonicalSlug}/${artifact.cardVersion}.json`;
             await env.CARDS.put(finalCardKey, JSON.stringify({
                 ...artifact.card,
-                slug: artifact.slug,
+                slug: identity.canonicalSlug,
+                sourceSlug: artifact.slug,
                 sourceVersion: artifact.sourceVersion,
                 sourceHash: artifact.sourceHash,
                 cardVersion: artifact.cardVersion,
@@ -300,11 +374,18 @@ export async function runPublish(env: Env, options: { limit?: number } = {}): Pr
             }), { httpMetadata: { contentType: "application/json" } });
 
             await env.CATALOG.batch([
-                env.CATALOG.prepare("DELETE FROM tools WHERE server_slug = ?1").bind(artifact.slug),
-                env.CATALOG.prepare("DELETE FROM transports WHERE server_slug = ?1").bind(artifact.slug),
-                env.CATALOG.prepare("DELETE FROM credentials WHERE server_slug = ?1").bind(artifact.slug),
+                env.CATALOG.prepare("DELETE FROM tools WHERE server_slug = ?1").bind(identity.canonicalSlug),
+                env.CATALOG.prepare("DELETE FROM transports WHERE server_slug = ?1").bind(identity.canonicalSlug),
+                env.CATALOG.prepare("DELETE FROM credentials WHERE server_slug = ?1").bind(identity.canonicalSlug),
+                env.CATALOG.prepare(
+                    `UPDATE servers
+                     SET status = 'deprecated',
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE slug = ?1
+                       AND slug != ?2`,
+                ).bind(identity.sourceSlug, identity.canonicalSlug),
                 upsertServerStmt(env, server),
-                ...transportRows.map((transport) => upsertTransportStmt(env, transport)),
+                ...transportRowsForCanonicalSlug.map((transport) => upsertTransportStmt(env, transport)),
                 ...toolRows.map((tool) => upsertToolStmt(env, tool)),
                 ...credentialRows,
                 env.CATALOG.prepare(
@@ -320,7 +401,7 @@ export async function runPublish(env: Env, options: { limit?: number } = {}): Pr
                         reviewed_at = excluded.reviewed_at,
                         card_version = excluded.card_version`,
                 ).bind(
-                    artifact.slug,
+                    identity.canonicalSlug,
                     artifact.card.name,
                     artifact.card.description,
                     JSON.stringify(artifact.card.tags),
@@ -333,7 +414,7 @@ export async function runPublish(env: Env, options: { limit?: number } = {}): Pr
                 env.CATALOG.prepare(
                     `INSERT INTO versions (server_slug, card_version, card_key) VALUES (?1, ?2, ?3)
                      ON CONFLICT(server_slug, card_version) DO NOTHING`,
-                ).bind(artifact.slug, artifact.cardVersion, finalCardKey),
+                ).bind(identity.canonicalSlug, artifact.cardVersion, finalCardKey),
                 env.CATALOG.prepare(
                     `INSERT INTO catalog_decisions (server_slug, decision, reason, source_version, decided_by, decided_at)
                      VALUES (?1, 'serve', ?2, ?3, 'catalog-publisher', CURRENT_TIMESTAMP)
@@ -344,19 +425,29 @@ export async function runPublish(env: Env, options: { limit?: number } = {}): Pr
                         decided_by = excluded.decided_by,
                         decided_at = CURRENT_TIMESTAMP`,
                 ).bind(
-                    artifact.slug,
+                    identity.canonicalSlug,
                     validation.status === "credential_gated"
                         ? "metadata-agent respawn produced credential-required evidence"
                         : "metadata-agent respawn produced observed tools and schemas",
                     `${artifact.sourceVersion}:${artifact.sourceHash}`,
                 ),
-                upsertAliasStmt(env, { alias_id: `mcp:${artifact.slug}`, server_slug: artifact.slug }),
-                upsertAliasStmt(env, { alias_id: `mcp-${artifact.slug}`, server_slug: artifact.slug }),
-                upsertAliasStmt(env, { alias_id: artifact.candidate.rawName, server_slug: artifact.slug }),
+                ...identity.aliasIds.map((aliasId) => upsertAliasStmt(env, { alias_id: aliasId, server_slug: identity.canonicalSlug })),
             ]);
+            await clearStageItemError(env, {
+                itemId: row.server_slug,
+                itemVersion: row.source_hash,
+                stage: "publish",
+            }).catch(() => undefined);
             published++;
         } catch (error) {
-            errors.push({ slug: row.server_slug, message: error instanceof Error ? error.message : String(error) });
+            const message = error instanceof Error ? error.message : String(error);
+            await recordStageItemError(env, {
+                itemId: row.server_slug,
+                itemVersion: row.source_hash,
+                stage: "publish",
+                message,
+            }).catch(() => undefined);
+            recordPublishError(errors, row.server_slug, message);
         }
     }
 
@@ -374,4 +465,8 @@ export const __test = {
     validateArtifact,
     selectLatestCanonicalRows,
     isCanonicalShard,
+    publishIdentity,
+    publishLaneShard,
+    publishableReviewRowsSql,
+    recordPublishError,
 };

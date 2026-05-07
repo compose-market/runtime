@@ -13,6 +13,9 @@ export interface ScreenedTransport {
     transport: CatalogCandidateTransport;
     tools: ObservedCandidateTool[];
     latencyMs: number;
+    runnerProfile?: string | null;
+    deadlineMs?: number | null;
+    serverInfo?: Record<string, unknown> | null;
     observedAt: string;
 }
 
@@ -22,6 +25,7 @@ export interface ScreeningError {
     message: string;
     credentialVars?: string[];
     retryable?: boolean;
+    retryClass?: string;
 }
 
 export interface ScreeningArtifact {
@@ -59,6 +63,10 @@ export function hashShard(input: string, shardCount: number): number {
         hash = Math.imul(hash, 16777619);
     }
     return (hash >>> 0) % Math.max(1, shardCount);
+}
+
+export function metadataLaneShard(row: Pick<ScreeningRow, "server_slug" | "source_hash">, laneCount: number): number {
+    return hashShard(`${row.server_slug}:${row.source_hash}:metadata-lane`, laneCount);
 }
 
 export function screeningObjectKey(candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): string {
@@ -163,6 +171,21 @@ export async function hasRecentRetryableScreening(
     if (!row?.updated_at) return false;
     const updatedAt = new Date(row.updated_at).getTime();
     return Number.isFinite(updatedAt) && Date.now() - updatedAt < backoffMs;
+}
+
+export async function readRetryableScreeningErrors(
+    env: Env,
+    candidate: Pick<CatalogCandidate, "slug" | "sourceHash">,
+): Promise<ScreeningError[] | null> {
+    const row = await env.CATALOG.prepare(
+        `SELECT errors FROM candidate_screenings
+         WHERE server_slug = ?1
+           AND source_hash = ?2
+           AND status = 'retryable'
+         LIMIT 1`,
+    ).bind(candidate.slug, candidate.sourceHash).first<{ errors: string }>();
+    if (!row) return null;
+    return parseScreeningJsonArray<ScreeningError>(row.errors);
 }
 
 export function parseScreeningJsonArray<T>(value: string): T[] {

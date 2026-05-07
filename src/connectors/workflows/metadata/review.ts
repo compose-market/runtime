@@ -3,7 +3,7 @@
  *
  * The three metadata agents are concrete model routes:
  *   0 - Gemini Flash via GOOGLE_GENERATIVE_AI_API_KEY
- *   1 - Workers AI via the AI binding
+ *   1 - Fireworks MiniMax via FIREWORKS_API_KEY
  *   2 - Fireworks DeepSeek via FIREWORKS_API_KEY
  *
  * They produce metadata only from observed spawn output (or explicit
@@ -12,17 +12,25 @@
 
 import type { Env } from "../../worker/env.js";
 
-const SYSTEM_PROMPT = `You normalize MCP server metadata from observed MCP spawn evidence. Output JSON with cleaned fields. Output ONLY a single JSON object, no markdown.
+const SYSTEM_PROMPT = `Spawn the MCP Server, and use the correct name and slug returned by the spawned-server's metadata. Output ONLY a single JSON object, no markdown.
+
+Examples:
+Good server name: "Server Name"
+Bad server names: "io-github-server-name"; "jimmy-chow-server-name"; "Server Name by Jimmy Chow"; "MCP Server Server Name"; "Server Name MCP"
+Good slug: "server-name"
+Bad slugs: "io-github-server-name"; "jimmy-chow-server-name"; "server-name-by-jimmy-chow"; "mcp-server-server-name"; "server-name-mcp"
 
 Schema:
 {
   "name": string,
+  "slug": string,
   "description": string,
   "tags": string[]
 }`;
 
 export interface ReviewedCard {
     name: string;
+    slug: string;
     description: string;
     tags: string[];
 }
@@ -33,18 +41,30 @@ export interface MetadataReviewInput {
     description: string;
     tools: Array<{ name: string; description: string | null; inputSchema?: Record<string, unknown> }>;
     credentialVars?: string[];
+    serverInfo?: Record<string, unknown> | null;
+}
+
+export class MetadataReviewProviderError extends Error {
+    provider: string;
+
+    constructor(provider: string, message: string) {
+        super(`${provider}: ${message}`);
+        this.name = "MetadataReviewProviderError";
+        this.provider = provider;
+    }
 }
 
 export function reviewerForAgent(agentId: number): string {
-    if (agentId === 0) return "metadata-agent-0:gemini-2.5-flash";
-    if (agentId === 1) return "metadata-agent-1:workers-ai";
-    if (agentId === 2) return "metadata-agent-2:fireworks-deepseek";
+    if (agentId === 0) return "metadata-agent-0:gemini-2.5-flash:spawn-metadata-v2";
+    if (agentId === 1) return "metadata-agent-1:fireworks-minimax-m2p7:spawn-metadata-v2";
+    if (agentId === 2) return "metadata-agent-2:fireworks-deepseek-v3p2:spawn-metadata-v2";
     throw new Error("agentId must be 0, 1, or 2");
 }
 
 function validate(card: ReviewedCard | null): card is ReviewedCard {
     if (!card || typeof card !== "object") return false;
     if (typeof card.name !== "string" || card.name.trim().length === 0) return false;
+    if (typeof card.slug !== "string" || card.slug.trim().length === 0) return false;
     if (typeof card.description !== "string" || card.description.trim().length === 0) return false;
     if (!Array.isArray(card.tags) || card.tags.length === 0) return false;
     for (const tag of card.tags) {
@@ -58,6 +78,7 @@ function buildUserPrompt(input: MetadataReviewInput): string {
     const lines = [`Raw server name: ${input.name}`];
     if (input.repoUrl) lines.push(`Repository: ${input.repoUrl}`);
     if (input.description) lines.push(`Registry description for disambiguation only: ${input.description}`);
+    if (input.serverInfo) lines.push(`Spawned-server metadata: ${JSON.stringify(input.serverInfo)}`);
     if (input.credentialVars && input.credentialVars.length > 0) {
         lines.push(`Credential-required evidence: ${input.credentialVars.join(", ")}`);
         lines.push("No tools were guessed. Describe only the server identity and credential-gated access.");
@@ -73,9 +94,27 @@ function buildUserPrompt(input: MetadataReviewInput): string {
     return lines.join("\n");
 }
 
-async function callGeminiFlash(env: Env, prompt: string): Promise<ReviewedCard | null> {
+function providerCard(provider: string, text: string): ReviewedCard {
+    const card = parseStrict(text);
+    if (!card) {
+        throw new MetadataReviewProviderError(provider, "model returned invalid metadata JSON");
+    }
+    return card;
+}
+
+function parseJsonResponse<T>(provider: string, text: string): T {
+    try {
+        return JSON.parse(text) as T;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new MetadataReviewProviderError(provider, `response was not valid JSON: ${message}`);
+    }
+}
+
+async function callGeminiFlash(env: Env, prompt: string): Promise<ReviewedCard> {
+    const provider = "Gemini";
     const apiKey = (env as unknown as Record<string, string | undefined>).GOOGLE_GENERATIVE_AI_API_KEY;
-    if (!apiKey) return null;
+    if (!apiKey) throw new MetadataReviewProviderError(provider, "GOOGLE_GENERATIVE_AI_API_KEY is not configured");
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${env.COMPILER_MODEL_PRIMARY}:generateContent?key=${apiKey}`;
     const r = await fetch(url, {
         method: "POST",
@@ -85,62 +124,26 @@ async function callGeminiFlash(env: Env, prompt: string): Promise<ReviewedCard |
             generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
         }),
     });
-    if (!r.ok) return null;
-    const body = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const responseText = await r.text();
+    if (!r.ok) throw new MetadataReviewProviderError(provider, `HTTP ${r.status}: ${responseText.slice(0, 300)}`);
+    const body = parseJsonResponse<{ candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }>(provider, responseText);
     const text = body.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    return parseStrict(text);
+    if (!text.trim()) throw new MetadataReviewProviderError(provider, "response did not include candidate text");
+    return providerCard(provider, text);
 }
 
-async function callWorkersAi(env: Env, prompt: string): Promise<ReviewedCard | null> {
-    try {
-        const result = await env.AI.run<AiChatResult>(env.COMPILER_MODEL_SECONDARY, {
-            messages: [
-                { role: "system", content: SYSTEM_PROMPT },
-                { role: "user", content: prompt },
-            ],
-            temperature: 0.2,
-        });
-        const text = extractAiText(result);
-        return parseStrict(text);
-    } catch {
-        return null;
-    }
+function fireworksModelId(model: string): string {
+    return model.startsWith("accounts/") ? model : `accounts/fireworks/models/${model}`;
 }
 
-interface AiChatResult {
-    response?: string;
-    choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
-    result?: {
-        response?: string;
-        choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
-    };
-}
-
-function extractAiText(result: AiChatResult): string {
-    const candidates = [
-        result.response,
-        result.choices?.[0]?.message?.content,
-        result.result?.response,
-        result.result?.choices?.[0]?.message?.content,
-    ];
-    for (const candidate of candidates) {
-        if (typeof candidate === "string" && candidate.trim().length > 0) return candidate;
-        if (Array.isArray(candidate)) {
-            const text = candidate.map((part) => part.text || "").join("").trim();
-            if (text) return text;
-        }
-    }
-    return JSON.stringify(result);
-}
-
-async function callFireworks(env: Env, prompt: string): Promise<ReviewedCard | null> {
+async function callFireworks(env: Env, prompt: string, model: string, provider: string): Promise<ReviewedCard> {
     const key = (env as unknown as Record<string, string | undefined>).FIREWORKS_API_KEY;
-    if (!key) return null;
+    if (!key) throw new MetadataReviewProviderError(provider, "FIREWORKS_API_KEY is not configured");
     const r = await fetch("https://api.fireworks.ai/inference/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
         body: JSON.stringify({
-            model: `accounts/fireworks/models/${env.COMPILER_MODEL_TERTIARY}`,
+            model: fireworksModelId(model),
             messages: [
                 { role: "system", content: SYSTEM_PROMPT },
                 { role: "user", content: prompt },
@@ -148,10 +151,12 @@ async function callFireworks(env: Env, prompt: string): Promise<ReviewedCard | n
             temperature: 0.2,
         }),
     });
-    if (!r.ok) return null;
-    const body = await r.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const responseText = await r.text();
+    if (!r.ok) throw new MetadataReviewProviderError(provider, `HTTP ${r.status}: ${responseText.slice(0, 300)}`);
+    const body = parseJsonResponse<{ choices?: Array<{ message?: { content?: string } }> }>(provider, responseText);
     const text = body.choices?.[0]?.message?.content || "";
-    return parseStrict(text);
+    if (!text.trim()) throw new MetadataReviewProviderError(provider, "response did not include message content");
+    return providerCard(provider, text);
 }
 
 function parseStrict(text: string): ReviewedCard | null {
@@ -178,12 +183,12 @@ export async function reviewMetadataWithAgent(
     env: Env,
     agentId: number,
     input: MetadataReviewInput,
-): Promise<ReviewedCard | null> {
+): Promise<ReviewedCard> {
     const prompt = buildUserPrompt(input);
-    let card: ReviewedCard | null = null;
+    let card: ReviewedCard;
     if (agentId === 0) card = await callGeminiFlash(env, prompt);
-    else if (agentId === 1) card = await callWorkersAi(env, prompt);
-    else if (agentId === 2) card = await callFireworks(env, prompt);
+    else if (agentId === 1) card = await callFireworks(env, prompt, env.COMPILER_MODEL_SECONDARY, "Fireworks MiniMax");
+    else if (agentId === 2) card = await callFireworks(env, prompt, env.COMPILER_MODEL_TERTIARY, "Fireworks DeepSeek");
     else throw new Error("agentId must be 0, 1, or 2");
     return card;
 }
@@ -197,5 +202,7 @@ export async function hashReviewedArtifact(input: unknown): Promise<string> {
 export const __test = {
     validate,
     parseStrict,
-    extractAiText,
+    buildUserPrompt,
+    fireworksModelId,
+    MetadataReviewProviderError,
 };

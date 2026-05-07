@@ -17,10 +17,12 @@
 
 import type { Env } from "../worker/env.js";
 import {
+    buildCandidateFromGhcrPackage,
     buildCandidateFromRegistryEntry,
     candidateObjectKey,
     cleanCandidateSlug,
     shadowObjectKey,
+    type GhcrContainerPackage,
     type RegistryEntry,
 } from "./candidates.js";
 import { hasTerminalScreening } from "./screening.js";
@@ -38,6 +40,9 @@ const MAX_CANDIDATE_LIMIT = 25;
 interface SeedCursor {
     cursor: string | null;
     pageOffset: number;
+    registryComplete: boolean;
+    ghcrOffset: number;
+    ghcrComplete: boolean;
     complete: boolean;
 }
 
@@ -73,36 +78,91 @@ async function ensureSeedCursorTable(env: Env): Promise<void> {
         if (!/no such column/i.test(message)) throw error;
         await env.CATALOG.prepare(`ALTER TABLE seed_cursor ADD COLUMN completed_at TEXT`).run();
     }
+    try {
+        await env.CATALOG.prepare(`SELECT registry_complete FROM seed_cursor LIMIT 1`).first();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/no such column/i.test(message)) throw error;
+        await env.CATALOG.prepare(`ALTER TABLE seed_cursor ADD COLUMN registry_complete INTEGER NOT NULL DEFAULT 0`).run();
+        await env.CATALOG.prepare(`UPDATE seed_cursor SET registry_complete = complete`).run();
+    }
+    try {
+        await env.CATALOG.prepare(`SELECT ghcr_offset FROM seed_cursor LIMIT 1`).first();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/no such column/i.test(message)) throw error;
+        await env.CATALOG.prepare(`ALTER TABLE seed_cursor ADD COLUMN ghcr_offset INTEGER NOT NULL DEFAULT 0`).run();
+    }
+    try {
+        await env.CATALOG.prepare(`SELECT ghcr_complete FROM seed_cursor LIMIT 1`).first();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/no such column/i.test(message)) throw error;
+        await env.CATALOG.prepare(`ALTER TABLE seed_cursor ADD COLUMN ghcr_complete INTEGER NOT NULL DEFAULT 0`).run();
+        await env.CATALOG.prepare(
+            `UPDATE seed_cursor
+             SET complete = 0
+             WHERE complete = 1
+               AND registry_complete = 1
+               AND ghcr_complete = 0`,
+        ).run();
+    }
 }
 
 async function getCursor(env: Env): Promise<SeedCursor> {
     await ensureSeedCursorTable(env);
     const row = await env.CATALOG.prepare(
-        `SELECT cursor, page_offset, complete FROM seed_cursor WHERE id = 1`,
+        `SELECT cursor, page_offset, complete, registry_complete, ghcr_offset, ghcr_complete FROM seed_cursor WHERE id = 1`,
     ).first<{
         cursor: string | null;
         page_offset: number | null;
+        registry_complete: number | null;
+        ghcr_offset: number | null;
+        ghcr_complete: number | null;
         complete: number | null;
     }>();
     return {
         cursor: row?.cursor ?? null,
         pageOffset: Math.max(0, Number(row?.page_offset ?? 0)),
+        registryComplete: Number(row?.registry_complete ?? row?.complete ?? 0) === 1,
+        ghcrOffset: Math.max(0, Number(row?.ghcr_offset ?? 0)),
+        ghcrComplete: Number(row?.ghcr_complete ?? row?.complete ?? 0) === 1,
         complete: Number(row?.complete ?? 0) === 1,
     };
 }
 
-async function persistCursor(env: Env, cursor: string | null, pageOffset = 0, complete = false): Promise<void> {
+async function persistCursor(
+    env: Env,
+    input: {
+        cursor: string | null;
+        pageOffset?: number;
+        registryComplete?: boolean;
+        ghcrOffset?: number;
+        ghcrComplete?: boolean;
+        complete?: boolean;
+    },
+): Promise<void> {
     await ensureSeedCursorTable(env);
     await env.CATALOG.prepare(
-        `INSERT INTO seed_cursor (id, cursor, page_offset, complete, completed_at, updated_at)
-         VALUES (1, ?1, ?2, ?3, CASE WHEN ?3 = 1 THEN CURRENT_TIMESTAMP ELSE NULL END, CURRENT_TIMESTAMP)
+        `INSERT INTO seed_cursor (id, cursor, page_offset, registry_complete, ghcr_offset, ghcr_complete, complete, completed_at, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?6 = 1 THEN CURRENT_TIMESTAMP ELSE NULL END, CURRENT_TIMESTAMP)
          ON CONFLICT(id) DO UPDATE SET
             cursor = excluded.cursor,
             page_offset = excluded.page_offset,
+            registry_complete = excluded.registry_complete,
+            ghcr_offset = excluded.ghcr_offset,
+            ghcr_complete = excluded.ghcr_complete,
             complete = excluded.complete,
             completed_at = excluded.completed_at,
             updated_at = CURRENT_TIMESTAMP`,
-    ).bind(cursor, pageOffset, complete ? 1 : 0).run();
+    ).bind(
+        input.cursor,
+        input.pageOffset ?? 0,
+        input.registryComplete ? 1 : 0,
+        input.ghcrOffset ?? 0,
+        input.ghcrComplete ? 1 : 0,
+        input.complete ? 1 : 0,
+    ).run();
 }
 
 async function markVerificationIncomplete(env: Env): Promise<void> {
@@ -121,43 +181,129 @@ async function markVerificationIncomplete(env: Env): Promise<void> {
 
 interface GhcrIndex {
     fetched_at: number;
-    images: Record<string, string>; // slug → image ref
+    package_page: number;
+    package_complete: boolean;
+    pending_packages: Array<{ name: string; updated_at?: string | null }>;
+    images: Record<string, string>; // slug -> image ref
+    packages: Record<string, GhcrContainerPackage>; // slug -> package metadata
 }
 
-async function loadOrRefreshGhcrIndex(env: Env): Promise<GhcrIndex> {
-    const stored = await env.RAW.get(GHCR_INDEX_KEY);
+function ghcrToken(env: Env): string | undefined {
+    return env.GHCR_GITHUB_PAT || env.GITHUB_GHCR_PAT || env.GHCR_TOKEN;
+}
+
+function ghcrImageForPackage(env: Env, packageName: string, tag: string): { slug: string; image: string } | null {
+    const cleanPackage = packageName.replace(/^\/+|\/+$/g, "");
+    if (!cleanPackage) return null;
+    const parts = cleanPackage.split("/");
+    const slugPart = parts.at(-1);
+    if (!slugPart) return null;
+    const slug = cleanCandidateSlug(slugPart);
+    if (!slug) return null;
+    const namespace = env.GHCR_NAMESPACE.replace(/\/+$/g, "");
+    const registryRoot = namespace.endsWith("/mcp") ? namespace.slice(0, -4) : namespace;
+    const image = cleanPackage.includes("/")
+        ? `${registryRoot}/${cleanPackage}:${tag}`
+        : `${namespace}/${cleanPackage}:${tag}`;
+    return { slug, image };
+}
+
+async function loadOrRefreshGhcrIndex(env: Env, options: { budget?: number } = {}): Promise<GhcrIndex> {
+    const stored = env.RAW ? await env.RAW.get(GHCR_INDEX_KEY) : null;
+    const empty: GhcrIndex = {
+        fetched_at: Date.now(),
+        package_page: 1,
+        package_complete: false,
+        pending_packages: [],
+        images: {},
+        packages: {},
+    };
     if (stored) {
         try {
             const parsed = await stored.json<GhcrIndex>();
-            if (Date.now() - parsed.fetched_at < GHCR_INDEX_TTL_MS) return parsed;
+            if (
+                Date.now() - parsed.fetched_at < GHCR_INDEX_TTL_MS &&
+                parsed.package_complete &&
+                parsed.pending_packages.length === 0
+            ) {
+                return parsed;
+            }
+            if (Date.now() - parsed.fetched_at < GHCR_INDEX_TTL_MS) {
+                return await advanceGhcrIndex(env, parsed, options.budget ?? 60);
+            }
         } catch {
             // fall through to refresh
         }
     }
-    const images: Record<string, string> = {};
-    if (env.GHCR_TOKEN) {
-        const namespace = env.GHCR_NAMESPACE.replace(/^ghcr\.io\//, "").split("/")[0];
-        try {
-            const r = await fetch(
-                `https://api.github.com/orgs/${namespace}/packages?package_type=container&per_page=100`,
-                { headers: { Authorization: `Bearer ${env.GHCR_TOKEN}`, Accept: "application/vnd.github+json" } },
-            );
-            if (r.ok) {
-                const list = await r.json() as Array<{ name: string }>;
-                for (const item of list || []) {
-                    if (typeof item.name === "string") {
-                        images[cleanCandidateSlug(item.name)] = `${env.GHCR_NAMESPACE}/${item.name}:latest`;
-                    }
-                }
-            }
-        } catch {
-            // GHCR refresh is non-fatal; the index just stays as it was.
-        }
+    const next = await advanceGhcrIndex(env, empty, options.budget ?? 60);
+    if (env.RAW) {
+        await env.RAW.put(GHCR_INDEX_KEY, JSON.stringify(next), {
+            httpMetadata: { contentType: "application/json" },
+        });
     }
-    const next: GhcrIndex = { fetched_at: Date.now(), images };
-    await env.RAW.put(GHCR_INDEX_KEY, JSON.stringify(next), {
-        httpMetadata: { contentType: "application/json" },
-    });
+    return next;
+}
+
+async function advanceGhcrIndex(env: Env, index: GhcrIndex, budget: number): Promise<GhcrIndex> {
+    const token = ghcrToken(env);
+    if (!token) return index;
+    let remaining = Math.max(1, Math.min(budget, 80));
+    const next: GhcrIndex = {
+        fetched_at: Date.now(),
+        package_page: index.package_page || 1,
+        package_complete: index.package_complete === true,
+        pending_packages: [...(index.pending_packages || [])],
+        images: { ...(index.images || {}) },
+        packages: { ...(index.packages || {}) },
+    };
+
+    while (!next.package_complete && next.pending_packages.length < 50 && remaining > 0) {
+        remaining--;
+        const r = await fetch(
+            `https://api.github.com/orgs/compose-market/packages?package_type=container&per_page=100&page=${next.package_page}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    Accept: "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": "compose-market-connectors",
+                },
+            },
+        );
+        if (!r.ok) break;
+        const list = await r.json() as Array<{ name?: string; updated_at?: string | null }>;
+        if (!Array.isArray(list) || list.length === 0) {
+            next.package_complete = true;
+            break;
+        }
+        for (const item of list) {
+            if (typeof item.name === "string" && item.name.startsWith("mcp/")) {
+                next.pending_packages.push({ name: item.name, updated_at: item.updated_at ?? null });
+            }
+        }
+        next.package_page += 1;
+    }
+
+    while (next.pending_packages.length > 0 && remaining > 0) {
+        const item = next.pending_packages.shift()!;
+        const tag = "latest";
+        const mapped = ghcrImageForPackage(env, item.name, tag);
+        if (!mapped) continue;
+        next.images[mapped.slug] = mapped.image;
+        next.packages[mapped.slug] = {
+            packageName: item.name,
+            slug: mapped.slug,
+            image: mapped.image,
+            tag,
+            updatedAt: item.updated_at ?? null,
+        };
+    }
+
+    if (env.RAW) {
+        await env.RAW.put(GHCR_INDEX_KEY, JSON.stringify(next), {
+            httpMetadata: { contentType: "application/json" },
+        });
+    }
     return next;
 }
 
@@ -188,7 +334,14 @@ export async function runSeedPage(env: Env, options: { reset?: boolean; maxCandi
     const maxCandidates = Math.max(1, Math.min(Math.floor(options.maxCandidates ?? DEFAULT_CANDIDATE_LIMIT), MAX_CANDIDATE_LIMIT));
 
     if (options.reset) {
-        await persistCursor(env, null, 0, false);
+        await persistCursor(env, {
+            cursor: null,
+            pageOffset: 0,
+            registryComplete: false,
+            ghcrOffset: 0,
+            ghcrComplete: false,
+            complete: false,
+        });
         await markVerificationIncomplete(env);
     }
 
@@ -214,6 +367,97 @@ export async function runSeedPage(env: Env, options: { reset?: boolean; maxCandi
             errors,
         };
     }
+
+    if (state.registryComplete) {
+        const ghcr = await loadOrRefreshGhcrIndex(env);
+        if (!ghcr.package_complete || ghcr.pending_packages.length > 0) {
+            await persistCursor(env, {
+                cursor: state.cursor,
+                pageOffset: state.pageOffset,
+                registryComplete: true,
+                ghcrOffset: 0,
+                ghcrComplete: false,
+                complete: false,
+            });
+            return {
+                started_at: started,
+                finished_at: new Date().toISOString(),
+                cursor_in: cursorIn,
+                cursor_out: cursorIn,
+                page_offset_in: 0,
+                page_offset_out: 0,
+                page_size: Object.keys(ghcr.packages || {}).length,
+                processed: 0,
+                upserted: 0,
+                candidates_archived: 0,
+                shadow_skipped: 0,
+                complete_skipped: 0,
+                images_attached: 0,
+                done: false,
+                errors,
+            };
+        }
+        const packages = Object.values(ghcr.packages || {}).sort((a, b) => a.slug.localeCompare(b.slug));
+        const entries = packages.slice(state.ghcrOffset, state.ghcrOffset + maxCandidates);
+        const rawKey = "ghcr-index/v1.json";
+        let candidatesArchived = 0;
+        let shadowSkipped = 0;
+        let completeSkipped = 0;
+
+        for (const pkg of entries) {
+            try {
+                const candidate = await buildCandidateFromGhcrPackage(pkg, rawKey);
+                if (!candidate) continue;
+                const shadowed = await env.SNAPSHOTS.head(shadowObjectKey(candidate));
+                if (shadowed) {
+                    shadowSkipped++;
+                    continue;
+                }
+                if (await hasTerminalScreening(env, candidate)) {
+                    completeSkipped++;
+                    continue;
+                }
+                await env.RAW.put(candidateObjectKey(candidate), JSON.stringify(candidate), {
+                    httpMetadata: { contentType: "application/json" },
+                });
+                candidatesArchived++;
+            } catch (err) {
+                errors.push({ slug: pkg.slug, message: err instanceof Error ? err.message : String(err) });
+            }
+        }
+
+        const offsetOut = Math.min(state.ghcrOffset + entries.length, packages.length);
+        const ghcrComplete = ghcr.package_complete && ghcr.pending_packages.length === 0 && offsetOut >= packages.length;
+        await persistCursor(env, {
+            cursor: state.cursor,
+            pageOffset: state.pageOffset,
+            registryComplete: true,
+            ghcrOffset: ghcrComplete ? 0 : offsetOut,
+            ghcrComplete,
+            complete: ghcrComplete,
+        });
+        if (candidatesArchived > 0) {
+            await markVerificationIncomplete(env);
+        }
+        return {
+            started_at: started,
+            finished_at: new Date().toISOString(),
+            cursor_in: cursorIn,
+            cursor_out: cursorIn,
+            page_offset_in: state.ghcrOffset,
+            page_offset_out: ghcrComplete ? 0 : offsetOut,
+            page_size: packages.length,
+            processed: entries.length,
+            upserted: 0,
+            candidates_archived: candidatesArchived,
+            shadow_skipped: shadowSkipped,
+            complete_skipped: completeSkipped,
+            images_attached: entries.length,
+            done: ghcrComplete,
+            errors,
+        };
+    }
+
     const url = cursorIn
         ? `${env.MCP_REGISTRY_URL}?cursor=${encodeURIComponent(cursorIn)}`
         : env.MCP_REGISTRY_URL;
@@ -268,12 +512,19 @@ export async function runSeedPage(env: Env, options: { reset?: boolean; maxCandi
     const pageComplete = offsetOut >= page.servers.length;
     const nextCursor = pageComplete ? cursorOut : cursorIn;
     const nextOffset = pageComplete ? 0 : offsetOut;
-    const seedDone = pageComplete && cursorOut === null;
+    const registryComplete = pageComplete && cursorOut === null;
 
     // Cursor update is kept last so a failed chunk replays from the same
     // candidate offset. Candidate object keys are deterministic, so replay is
     // idempotent.
-    await persistCursor(env, nextCursor, nextOffset, seedDone);
+    await persistCursor(env, {
+        cursor: nextCursor,
+        pageOffset: nextOffset,
+        registryComplete,
+        ghcrOffset: state.ghcrOffset,
+        ghcrComplete: state.ghcrComplete,
+        complete: false,
+    });
     if (candidatesArchived > 0) {
         await markVerificationIncomplete(env);
     }
@@ -292,7 +543,7 @@ export async function runSeedPage(env: Env, options: { reset?: boolean; maxCandi
         shadow_skipped: shadowSkipped,
         complete_skipped: completeSkipped,
         images_attached: imagesAttached,
-        done: seedDone,
+        done: false,
         errors,
     };
 }

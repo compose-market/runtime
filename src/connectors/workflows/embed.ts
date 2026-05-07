@@ -9,6 +9,8 @@
 import type { Env } from "../worker/env.js";
 import { embedTexts, buildCardEmbeddingText, buildVectorId } from "../catalog/embeddings.js";
 import { getTools, parseTags } from "../catalog/d1.js";
+import { hashShard } from "./screening.js";
+import { clearStageItemError, ensureStageErrorSchema, recordStageItemError } from "./stage-errors.js";
 
 async function sha256Hex(text: string): Promise<string> {
     const bytes = new TextEncoder().encode(text);
@@ -24,13 +26,26 @@ export interface EmbedReport {
     errors: Array<{ slug: string; message: string }>;
 }
 
-export async function runEmbed(env: Env, options: { limit?: number } = {}): Promise<EmbedReport> {
+function normalizeLane(options: { laneId?: number; laneCount?: number }): { laneId: number; laneCount: number } {
+    const laneCount = Math.max(1, Math.min(Math.floor(options.laneCount ?? 1), 64));
+    const laneId = Math.max(0, Math.min(Math.floor(options.laneId ?? 0), laneCount - 1));
+    return { laneId, laneCount };
+}
+
+function embedLaneShard(row: { slug: string; card_version: string }, laneCount: number): number {
+    return hashShard(`${row.slug}:${row.card_version}`, laneCount);
+}
+
+export async function runEmbed(env: Env, options: { limit?: number; laneId?: number; laneCount?: number } = {}): Promise<EmbedReport> {
     const started = new Date().toISOString();
+    await ensureStageErrorSchema(env);
     const errors: Array<{ slug: string; message: string }> = [];
     let embedded = 0;
     let skipped = 0;
 
     const limit = Math.min(options.limit || 100, 500);
+    const lane = normalizeLane(options);
+    const pageSize = Math.min(Math.max(limit * lane.laneCount * 4, limit), 50_000);
     const rows = await env.CATALOG.prepare(
         `SELECT s.slug,
                 m.human_name AS name,
@@ -47,13 +62,21 @@ export async function runEmbed(env: Env, options: { limit?: number } = {}): Prom
           AND es.model = ?2
           AND es.dimensions = 1024
           AND es.input_type = 'document'
+         LEFT JOIN catalog_stage_errors se
+           ON se.item_id = s.slug
+          AND se.item_version = s.card_version
+          AND se.stage = 'embed'
+          AND se.next_retry_at > CURRENT_TIMESTAMP
          WHERE s.status IN ('live', 'credential_gated')
            AND es.server_slug IS NULL
+           AND se.item_id IS NULL
          ORDER BY s.compiled_at DESC
          LIMIT ?1`,
-    ).bind(limit, env.EMBEDDING_MODEL || "voyage-4-large").all<{ slug: string; name: string; description: string; tags: string; card_version: string; status: "live" | "credential_gated" }>();
+    ).bind(pageSize, env.EMBEDDING_MODEL || "voyage-4-large").all<{ slug: string; name: string; description: string; tags: string; card_version: string; status: "live" | "credential_gated" }>();
 
-    const targets = rows.results || [];
+    const targets = (rows.results || [])
+        .filter((row) => embedLaneShard(row, lane.laneCount) === lane.laneId)
+        .slice(0, limit);
     if (targets.length === 0) {
         return { started_at: started, finished_at: new Date().toISOString(), embedded: 0, skipped: 0, errors: [] };
     }
@@ -70,7 +93,14 @@ export async function runEmbed(env: Env, options: { limit?: number } = {}): Prom
             const text = buildCardEmbeddingText(card);
             const [vector] = await embedTexts(env, [text], "document");
             if (!vector) {
-                errors.push({ slug: row.slug, message: "embedding returned empty" });
+                const message = "embedding returned empty";
+                await recordStageItemError(env, {
+                    itemId: row.slug,
+                    itemVersion: row.card_version,
+                    stage: "embed",
+                    message,
+                }).catch(() => undefined);
+                errors.push({ slug: row.slug, message });
                 continue;
             }
             const vectorId = buildVectorId(row.slug, row.card_version);
@@ -78,14 +108,14 @@ export async function runEmbed(env: Env, options: { limit?: number } = {}): Prom
             await env.EMBEDDINGS.upsert([{
                 id: vectorId,
                 values: vector,
-                    metadata: {
-                        slug: row.slug,
-                        origin: "tools",
-                        indexed: "final-catalog",
-                        status: row.status,
-                        name: row.name,
-                        cardVersion: row.card_version,
-                        tags: parseTags(row.tags),
+                metadata: {
+                    slug: row.slug,
+                    origin: "tools",
+                    indexed: "final-catalog",
+                    status: row.status,
+                    name: row.name,
+                    cardVersion: row.card_version,
+                    tags: parseTags(row.tags),
                 },
             }]);
             await env.CATALOG.batch([
@@ -116,9 +146,21 @@ export async function runEmbed(env: Env, options: { limit?: number } = {}): Prom
                         decided_at = CURRENT_TIMESTAMP`,
                 ).bind(row.slug, row.card_version),
             ]);
+            await clearStageItemError(env, {
+                itemId: row.slug,
+                itemVersion: row.card_version,
+                stage: "embed",
+            }).catch(() => undefined);
             embedded++;
         } catch (err) {
-            errors.push({ slug: row.slug, message: err instanceof Error ? err.message : String(err) });
+            const message = err instanceof Error ? err.message : String(err);
+            await recordStageItemError(env, {
+                itemId: row.slug,
+                itemVersion: row.card_version,
+                stage: "embed",
+                message,
+            }).catch(() => undefined);
+            errors.push({ slug: row.slug, message });
         }
     }
 
@@ -130,3 +172,7 @@ export async function runEmbed(env: Env, options: { limit?: number } = {}): Prom
         errors,
     };
 }
+
+export const __test = {
+    embedLaneShard,
+};

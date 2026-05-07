@@ -4,6 +4,7 @@ import { listToolsViaRunner, RunnerDispatchError } from "../../container/dispatc
 import { detectFromJsonRpc, detectFromStderr } from "../../worker/credentials.js";
 import type { CatalogCandidateTransport } from "../candidates.js";
 import type { ServerSpawnConfig } from "../../catalog/spawn.js";
+import { classifySpawnFailure, recordSpawnAttempt } from "../attempts.js";
 import {
     hashReviewedArtifact,
     reviewMetadataWithAgent,
@@ -13,6 +14,7 @@ import {
 import {
     hashShard,
     ensureScreeningSchema,
+    metadataLaneShard,
     metadataArtifactObjectKey,
     parseScreeningJsonArray,
     readScreeningArtifact,
@@ -27,6 +29,8 @@ export interface MetadataAgentReport {
     started_at: string;
     finished_at: string;
     agent_id: number;
+    lane_id: number;
+    lane_count: number;
     reviewer: string;
     examined: number;
     completed: number;
@@ -79,13 +83,16 @@ async function listScreeningRows(
     env: Env,
     agentId: number,
     limit: number,
-    options: { retryRecent?: boolean } = {},
+    options: { retryRecent?: boolean; laneId?: number; laneCount?: number } = {},
 ): Promise<ScreeningRow[]> {
     await ensureScreeningSchema(env);
     await ensureMetadataAgentReviewSchema(env);
     const out: ScreeningRow[] = [];
     const pageSize = Math.min(Math.max(limit * 200, 10_000), 50_000);
     const retryCutoff = new Date(Date.now() - RETRYABLE_REVIEW_BACKOFF_MS).toISOString();
+    const laneCount = Math.max(1, Math.min(Math.floor(options.laneCount ?? 1), 64));
+    const laneId = Math.max(0, Math.min(Math.floor(options.laneId ?? 0), laneCount - 1));
+    const reviewer = reviewerForAgent(agentId);
     const rows = await env.CATALOG.prepare(
         `SELECT s.*
          FROM candidate_screenings s
@@ -95,14 +102,16 @@ async function listScreeningRows(
           AND r.agent_id = ?1
          WHERE s.status IN ('functional', 'credential_gated')
            AND (s.metadata_agent_id = ?1 OR s.metadata_agent_id IS NULL)
-           AND (
-                r.status IS NULL
-             OR r.status = 'failed'
-             OR (r.status = 'retryable' AND (?2 = 1 OR r.updated_at <= ?3))
-           )
+	           AND (
+	                r.status IS NULL
+	             OR r.status = 'failed'
+	             OR (r.status = 'retryable' AND (?2 = 1 OR r.updated_at <= ?3))
+	             OR r.reviewer IS NULL
+	             OR r.reviewer != ?4
+	           )
          ORDER BY s.updated_at ASC
-         LIMIT ?4`,
-    ).bind(agentId, options.retryRecent ? 1 : 0, retryCutoff, pageSize).all<ScreeningRow>();
+         LIMIT ?5`,
+    ).bind(agentId, options.retryRecent ? 1 : 0, retryCutoff, reviewer, pageSize).all<ScreeningRow>();
 
     for (const row of rows.results || []) {
         if (out.length >= limit) break;
@@ -117,53 +126,167 @@ async function listScreeningRows(
             ).bind(row.server_slug, row.source_hash, computedAgentId).run();
         }
         if (computedAgentId !== agentId) continue;
+        if (metadataLaneShard(row, laneCount) !== laneId) continue;
+        const claimed = await claimMetadataRow(env, row, agentId, retryCutoff, reviewer);
+        if (!claimed) continue;
         out.push(row);
     }
     return out;
 }
 
+async function claimMetadataRow(env: Env, row: ScreeningRow, agentId: number, retryCutoff: string, reviewer = reviewerForAgent(agentId)): Promise<boolean> {
+    const result = await env.CATALOG.prepare(
+        `INSERT INTO metadata_agent_reviews
+            (server_slug, source_hash, source_version, agent_id, status, reviewer, canonical_agent_id, error_message, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'retryable', ?5, ?6, 'metadata-agent claimed for respawn', CURRENT_TIMESTAMP)
+         ON CONFLICT(server_slug, source_hash, agent_id) DO UPDATE SET
+            status = excluded.status,
+            reviewer = excluded.reviewer,
+            canonical_agent_id = excluded.canonical_agent_id,
+            error_message = excluded.error_message,
+            updated_at = CURRENT_TIMESTAMP
+         WHERE metadata_agent_reviews.status = 'failed'
+            OR (metadata_agent_reviews.status = 'retryable' AND metadata_agent_reviews.updated_at <= ?7)
+            OR metadata_agent_reviews.reviewer IS NULL
+            OR metadata_agent_reviews.reviewer != ?8`,
+    ).bind(
+        row.server_slug,
+        row.source_hash,
+        row.source_version,
+        agentId,
+        reviewer,
+        hashShard(`${row.server_slug}:${row.source_hash}`, 3),
+        retryCutoff,
+        reviewer,
+    ).run();
+    return Number(result.meta?.changes ?? 0) > 0;
+}
+
 async function respawnTransport(
     env: Env,
     slug: string,
+    screening: Pick<ScreeningArtifact, "sourceHash" | "sourceVersion">,
     transport: CatalogCandidateTransport,
     requiredCredentialVars: string[] = [],
+    input: { runnerProfile?: string | null; deadlineMs?: number | null; attemptNo?: number } = {},
 ): Promise<{
     transport: CatalogCandidateTransport;
     tools: ObservedCandidateTool[];
     latencyMs: number;
+    runnerProfile: string | null;
+    deadlineMs: number;
+    serverInfo?: Record<string, unknown> | null;
 }> {
     const started = Date.now();
-    const listing = transport.transport === "http"
-        ? await listToolsHttp({
-            url: requireRemoteUrl(transport),
-            requiredCredentialVars: [...new Set([...transport.envRequired, ...requiredCredentialVars])].sort(),
-            timeoutMs: METADATA_RESPAWN_DEADLINE_MS,
-        })
-        : await listToolsViaRunner(env, slug, toSpawnConfig(transport), { deadlineMs: METADATA_RESPAWN_DEADLINE_MS });
-    const tools = (listing.tools || []).map((tool) => ({
-        name: String(tool.name),
-        description: typeof tool.description === "string" ? tool.description : null,
-        inputSchema: tool.inputSchema || {},
-    }));
-    if (tools.length === 0) {
-        throw new Error("server returned zero tools on metadata-agent respawn");
+    const deadlineMs = Math.max(5_000, Math.min(input.deadlineMs ?? METADATA_RESPAWN_DEADLINE_MS, 120_000));
+    try {
+        const listing = transport.transport === "http"
+            ? await listToolsHttp({
+                url: requireRemoteUrl(transport),
+                requiredCredentialVars: [...new Set([...transport.envRequired, ...requiredCredentialVars])].sort(),
+                timeoutMs: deadlineMs,
+            })
+            : await listToolsViaRunner(env, slug, toSpawnConfig(transport), {
+                deadlineMs,
+                runnerProfile: input.runnerProfile,
+            });
+        const tools = (listing.tools || []).map((tool) => ({
+            name: String(tool.name),
+            description: typeof tool.description === "string" ? tool.description : null,
+            inputSchema: tool.inputSchema || {},
+        }));
+        if (tools.length === 0) {
+            await recordSpawnAttempt(env, {
+                serverSlug: slug,
+                sourceHash: screening.sourceHash,
+                sourceVersion: screening.sourceVersion,
+                stage: "metadata",
+                transportKind: transport.transport,
+                runnerProfile: input.runnerProfile ?? null,
+                deadlineMs,
+                attemptNo: input.attemptNo ?? 1,
+                status: "failed",
+                retryClass: "permanent_invalid",
+                errorCode: "TOOL_VALIDATION",
+                errorMessage: "server returned zero tools on metadata-agent respawn",
+                latencyMs: Date.now() - started,
+                observedTools: 0,
+            });
+            throw new Error("server returned zero tools on metadata-agent respawn");
+        }
+        await recordSpawnAttempt(env, {
+            serverSlug: slug,
+            sourceHash: screening.sourceHash,
+            sourceVersion: screening.sourceVersion,
+            stage: "metadata",
+            transportKind: transport.transport,
+            runnerProfile: input.runnerProfile ?? null,
+            deadlineMs,
+            attemptNo: input.attemptNo ?? 1,
+            status: "success",
+            retryClass: "success",
+            latencyMs: Date.now() - started,
+            observedTools: tools.length,
+        });
+        return {
+            transport,
+            tools,
+            latencyMs: Date.now() - started,
+            runnerProfile: input.runnerProfile ?? null,
+            deadlineMs,
+            serverInfo: "serverInfo" in listing ? listing.serverInfo ?? null : null,
+        };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const credentialVars = detectCredentialVars(error, message);
+        const classification = classifySpawnFailure({
+            message,
+            transport: transport.transport,
+            credentialVars,
+            runnerRetryable: error instanceof RunnerDispatchError ? error.retryable : undefined,
+        });
+        await recordSpawnAttempt(env, {
+            serverSlug: slug,
+            sourceHash: screening.sourceHash,
+            sourceVersion: screening.sourceVersion,
+            stage: "metadata",
+            transportKind: transport.transport,
+            runnerProfile: input.runnerProfile ?? null,
+            deadlineMs,
+            attemptNo: input.attemptNo ?? 1,
+            status: "failed",
+            retryClass: classification.retryClass,
+            errorCode: classification.code,
+            errorMessage: message,
+            latencyMs: Date.now() - started,
+            observedTools: 0,
+        });
+        throw error;
     }
-    return { transport, tools, latencyMs: Date.now() - started };
 }
 
 async function respawnFunctional(env: Env, screening: ScreeningArtifact): Promise<RespawnResult> {
     const errors: ScreeningError[] = [];
     const observedTransports: ScreenedTransport[] = [];
     const credentialVars: string[] = [];
-    const successfulTransports = screening.functionalTransports.map((entry) => entry.transport);
+    const successfulTransports = screening.functionalTransports;
 
-    for (const transport of successfulTransports) {
+    for (let i = 0; i < successfulTransports.length; i += 1) {
+        const entry = successfulTransports[i]!;
+        const transport = entry.transport;
         try {
-            const out = await respawnTransport(env, screening.slug, transport);
+            const out = await respawnTransport(env, screening.slug, screening, transport, [], {
+                runnerProfile: entry.runnerProfile ?? null,
+                deadlineMs: entry.deadlineMs ?? METADATA_RESPAWN_DEADLINE_MS,
+                attemptNo: i + 1,
+            });
             observedTransports.push({
                 transport: out.transport,
                 tools: out.tools,
                 latencyMs: out.latencyMs,
+                runnerProfile: out.runnerProfile,
+                deadlineMs: out.deadlineMs,
+                serverInfo: out.serverInfo ?? null,
                 observedAt: new Date().toISOString(),
             });
         } catch (error) {
@@ -193,13 +316,19 @@ async function respawnCredentialGated(env: Env, screening: ScreeningArtifact): P
     const observedTransports: ScreenedTransport[] = [];
     const credentialVars = new Set(screening.credentialVars);
 
-    for (const transport of screening.candidate.transports) {
+    for (let i = 0; i < screening.candidate.transports.length; i += 1) {
+        const transport = screening.candidate.transports[i]!;
         try {
-            const out = await respawnTransport(env, screening.slug, transport, screening.credentialVars);
+            const out = await respawnTransport(env, screening.slug, screening, transport, screening.credentialVars, {
+                attemptNo: i + 1,
+            });
             observedTransports.push({
                 transport: out.transport,
                 tools: out.tools,
                 latencyMs: out.latencyMs,
+                runnerProfile: out.runnerProfile,
+                deadlineMs: out.deadlineMs,
+                serverInfo: out.serverInfo ?? null,
                 observedAt: new Date().toISOString(),
             });
         } catch (error) {
@@ -249,6 +378,13 @@ function observedSchemas(tools: ObservedCandidateTool[]): Record<string, Record<
         schemas[tool.name] = tool.inputSchema || {};
     }
     return schemas;
+}
+
+function firstServerInfo(transports: ScreenedTransport[]): Record<string, unknown> | null {
+    for (const transport of transports) {
+        if (transport.serverInfo && typeof transport.serverInfo === "object" && !Array.isArray(transport.serverInfo)) return transport.serverInfo;
+    }
+    return null;
 }
 
 async function writeRetryableReview(
@@ -332,10 +468,12 @@ async function writeCompleteReview(env: Env, artifact: MetadataAgentArtifact): P
 
 export async function runMetadataAgent(
     env: Env,
-    options: { agentId: number; limit?: number; retryRecent?: boolean } = { agentId: 0 },
+    options: { agentId: number; limit?: number; retryRecent?: boolean; laneId?: number; laneCount?: number } = { agentId: 0 },
 ): Promise<MetadataAgentReport> {
     const started = new Date().toISOString();
     const agentId = Math.max(0, Math.min(options.agentId, 2));
+    const laneCount = Math.max(1, Math.min(Math.floor(options.laneCount ?? 1), 64));
+    const laneId = Math.max(0, Math.min(Math.floor(options.laneId ?? 0), laneCount - 1));
     const reviewer = reviewerForAgent(agentId);
     const limit = Math.max(1, Math.min(options.limit ?? 25, 100));
     const errors: Array<{ slug: string; message: string }> = [];
@@ -345,7 +483,11 @@ export async function runMetadataAgent(
     let retryable = 0;
     let skipped = 0;
 
-    const rows = await listScreeningRows(env, agentId, limit, { retryRecent: options.retryRecent });
+    const rows = await listScreeningRows(env, agentId, limit, {
+        retryRecent: options.retryRecent,
+        laneId,
+        laneCount,
+    });
     for (const row of rows) {
         examined++;
         try {
@@ -381,6 +523,7 @@ export async function runMetadataAgent(
                     inputSchema: tool.inputSchema,
                 })),
                 credentialVars: catalogStatus === "credential_gated" ? credentialVars : undefined,
+                serverInfo: firstServerInfo(respawn.observedTransports),
             });
             if (!card) {
                 retryable++;
@@ -431,6 +574,8 @@ export async function runMetadataAgent(
         started_at: started,
         finished_at: new Date().toISOString(),
         agent_id: agentId,
+        lane_id: laneId,
+        lane_count: laneCount,
         reviewer,
         examined,
         completed,

@@ -57,6 +57,14 @@ export interface CatalogCandidate {
     rawTools: Array<{ name: string; description?: string | null; inputSchema?: Record<string, unknown> }>;
 }
 
+export interface GhcrContainerPackage {
+    packageName: string;
+    slug: string;
+    image: string;
+    tag: string;
+    updatedAt: string | null;
+}
+
 export type ServedCatalogStatus = "live" | "credential_gated";
 export type CatalogStatus =
     | ServedCatalogStatus
@@ -207,7 +215,7 @@ export async function buildCandidateFromRegistryEntry(
             args: [],
             envRequired: [],
             envOptional: [],
-            priority: 50,
+            priority: 60,
         });
     }
 
@@ -244,12 +252,58 @@ export async function buildCandidateFromRegistryEntry(
     };
 }
 
+export async function buildCandidateFromGhcrPackage(
+    pkg: GhcrContainerPackage,
+    rawKey: string,
+): Promise<CatalogCandidate | null> {
+    const slug = cleanCandidateSlug(pkg.slug);
+    if (!slug || !pkg.image.startsWith("ghcr.io/compose-market/")) return null;
+    const sourceVersion = `ghcr:${pkg.tag}`;
+    const sourceHash = await sha256Hex(JSON.stringify({
+        source: "ghcr",
+        packageName: pkg.packageName,
+        image: pkg.image,
+        tag: pkg.tag,
+        updatedAt: pkg.updatedAt,
+    }));
+    return {
+        slug,
+        namespace: "compose-market",
+        rawName: `compose-market/${pkg.packageName}`,
+        rawDescription: `Curated Compose Market MCP container for ${slug}.`,
+        tags: ["docker", "ghcr"],
+        repoUrl: "https://github.com/compose-market/mcp",
+        image: pkg.image,
+        statefulness: "unknown",
+        sourceVersion,
+        sourceHash,
+        rawKey,
+        transports: [{
+            transport: "docker",
+            package: null,
+            image: pkg.image,
+            remoteUrl: null,
+            protocol: null,
+            args: [],
+            envRequired: [],
+            envOptional: [],
+            priority: 60,
+        }],
+        credentials: [],
+        rawTools: [],
+    };
+}
+
 export function candidateObjectKey(candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): string {
     return `candidates/${candidate.slug}/${candidate.sourceHash}.json`;
 }
 
 export function shadowObjectKey(candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): string {
     return `shadows/${candidate.slug}/${candidate.sourceHash}.json`;
+}
+
+export function retryCandidateObjectKey(candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): string {
+    return `retry-queue/${candidate.slug}/${candidate.sourceHash}.json`;
 }
 
 export function declaredCredentialVars(candidate: Pick<CatalogCandidate, "credentials" | "transports">): string[] {

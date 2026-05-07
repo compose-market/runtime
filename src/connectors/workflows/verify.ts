@@ -3,17 +3,26 @@ import { listToolsHttp } from "../container/transports/http.js";
 import { listToolsViaRunner, RunnerDispatchError } from "../container/dispatcher.js";
 import { detectFromJsonRpc, detectFromStderr } from "../worker/credentials.js";
 import {
+    candidateObjectKey,
     shadowObjectKey,
     type CatalogCandidate,
     type CatalogCandidateTransport,
 } from "./candidates.js";
 import type { ServerSpawnConfig } from "../catalog/spawn.js";
 import {
+    classifySpawnFailure,
+    profilesForTransport,
+    readSpawnAttempt,
+    recordSpawnAttempt,
+    type RunnerProfile,
+} from "./attempts.js";
+import {
     hashShard,
     hasTerminalScreening,
-    hasRecentRetryableScreening,
+    readScreeningArtifact,
     writeScreeningArtifact,
     type ObservedCandidateTool,
+    type ScreeningRow,
     type ScreenedTransport,
     type ScreeningError,
     type ScreeningStatus,
@@ -40,6 +49,9 @@ interface TransportProbeSuccess {
     transport: CatalogCandidateTransport;
     tools: ObservedCandidateTool[];
     latencyMs: number;
+    runnerProfile: string | null;
+    deadlineMs: number;
+    serverInfo?: Record<string, unknown> | null;
 }
 
 interface TransportProbeFailure {
@@ -89,12 +101,206 @@ async function readCandidate(env: Env, object: R2Object): Promise<CatalogCandida
     const body = await env.RAW.get(object.key);
     if (!body) return null;
     try {
-        const parsed = await body.json<CatalogCandidate>();
-        if (!parsed.slug || !parsed.sourceHash || !Array.isArray(parsed.transports)) return null;
-        return parsed;
+        const parsed = await body.json<unknown>();
+        const envelope = parsed && typeof parsed === "object" ? parsed as { candidate?: unknown } : {};
+        const candidate = (envelope.candidate && typeof envelope.candidate === "object" ? envelope.candidate : parsed) as Partial<CatalogCandidate>;
+        if (!candidate.slug || !candidate.sourceHash || !Array.isArray(candidate.transports)) return null;
+        return candidate as CatalogCandidate;
     } catch {
         return null;
     }
+}
+
+function hashText(input: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i += 1) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function probeAttemptObjectKey(
+    candidate: Pick<CatalogCandidate, "slug" | "sourceHash">,
+    transport: CatalogCandidateTransport,
+    runnerProfile: RunnerProfile | null,
+    attemptNo: number,
+): string {
+    const transportHash = hashText(JSON.stringify(transport));
+    return [
+        "screening-attempts",
+        candidate.slug,
+        candidate.sourceHash,
+        "verify",
+        `${transport.transport}-${transportHash}`,
+        `${runnerProfile ?? "remote"}-${attemptNo}.json`,
+    ].join("/");
+}
+
+async function readStoredProbeAttempt(
+    env: Env,
+    candidate: CatalogCandidate,
+    transport: CatalogCandidateTransport,
+    runnerProfile: RunnerProfile | null,
+    attemptNo: number,
+): Promise<TransportProbe | null> {
+    const key = probeAttemptObjectKey(candidate, transport, runnerProfile, attemptNo);
+    const object = await env.SNAPSHOTS.get(key);
+    if (object) {
+        try {
+            const parsed = await object.json<{
+                ok: boolean;
+                tools?: ObservedCandidateTool[];
+                latencyMs?: number;
+                deadlineMs?: number;
+                serverInfo?: Record<string, unknown> | null;
+                error?: ScreeningError;
+            }>();
+            if (parsed.ok) {
+                return {
+                    ok: true,
+                    transport,
+                    tools: Array.isArray(parsed.tools) ? parsed.tools : [],
+                    latencyMs: Number(parsed.latencyMs ?? 0),
+                    runnerProfile,
+                    deadlineMs: Number(parsed.deadlineMs ?? VERIFY_PROBE_DEADLINE_MS),
+                    serverInfo: parsed.serverInfo ?? null,
+                };
+            }
+            if (parsed.error) return { ok: false, error: parsed.error };
+        } catch {
+            return null;
+        }
+    }
+
+    const recorded = await readSpawnAttempt(env, {
+        serverSlug: candidate.slug,
+        sourceHash: candidate.sourceHash,
+        stage: "verify",
+        transportKind: transport.transport,
+        runnerProfile,
+        attemptNo,
+    });
+    if (recorded?.status !== "failed") return null;
+    return {
+        ok: false,
+        error: {
+            transport: transport.transport,
+            code: recorded.errorCode || "MCP_SPAWN_FAILED",
+            message: recorded.errorMessage || "previous failed verification attempt",
+            retryable: !["credentials_required", "permanent_invalid"].includes(recorded.retryClass),
+            retryClass: recorded.retryClass,
+        },
+    };
+}
+
+async function writeStoredProbeAttempt(
+    env: Env,
+    candidate: CatalogCandidate,
+    transport: CatalogCandidateTransport,
+    runnerProfile: RunnerProfile | null,
+    attemptNo: number,
+    probe: TransportProbe,
+): Promise<void> {
+    const key = probeAttemptObjectKey(candidate, transport, runnerProfile, attemptNo);
+    await env.SNAPSHOTS.put(key, JSON.stringify({
+        ok: probe.ok,
+        transport,
+        runnerProfile,
+        attemptNo,
+        deadlineMs: probe.ok ? probe.deadlineMs : VERIFY_PROBE_DEADLINE_MS,
+        latencyMs: probe.ok ? probe.latencyMs : undefined,
+        tools: probe.ok ? probe.tools : undefined,
+        serverInfo: probe.ok ? probe.serverInfo ?? null : undefined,
+        error: probe.ok ? undefined : probe.error,
+        attemptedAt: new Date().toISOString(),
+    }), { httpMetadata: { contentType: "application/json" } });
+}
+
+function candidateObjectSlug(objectKey: string): string {
+    return objectKey.split("/")[1] || objectKey;
+}
+
+async function listCandidateObjectsForPrefix(
+    env: Env,
+    input: {
+        prefix: string;
+        shardId: number;
+        shardCount: number;
+        limit: number;
+        cursor?: string;
+    },
+): Promise<CandidateBatch> {
+    const out: Array<{ key: string; candidate: CatalogCandidate }> = [];
+    let cursor = input.cursor;
+    let pages = 0;
+    let scanned = 0;
+    let reachedEnd = false;
+    while (out.length < input.limit && pages < VERIFY_LIST_PAGES_PER_CALL) {
+        const page = await env.RAW.list({ prefix: input.prefix, cursor, limit: 1000 });
+        pages++;
+        scanned += page.objects.length;
+        for (const object of page.objects) {
+            if (out.length >= input.limit) break;
+            const keySlug = candidateObjectSlug(object.key);
+            if (hashShard(keySlug, input.shardCount) !== input.shardId) continue;
+            const candidate = await readCandidate(env, object);
+            if (!candidate) continue;
+            out.push({ key: object.key, candidate });
+        }
+        if (!page.truncated || !page.cursor) {
+            cursor = undefined;
+            reachedEnd = true;
+            break;
+        }
+        cursor = page.cursor;
+    }
+
+    return {
+        candidates: out,
+        nextCursor: cursor || null,
+        done: Boolean(reachedEnd && out.length === 0),
+        scanned,
+    };
+}
+
+function candidateBatchKey(candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): string {
+    return `${candidate.slug}\u001f${candidate.sourceHash}`;
+}
+
+async function listRetryableScreeningCandidates(
+    env: Env,
+    shardId: number,
+    shardCount: number,
+    limit: number,
+    seen: Set<string>,
+): Promise<Array<{ key: string; candidate: CatalogCandidate }>> {
+    if (limit <= 0) return [];
+    const out: Array<{ key: string; candidate: CatalogCandidate }> = [];
+    const pageSize = Math.min(Math.max(limit * 200, 1000), 10_000);
+    const rows = await env.CATALOG.prepare(
+        `SELECT *
+         FROM candidate_screenings
+         WHERE status = 'retryable'
+         ORDER BY updated_at ASC
+         LIMIT ?1`,
+    ).bind(pageSize).all<ScreeningRow>();
+
+    for (const row of rows.results || []) {
+        if (out.length >= limit) break;
+        if (hashShard(row.server_slug, shardCount) !== shardId) continue;
+        const key = `${row.server_slug}\u001f${row.source_hash}`;
+        if (seen.has(key)) continue;
+        const artifact = await readScreeningArtifact(env, row);
+        if (!artifact?.candidate) continue;
+        if (await hasTerminalScreening(env, artifact.candidate)) continue;
+        seen.add(key);
+        out.push({
+            key: candidateObjectKey(artifact.candidate),
+            candidate: artifact.candidate,
+        });
+    }
+    return out;
 }
 
 async function ensureVerificationCursorColumns(env: Env): Promise<void> {
@@ -159,6 +365,47 @@ async function persistVerificationCursor(
     ).bind(input.shardId, input.shardCount, input.lastSlug, input.nextCursor, input.done ? 1 : 0).run();
 }
 
+async function ensureRetryQueueSchema(env: Env): Promise<void> {
+    await env.CATALOG.prepare(
+        `CREATE TABLE IF NOT EXISTS candidate_retry_queue (
+            server_slug     TEXT NOT NULL,
+            source_hash     TEXT NOT NULL,
+            source_version  TEXT NOT NULL,
+            raw_key         TEXT NOT NULL,
+            candidate_key   TEXT NOT NULL,
+            retry_class     TEXT NOT NULL,
+            attempts        INTEGER NOT NULL DEFAULT 1,
+            next_retry_at   TEXT NOT NULL,
+            last_error      TEXT,
+            parked_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (server_slug, source_hash)
+        )`,
+    ).run();
+    await env.CATALOG.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_candidate_retry_queue_next
+         ON candidate_retry_queue(next_retry_at, retry_class, updated_at)`,
+    ).run();
+}
+
+async function deleteRetryQueueEntry(env: Env, candidate: Pick<CatalogCandidate, "slug" | "sourceHash">): Promise<void> {
+    await ensureRetryQueueSchema(env);
+    await env.CATALOG.prepare(
+        `DELETE FROM candidate_retry_queue
+         WHERE server_slug = ?1
+           AND source_hash = ?2`,
+    ).bind(candidate.slug, candidate.sourceHash).run();
+}
+
+async function deleteCandidateState(
+    env: Env,
+    candidate: Pick<CatalogCandidate, "slug" | "sourceHash">,
+    key: string,
+): Promise<void> {
+    await env.RAW.delete(key);
+    await deleteRetryQueueEntry(env, candidate);
+}
+
 async function listCandidateBatch(
     env: Env,
     shardId: number,
@@ -166,44 +413,46 @@ async function listCandidateBatch(
     limit: number,
 ): Promise<CandidateBatch> {
     const out: Array<{ key: string; candidate: CatalogCandidate }> = [];
+    const seen = new Set<string>();
     const state = await readVerificationCursor(env, shardId, shardCount);
-    if (state.done) {
+    const active = state.done
+        ? { candidates: [], nextCursor: null, done: true, scanned: 0 }
+        : await listCandidateObjectsForPrefix(env, {
+            prefix: "candidates/",
+            shardId,
+            shardCount,
+            limit,
+            cursor: state.cursor,
+        });
+    out.push(...active.candidates);
+    for (const entry of active.candidates) seen.add(candidateBatchKey(entry.candidate));
+    let scanned = active.scanned;
+    if (active.nextCursor || out.length >= limit) {
         return {
-            candidates: [],
-            nextCursor: null,
-            done: true,
-            scanned: 0,
+            candidates: out,
+            nextCursor: active.nextCursor,
+            done: false,
+            scanned,
         };
     }
-    let cursor: string | undefined = state.cursor;
-    let pages = 0;
-    let scanned = 0;
-    let reachedEnd = false;
-    while (out.length < limit && pages < VERIFY_LIST_PAGES_PER_CALL) {
-        const page = await env.RAW.list({ prefix: "candidates/", cursor, limit: 1000 });
-        pages++;
-        scanned += page.objects.length;
-        for (const object of page.objects) {
-            if (out.length >= limit) break;
-            const keySlug = object.key.split("/")[1] || object.key;
-            if (hashShard(keySlug, shardCount) !== shardId) continue;
-            const candidate = await readCandidate(env, object);
-            if (!candidate) continue;
-            if (await hasRecentRetryableScreening(env, candidate)) continue;
-            out.push({ key: object.key, candidate });
-        }
-        if (!page.truncated || !page.cursor) {
-            cursor = undefined;
-            reachedEnd = true;
-            break;
-        }
-        cursor = page.cursor;
-    }
 
+    const retryQueue = await listCandidateObjectsForPrefix(env, {
+        prefix: "retry-queue/",
+        shardId,
+        shardCount,
+        limit: limit - out.length,
+    });
+    out.push(...retryQueue.candidates);
+    for (const entry of retryQueue.candidates) seen.add(candidateBatchKey(entry.candidate));
+    scanned += retryQueue.scanned;
+    if (out.length < limit) {
+        const retryableScreenings = await listRetryableScreeningCandidates(env, shardId, shardCount, limit - out.length, seen);
+        out.push(...retryableScreenings);
+    }
     return {
         candidates: out,
-        nextCursor: cursor || null,
-        done: Boolean(reachedEnd && out.length === 0),
+        nextCursor: null,
+        done: Boolean(active.done && retryQueue.done && out.length === 0),
         scanned,
     };
 }
@@ -227,11 +476,19 @@ async function writeShadow(
         rawKey: candidate.rawKey,
     }), { httpMetadata: { contentType: "application/json" } });
     if (input.deleteCandidateKey) {
-        await env.RAW.delete(input.deleteCandidateKey);
+        await deleteCandidateState(env, candidate, input.deleteCandidateKey);
     }
 }
 
-async function probeTransport(env: Env, candidate: CatalogCandidate, transport: CatalogCandidateTransport): Promise<TransportProbe> {
+async function probeTransportOnce(
+    env: Env,
+    candidate: CatalogCandidate,
+    transport: CatalogCandidateTransport,
+    input: { runnerProfile: RunnerProfile | null; attemptNo: number },
+): Promise<TransportProbe> {
+    const stored = await readStoredProbeAttempt(env, candidate, transport, input.runnerProfile, input.attemptNo);
+    if (stored) return stored;
+
     const started = Date.now();
     try {
         const listingPromise = transport.transport === "http"
@@ -240,7 +497,10 @@ async function probeTransport(env: Env, candidate: CatalogCandidate, transport: 
                 requiredCredentialVars: transport.envRequired,
                 timeoutMs: VERIFY_PROBE_DEADLINE_MS,
             })
-            : listToolsViaRunner(env, candidate.slug, toSpawnConfig(transport), { deadlineMs: VERIFY_PROBE_DEADLINE_MS });
+            : listToolsViaRunner(env, candidate.slug, toSpawnConfig(transport), {
+                deadlineMs: VERIFY_PROBE_DEADLINE_MS,
+                runnerProfile: input.runnerProfile,
+            });
         const listing = await withDeadline(
             Promise.resolve(listingPromise),
             VERIFY_PROBE_DEADLINE_MS + 5_000,
@@ -252,22 +512,60 @@ async function probeTransport(env: Env, candidate: CatalogCandidate, transport: 
             inputSchema: tool.inputSchema || {},
         }));
         if (tools.length === 0) {
-            return {
+            await recordSpawnAttempt(env, {
+                serverSlug: candidate.slug,
+                sourceHash: candidate.sourceHash,
+                sourceVersion: candidate.sourceVersion,
+                stage: "verify",
+                transportKind: transport.transport,
+                runnerProfile: input.runnerProfile,
+                deadlineMs: VERIFY_PROBE_DEADLINE_MS,
+                attemptNo: input.attemptNo,
+                status: "failed",
+                retryClass: "permanent_invalid",
+                errorCode: "TOOL_VALIDATION",
+                errorMessage: "server returned zero tools",
+                latencyMs: Date.now() - started,
+                observedTools: 0,
+            });
+            const failed: TransportProbe = {
                 ok: false,
                 error: {
                     transport: transport.transport,
                     code: "TOOL_VALIDATION",
                     message: "server returned zero tools",
                     retryable: false,
+                    retryClass: "permanent_invalid",
                 },
             };
+            await writeStoredProbeAttempt(env, candidate, transport, input.runnerProfile, input.attemptNo, failed).catch(() => undefined);
+            return failed;
         }
-        return {
+        await recordSpawnAttempt(env, {
+            serverSlug: candidate.slug,
+            sourceHash: candidate.sourceHash,
+            sourceVersion: candidate.sourceVersion,
+            stage: "verify",
+            transportKind: transport.transport,
+            runnerProfile: input.runnerProfile,
+            deadlineMs: VERIFY_PROBE_DEADLINE_MS,
+            attemptNo: input.attemptNo,
+            status: "success",
+            retryClass: "success",
+            latencyMs: Date.now() - started,
+            observedTools: tools.length,
+        });
+        const succeeded: TransportProbe = {
             ok: true,
             transport,
             tools,
             latencyMs: Date.now() - started,
+            runnerProfile: input.runnerProfile,
+            deadlineMs: VERIFY_PROBE_DEADLINE_MS,
+            serverInfo: "serverInfo" in listing ? listing.serverInfo ?? null : null,
         };
+        await writeStoredProbeAttempt(env, candidate, transport, input.runnerProfile, input.attemptNo, succeeded).catch(() => undefined);
+        return succeeded;
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const credentialVars = [...new Set([
@@ -275,17 +573,57 @@ async function probeTransport(env: Env, candidate: CatalogCandidate, transport: 
             ...detectFromJsonRpc(safeJsonParse(message)),
             ...(error instanceof RunnerDispatchError ? error.credentialVars : []),
         ])];
-        return {
+        const classification = classifySpawnFailure({
+            message,
+            transport: transport.transport,
+            credentialVars,
+            runnerRetryable: error instanceof RunnerDispatchError ? error.retryable : undefined,
+        });
+        await recordSpawnAttempt(env, {
+            serverSlug: candidate.slug,
+            sourceHash: candidate.sourceHash,
+            sourceVersion: candidate.sourceVersion,
+            stage: "verify",
+            transportKind: transport.transport,
+            runnerProfile: input.runnerProfile,
+            deadlineMs: VERIFY_PROBE_DEADLINE_MS,
+            attemptNo: input.attemptNo,
+            status: "failed",
+            retryClass: classification.retryClass,
+            errorCode: classification.code,
+            errorMessage: message,
+            latencyMs: Date.now() - started,
+            observedTools: 0,
+        });
+        const failed: TransportProbe = {
             ok: false,
             error: {
                 transport: transport.transport,
-                code: credentialVars.length > 0 ? "CREDENTIALS_REQUIRED" : "MCP_SPAWN_FAILED",
+                code: classification.code,
                 message,
                 credentialVars,
-                retryable: credentialVars.length === 0 && isRetryableVerificationFailure(error, message),
+                retryable: classification.retryable,
+                retryClass: classification.retryClass,
             },
         };
+        await writeStoredProbeAttempt(env, candidate, transport, input.runnerProfile, input.attemptNo, failed).catch(() => undefined);
+        return failed;
     }
+}
+
+async function probeTransport(env: Env, candidate: CatalogCandidate, transport: CatalogCandidateTransport): Promise<TransportProbe> {
+    if (transport.transport === "http") {
+        return await probeTransportOnce(env, candidate, transport, { runnerProfile: null, attemptNo: 1 });
+    }
+    const profiles = profilesForTransport(env, transport.transport);
+    let last: TransportProbe | null = null;
+    for (let i = 0; i < profiles.length; i += 1) {
+        const profile = profiles[i]!;
+        const probe = await probeTransportOnce(env, candidate, transport, { runnerProfile: profile, attemptNo: i + 1 });
+        if (probe.ok) return probe;
+        last = probe;
+    }
+    return last || await probeTransportOnce(env, candidate, transport, { runnerProfile: "lite", attemptNo: 1 });
 }
 
 async function screenCandidate(env: Env, candidate: CatalogCandidate): Promise<CandidateScreeningResult> {
@@ -316,6 +654,9 @@ async function screenCandidate(env: Env, candidate: CatalogCandidate): Promise<C
                 transport: success.transport,
                 tools: success.tools,
                 latencyMs: success.latencyMs,
+                runnerProfile: success.runnerProfile,
+                deadlineMs: success.deadlineMs,
+                serverInfo: success.serverInfo ?? null,
                 observedAt: now,
             })),
             credentialVars,
@@ -332,26 +673,12 @@ async function screenCandidate(env: Env, candidate: CatalogCandidate): Promise<C
         };
     }
 
-    if (errors.some((error) => error.retryable === true)) {
-        return {
-            status: "retryable",
-            functionalTransports: [],
-            credentialVars: [],
-            errors,
-        };
-    }
-
     return {
         status: "shadowed",
         functionalTransports: [],
         credentialVars: [],
         errors,
     };
-}
-
-function isRetryableVerificationFailure(error: unknown, message: string): boolean {
-    if (error instanceof RunnerDispatchError) return error.retryable;
-    return /timed out|timeout|aborted|too many subrequests|not yet provisioned|container|temporar|rate limit|network|fetch failed/i.test(message);
 }
 
 function requireRemoteUrl(transport: CatalogCandidateTransport): string {
@@ -408,7 +735,7 @@ export async function runVerifyShard(
         try {
             const alreadyShadowed = await env.SNAPSHOTS.head(shadowObjectKey(candidate));
             if (alreadyShadowed || await hasTerminalScreening(env, candidate)) {
-                await env.RAW.delete(key);
+                await deleteCandidateState(env, candidate, key);
                 skipped++;
                 continue;
             }
@@ -446,12 +773,6 @@ export async function runVerifyShard(
             };
             await writeScreeningArtifact(env, artifact);
 
-            if (result.status === "retryable") {
-                retryable++;
-                errors.push({ slug: candidate.slug, message: "retryable verification failure retained in R2" });
-                continue;
-            }
-
             if (result.status === "shadowed") {
                 await writeShadow(env, candidate, {
                     reason: "permanent screening failure",
@@ -462,30 +783,37 @@ export async function runVerifyShard(
                 continue;
             }
 
-            await env.RAW.delete(key);
+            await deleteCandidateState(env, candidate, key);
             if (result.status === "functional") functional++;
             if (result.status === "credential_gated") credentialGated++;
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             errors.push({ slug: candidate.slug, message });
-            retryable++;
+            const fallbackErrors: ScreeningError[] = [{
+                transport: "none",
+                code: "MCP_SPAWN_FAILED",
+                message,
+                retryable: false,
+                retryClass: "permanent_invalid",
+            }];
             await writeScreeningArtifact(env, {
                 slug: candidate.slug,
                 sourceHash: candidate.sourceHash,
                 sourceVersion: candidate.sourceVersion,
                 rawKey: candidate.rawKey,
-                status: "retryable",
+                status: "shadowed",
                 candidate,
                 functionalTransports: [],
                 credentialVars: [],
-                errors: [{
-                    transport: "none",
-                    code: "MCP_SPAWN_FAILED",
-                    message,
-                    retryable: true,
-                }],
+                errors: fallbackErrors,
                 screenedAt: new Date().toISOString(),
             });
+            await writeShadow(env, candidate, {
+                reason: "verification exception after exhaustive probe",
+                errors: fallbackErrors,
+                deleteCandidateKey: key,
+            });
+            shadowed++;
         }
     }
 
@@ -513,4 +841,5 @@ function safeJsonParse(s: string): unknown {
 export const __test = {
     screenCandidate,
     listCandidateBatch,
+    probeAttemptObjectKey,
 };
