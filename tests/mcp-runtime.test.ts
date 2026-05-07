@@ -88,7 +88,11 @@ describe("connectors client", () => {
     }
     expect(caught).toBeInstanceOf(ConnectorsError);
     expect((caught as InstanceType<typeof ConnectorsError>).code).toBe("CREDENTIALS_REQUIRED");
-    expect((caught as Error).message).toBe("MCP credentials required: NOTION_API_KEY");
+    // Message uses a startsWith check rather than equality so the wording
+    // can evolve without churning the test (the actionable suffix
+    // "Ask the user to add these credentials in Backpack before retrying"
+    // is intentional UX guidance for the agent).
+    expect((caught as Error).message.startsWith("MCP credentials required: NOTION_API_KEY")).toBe(true);
     expect((caught as InstanceType<typeof ConnectorsError>).retryable).toBe(false);
   });
 

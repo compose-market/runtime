@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { __test as publishTest } from "../../src/connectors/workflows/publish.js";
-import { __test as reviewTest } from "../../src/connectors/workflows/metadata/review.js";
+import { __test as reviewTest, reviewMetadataWithAgent } from "../../src/connectors/workflows/metadata/review.js";
 import { hashShard, metadataArtifactObjectKey, metadataLaneShard, screeningObjectKey } from "../../src/connectors/workflows/screening.js";
 
 function baseArtifact(overrides: Record<string, unknown> = {}) {
@@ -14,6 +14,7 @@ function baseArtifact(overrides: Record<string, unknown> = {}) {
         catalogStatus: "live",
         card: {
             name: "Payments",
+            slug: "payments",
             description: "Observed payment operations exposed by the MCP server.",
             tags: ["payments", "commerce"],
         },
@@ -70,6 +71,7 @@ function baseArtifact(overrides: Record<string, unknown> = {}) {
 describe("metadata pipeline gates", () => {
     it("requires observed tools, schemas, and transports before publishing live rows", () => {
         expect(publishTest.validateArtifact(baseArtifact()).ok).toBe(true);
+        expect(publishTest.validateArtifact(baseArtifact({ card: { name: "Payments", description: "Observed payment operations exposed by the MCP server.", tags: ["payments"] } })).ok).toBe(false);
         expect(publishTest.validateArtifact(baseArtifact({ observedTools: [] })).ok).toBe(false);
         expect(publishTest.validateArtifact(baseArtifact({ observedSchemas: {} })).ok).toBe(false);
         expect(publishTest.validateArtifact(baseArtifact({ observedTransports: [] })).ok).toBe(false);
@@ -145,6 +147,36 @@ describe("metadata pipeline gates", () => {
         expect(publishTest.selectLatestCanonicalRows(rows, 10).map((row) => row.card_version)).toEqual(["new-card"]);
     });
 
+    it("keeps reviewed display metadata separate from the canonical pipeline identity", () => {
+        const identity = publishTest.publishIdentity(
+            { server_slug: "github-payments" },
+            baseArtifact({
+                slug: "payments",
+                card: {
+                    name: "Payments MCP Server",
+                    slug: "payments",
+                    description: "Observed payment operations exposed by the MCP server.",
+                    tags: ["payments", "commerce"],
+                },
+                candidate: {
+                    ...(baseArtifact().candidate as Record<string, unknown>),
+                    slug: "payments",
+                    rawName: "io.github.acme/payments-mcp",
+                },
+            }),
+        );
+
+        expect(identity.canonicalSlug).toBe("payments");
+        expect(identity.sourceSlug).toBe("github-payments");
+        expect(identity.aliasIds).toEqual(expect.arrayContaining([
+            "github-payments",
+            "payments",
+            "io.github.acme/payments-mcp",
+            "mcp:github-payments",
+            "mcp-payments",
+        ]));
+    });
+
     it("honors persisted canonical agent ids when selecting publishable reviews", () => {
         const rows = [
             {
@@ -172,25 +204,66 @@ describe("metadata pipeline gates", () => {
         expect(publishTest.selectLatestCanonicalRows(rows, 10).map((row) => row.card_version)).toEqual(["right-agent"]);
     });
 
+    it("filters already-published card versions before publish iteration", () => {
+        const sql = publishTest.publishableReviewRowsSql();
+
+        expect(sql).toContain("NOT EXISTS");
+        expect(sql).toContain("s.slug = r.server_slug OR a.alias_id = r.server_slug");
+        expect(sql).toContain("s.card_version = r.card_version");
+        expect(sql).toContain("s.status IN ('live', 'credential_gated')");
+    });
+
+    it("caps publish errors stored in workflow output", () => {
+        const errors: Array<{ slug: string; message: string }> = [];
+
+        for (let i = 0; i < 55; i += 1) {
+            publishTest.recordPublishError(errors, `server-${i}`, "failed");
+        }
+
+        expect(errors).toHaveLength(50);
+        expect(errors.at(-1)?.slug).toBe("server-49");
+    });
+
     it("accepts fenced model JSON without rewriting model decisions", () => {
-        const card = reviewTest.parseStrict("```json\n{\"name\":\"Payments MCP Server\",\"description\":\"Observed payment operations for creating and checking charges.\",\"tags\":[\"payments\",\"commerce\",\"billing\"]}\n```");
+        const card = reviewTest.parseStrict("```json\n{\"name\":\"Payments\",\"slug\":\"payments\",\"description\":\"Observed payment operations for creating and checking charges.\",\"tags\":[\"payments\",\"commerce\",\"billing\"]}\n```");
         expect(card).toEqual({
-            name: "Payments MCP Server",
+            name: "Payments",
+            slug: "payments",
             description: "Observed payment operations for creating and checking charges.",
             tags: ["payments", "commerce", "billing"],
         });
     });
 
-    it("extracts Workers AI text from REST-wrapped chat responses", () => {
-        expect(reviewTest.extractAiText({
-            result: {
-                choices: [{
-                    message: {
-                        content: "{\"name\":\"Calendar\",\"description\":\"Observed calendar scheduling operations for events and availability.\",\"tags\":[\"calendar\",\"scheduling\"]}",
-                    },
-                }],
-            },
-        })).toContain("\"Calendar\"");
+    it("builds metadata prompts around spawned server metadata and examples", () => {
+        const prompt = reviewTest.buildUserPrompt({
+            repoUrl: "https://github.com/example/server-name",
+            name: "io-github-server-name",
+            description: "Server Name MCP",
+            serverInfo: { name: "Server Name", slug: "server-name" },
+            tools: [{ name: "list_items", description: "List items", inputSchema: { type: "object" } }],
+        });
+
+        expect(prompt).toContain("Spawned-server metadata");
+        expect(prompt).toContain("server-name");
+    });
+
+    it("reports concrete provider failures instead of returning null metadata", async () => {
+        const input = {
+            repoUrl: null,
+            name: "Calendar",
+            description: "Calendar MCP",
+            tools: [{ name: "list_events", description: "List events", inputSchema: { type: "object" } }],
+        };
+
+        await expect(reviewMetadataWithAgent({
+            COMPILER_MODEL_PRIMARY: "gemini-2.5-flash",
+        } as never, 0, input)).rejects.toThrow("Gemini: GOOGLE_GENERATIVE_AI_API_KEY is not configured");
+        await expect(reviewMetadataWithAgent({
+            COMPILER_MODEL_SECONDARY: "accounts/fireworks/models/minimax-m2p7",
+        } as never, 1, input)).rejects.toThrow("Fireworks MiniMax: FIREWORKS_API_KEY is not configured");
+        await expect(reviewMetadataWithAgent({
+            COMPILER_MODEL_TERTIARY: "accounts/fireworks/models/deepseek-v3p2",
+        } as never, 2, input)).rejects.toThrow("Fireworks DeepSeek: FIREWORKS_API_KEY is not configured");
     });
 
 });

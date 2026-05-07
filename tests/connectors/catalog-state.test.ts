@@ -5,6 +5,7 @@ import {
     candidateObjectKey,
     declaredCredentialVars,
     isServedCatalogStatus,
+    retryCandidateObjectKey,
     shadowObjectKey,
 } from "../../src/connectors/workflows/candidates.js";
 
@@ -40,6 +41,7 @@ describe("connector candidate state", () => {
         expect(candidate.transports.map((t) => t.transport)).toEqual(["http", "npx", "docker"]);
         expect(declaredCredentialVars(candidate)).toEqual(["STRIPE_SECRET_KEY"]);
         expect(candidateObjectKey(candidate)).toMatch(/^candidates\/payments\/[a-f0-9]{64}\.json$/);
+        expect(retryCandidateObjectKey(candidate)).toMatch(/^retry-queue\/payments\/[a-f0-9]{64}\.json$/);
         expect(shadowObjectKey(candidate)).toMatch(/^shadows\/payments\/[a-f0-9]{64}\.json$/);
     });
 
