@@ -47,6 +47,8 @@ export interface TransportRow {
     last_failure_at: string | null;
     failure_streak: number;
     median_latency_ms: number | null;
+    runner_profile?: string | null;
+    deadline_ms?: number | null;
     priority: number;
 }
 
@@ -159,13 +161,10 @@ export async function getServer(env: Env, slug: string): Promise<ServerRow | nul
     ).bind(slug).first<ServerRow>();
 }
 
-export async function hasReviewedEmbedding(env: Env, slug: string): Promise<boolean> {
+export async function hasReviewedCatalogEntry(env: Env, slug: string): Promise<boolean> {
     const row = await env.CATALOG.prepare(
         `SELECT 1 AS ok
          FROM metadata_reviews mr
-         JOIN embedding_state es
-           ON es.server_slug = mr.server_slug
-          AND es.card_version = mr.card_version
          JOIN servers s
            ON s.slug = mr.server_slug
           AND s.card_version = mr.card_version
@@ -177,7 +176,7 @@ export async function hasReviewedEmbedding(env: Env, slug: string): Promise<bool
 
 export async function listServers(
     env: Env,
-    filters: { origin?: "tools" | "onchain"; status?: ServerRow["status"]; statuses?: ServerRow["status"][]; servedOnly?: boolean; limit: number; offset: number },
+    filters: { origin?: "tools" | "onchain"; status?: ServerRow["status"]; statuses?: ServerRow["status"][]; category?: string; servedOnly?: boolean; limit: number; offset: number },
 ): Promise<{ rows: ServerRow[]; total: number }> {
     const where: string[] = [];
     const params: unknown[] = [];
@@ -194,18 +193,17 @@ export async function listServers(
         where.push(`status IN (${placeholders.join(", ")})`);
         params.push(...filters.statuses);
     }
+    if (filters.category) {
+        where.push(`category = ?${params.length + 1}`);
+        params.push(filters.category);
+    }
     if (filters.servedOnly) {
         where.push(
-            `servers.status IN ('live', 'credential_gated')
+             `servers.status IN ('live', 'credential_gated')
              AND EXISTS (
                 SELECT 1 FROM metadata_reviews mr
                 WHERE mr.server_slug = servers.slug
                   AND mr.card_version = servers.card_version
-             )
-             AND EXISTS (
-                SELECT 1 FROM embedding_state es
-                WHERE es.server_slug = servers.slug
-                  AND es.card_version = servers.card_version
              )`,
         );
     }
@@ -255,11 +253,6 @@ export async function listCategories(env: Env): Promise<string[]> {
               WHERE mr.server_slug = servers.slug
                 AND mr.card_version = servers.card_version
            )
-           AND EXISTS (
-              SELECT 1 FROM embedding_state es
-              WHERE es.server_slug = servers.slug
-                AND es.card_version = servers.card_version
-           )
          ORDER BY category`,
     ).all<{ category: string }>();
     return (res.results || []).map((r) => r.category);
@@ -274,11 +267,6 @@ export async function listTags(env: Env): Promise<string[]> {
               SELECT 1 FROM metadata_reviews mr
               WHERE mr.server_slug = servers.slug
                 AND mr.card_version = servers.card_version
-           )
-           AND EXISTS (
-              SELECT 1 FROM embedding_state es
-              WHERE es.server_slug = servers.slug
-                AND es.card_version = servers.card_version
            )`,
     ).all<{ tags: string }>();
     const set = new Set<string>();
@@ -294,11 +282,6 @@ export async function meta(env: Env): Promise<{ origins: Record<string, number>;
           SELECT 1 FROM metadata_reviews mr
           WHERE mr.server_slug = servers.slug
             AND mr.card_version = servers.card_version
-      )
-      AND EXISTS (
-          SELECT 1 FROM embedding_state es
-          WHERE es.server_slug = servers.slug
-            AND es.card_version = servers.card_version
       )`;
     const byOriginRes = await env.CATALOG.prepare(
         `SELECT origin, COUNT(*) AS n FROM servers WHERE ${servedWhere} GROUP BY origin`,
@@ -392,8 +375,8 @@ export function upsertServerStmt(env: Env, row: ServerRow): D1PreparedStatement 
 
 export function upsertTransportStmt(env: Env, row: TransportRow): D1PreparedStatement {
     return env.CATALOG.prepare(
-        `INSERT INTO transports (server_slug, kind, package, image, remote_url, protocol, port_observed, cmd_args, env_required, env_optional, priority)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        `INSERT INTO transports (server_slug, kind, package, image, remote_url, protocol, port_observed, cmd_args, env_required, env_optional, runner_profile, deadline_ms, priority)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(server_slug, kind) DO UPDATE SET
             package        = excluded.package,
             image          = excluded.image,
@@ -403,11 +386,13 @@ export function upsertTransportStmt(env: Env, row: TransportRow): D1PreparedStat
             cmd_args       = excluded.cmd_args,
             env_required   = excluded.env_required,
             env_optional   = excluded.env_optional,
+            runner_profile = excluded.runner_profile,
+            deadline_ms    = excluded.deadline_ms,
             priority       = excluded.priority`,
     ).bind(
         row.server_slug, row.kind, row.package, row.image, row.remote_url,
         row.protocol, row.port_observed, row.cmd_args, row.env_required,
-        row.env_optional, row.priority,
+        row.env_optional, row.runner_profile ?? null, row.deadline_ms ?? null, row.priority,
     );
 }
 

@@ -17,6 +17,8 @@ export interface ServerSpawnConfig {
     env?: Record<string, string>;
     envRequired?: string[];
     envOptional?: string[];
+    runnerProfile?: string | null;
+    deadlineMs?: number | null;
     image?: string;
     remoteUrl?: string;
     protocol?: "sse" | "streamable-http";
@@ -56,6 +58,8 @@ export async function getSpawnConfigs(env: Env, slug: string): Promise<ServerSpa
                 protocol: row.protocol ?? undefined,
                 envRequired: parseStringArray(row.env_required),
                 envOptional: parseStringArray(row.env_optional),
+                runnerProfile: row.runner_profile ?? undefined,
+                deadlineMs: row.deadline_ms ?? undefined,
             });
         } else if (row.kind === "docker") {
             if (!row.image) continue;
@@ -64,6 +68,8 @@ export async function getSpawnConfigs(env: Env, slug: string): Promise<ServerSpa
                 image: row.image,
                 envRequired: parseStringArray(row.env_required),
                 envOptional: parseStringArray(row.env_optional),
+                runnerProfile: row.runner_profile ?? undefined,
+                deadlineMs: row.deadline_ms ?? undefined,
             });
         } else if (row.kind === "npx") {
             if (!row.package) continue;
@@ -73,6 +79,8 @@ export async function getSpawnConfigs(env: Env, slug: string): Promise<ServerSpa
                 args: cmdArgs.length > 0 ? cmdArgs : undefined,
                 envRequired: parseStringArray(row.env_required),
                 envOptional: parseStringArray(row.env_optional),
+                runnerProfile: row.runner_profile ?? undefined,
+                deadlineMs: row.deadline_ms ?? undefined,
             });
         } else if (row.kind === "stdio") {
             const command = cmdArgs[0];
@@ -83,6 +91,8 @@ export async function getSpawnConfigs(env: Env, slug: string): Promise<ServerSpa
                 args: cmdArgs.slice(1),
                 envRequired: parseStringArray(row.env_required),
                 envOptional: parseStringArray(row.env_optional),
+                runnerProfile: row.runner_profile ?? undefined,
+                deadlineMs: row.deadline_ms ?? undefined,
             });
         }
         // goat-plugin transports are handled in the GOAT runtime path, not

@@ -42,6 +42,7 @@ export interface CallResult {
 
 export interface ToolListing {
     tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
+    serverInfo?: Record<string, unknown> | null;
 }
 
 class StreamableHttpTransport implements Transport {
@@ -231,8 +232,9 @@ export async function listToolsHttp(target: HttpSpawnTarget): Promise<ToolListin
     const client = new Client({ name: CLIENT_NAME, version: CLIENT_VERSION }, { capabilities: {} });
     try {
         await client.connect(transport);
+        const serverInfo = (client as unknown as { getServerVersion?: () => unknown }).getServerVersion?.();
         const { tools } = await client.listTools();
-        return { tools };
+        return { tools, serverInfo: serverInfo && typeof serverInfo === "object" && !Array.isArray(serverInfo) ? serverInfo as Record<string, unknown> : null };
     } finally {
         try { await client.close(); } catch { /* ignore */ }
     }

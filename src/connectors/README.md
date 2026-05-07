@@ -148,9 +148,12 @@ curl -X POST https://connectors.compose.market/pipeline/run \
   --data '{"mode":"first-pass"}'
 ```
 
-The Workflow performs seed -> verify -> metadata agents -> publish -> embed
--> health -> gc, and each step skips already-complete rows. Subsequent runs
-are driven by the single daily full-pipeline cron in `wrangler.toml`.
+The Workflow is a batch supervisor. It starts seed, verify, metadata, publish,
+and embed workers together; each worker claims only ready rows for its stage
+and skips already-complete rows. Downstream workers run while upstream workers
+are still active, so a metadata-complete item can publish and embed without
+waiting for the whole catalog to finish verification. Subsequent runs are
+driven by the single daily full-pipeline cron in `wrangler.toml`.
 
 ## What replaced what
 

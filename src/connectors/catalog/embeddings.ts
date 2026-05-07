@@ -121,6 +121,17 @@ export function buildCardEmbeddingText(card: {
     ].join("\n");
 }
 
+function hashText(input: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i += 1) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 export function buildVectorId(slug: string, cardVersion: string): string {
-    return `${slug}:${cardVersion}`;
+    const id = `${slug}:${cardVersion}`;
+    if (new TextEncoder().encode(id).length <= 64) return id;
+    return `${slug.slice(0, 40)}:${hashText(id)}:${cardVersion.slice(0, 8)}`;
 }

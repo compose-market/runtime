@@ -219,6 +219,7 @@ async function startGateway(config, envProvided, deadlineMs) {
       return {
         endpoint,
         sessionId,
+        serverInfo: initialized.result?.serverInfo || initialized.result?.server_info || null,
         child,
         close: () => {
           try { child.kill("SIGTERM"); } catch {}
@@ -354,6 +355,7 @@ const server = http.createServer((req, res) => {
           ok: true,
           transportUsed: input.config?.transport || "unknown",
           credentialVars: [],
+          serverInfo: gateway.serverInfo || null,
           tools: listed.tools || [],
         };
       }
