@@ -200,7 +200,7 @@ async function searchGenesisVectors(params: {
   limit: number;
 }): Promise<KnowledgeSearchResult[]> {
   const vectors = await getMemoryVectorsCollection();
-  const embedding = await getEmbedding(params.query);
+  const embedding = await getEmbedding(params.query, "query");
   const candidateLimit = Math.max(params.limit * 12, 48);
 
   try {
