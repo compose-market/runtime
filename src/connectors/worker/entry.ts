@@ -67,6 +67,10 @@ export class McpRunnerContainer extends Container<Env> {
     }
 }
 
+export class McpRunnerBasicContainer extends McpRunnerContainer {}
+export class McpRunnerStandard1Container extends McpRunnerContainer {}
+export class McpRunnerStandard2Container extends McpRunnerContainer {}
+
 export class ConnectorCatalogPipelineWorkflow extends WorkflowEntrypoint<Env, ConnectorCatalogPipelineInput> {
     async run(
         event: Readonly<Parameters<typeof runConnectorCatalogPipeline>[1]>,
@@ -136,8 +140,20 @@ app.post("/verify", requireInternalSecret, async (c) => {
     return c.json(await runVerifyShard(c.env, { shardId: body.shardId, shardCount: body.shardCount, limit: body.limit }));
 });
 app.post("/metadata-agents/run", requireInternalSecret, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { agentId?: number; limit?: number; retryRecent?: boolean };
-    return c.json(await runMetadataAgent(c.env, { agentId: body.agentId ?? 0, limit: body.limit, retryRecent: body.retryRecent }));
+    const body = (await c.req.json().catch(() => ({}))) as {
+        agentId?: number;
+        laneId?: number;
+        laneCount?: number;
+        limit?: number;
+        retryRecent?: boolean;
+    };
+    return c.json(await runMetadataAgent(c.env, {
+        agentId: body.agentId ?? 0,
+        laneId: body.laneId,
+        laneCount: body.laneCount,
+        limit: body.limit,
+        retryRecent: body.retryRecent,
+    }));
 });
 app.post("/publish", requireInternalSecret, async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { limit?: number };
@@ -146,8 +162,17 @@ app.post("/publish", requireInternalSecret, async (c) => {
 app.post("/health", requireInternalSecret, async (c) => c.json(await runHealth(c.env)));
 app.post("/gc", requireInternalSecret, async (c) => c.json(await runGc(c.env)));
 app.post("/pipeline/run", requireInternalSecret, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as ConnectorCatalogPipelineInput & { id?: string };
-    return c.json(await startConnectorCatalogPipeline(c.env, body, { id: body.id, force: body.force === true }));
+    const body = (await c.req.json().catch(() => ({}))) as ConnectorCatalogPipelineInput & {
+        id?: string;
+        parentId?: string | null;
+        rootId?: string;
+    };
+    return c.json(await startConnectorCatalogPipeline(c.env, body, {
+        id: body.id,
+        parentId: body.parentId,
+        rootId: body.rootId,
+        force: body.force === true,
+    }));
 });
 app.get("/pipeline/status/:id", requireInternalSecret, async (c) => {
     return c.json(await getConnectorCatalogPipelineStatus(c.env, c.req.param("id")));

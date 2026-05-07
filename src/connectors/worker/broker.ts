@@ -19,7 +19,7 @@ import {
     getServer,
     getTools,
     getCredentials,
-    hasReviewedEmbedding,
+    hasReviewedCatalogEntry,
     resolveServerSlug,
     parseStringArray,
     parseJsonObject,
@@ -84,7 +84,7 @@ export async function listServerTools(env: Env, slugOrId: string): Promise<ToolL
     if (!slug) return null;
     const server = await getServer(env, slug);
     if (!server) return null;
-    if (!isServedCatalogStatus(server.status) || !(await hasReviewedEmbedding(env, slug))) {
+    if (!isServedCatalogStatus(server.status) || !(await hasReviewedCatalogEntry(env, slug))) {
         // Only agent-reviewed, promoted catalog rows expose tools to agents.
         return {
             serverId: slug,
@@ -145,7 +145,7 @@ export async function callServerTool(
     if (!server) {
         return { ok: false, kind: "MCP_CONFIG_NOT_FOUND", message: `unknown server: ${slug}`, retryable: false };
     }
-    if (!isServedCatalogStatus(server.status) || !(await hasReviewedEmbedding(env, slug))) {
+    if (!isServedCatalogStatus(server.status) || !(await hasReviewedCatalogEntry(env, slug))) {
         return { ok: false, kind: "SERVER_QUARANTINED", message: `server ${slug} is not in the served catalog (${server.status})`, retryable: false };
     }
 
@@ -286,7 +286,11 @@ async function dispatchOnce(
             cfg,
             toolName,
             envelope.args,
-            { envProvided: envelope.envProvided, deadlineMs: envelope.deadlineMs },
+            {
+                envProvided: envelope.envProvided,
+                deadlineMs: envelope.deadlineMs ?? cfg.deadlineMs ?? undefined,
+                runnerProfile: cfg.runnerProfile,
+            },
         );
     } catch (error) {
         if (error instanceof RunnerDispatchError && error.credentialVars.length > 0) {

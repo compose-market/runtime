@@ -22,6 +22,9 @@ export interface Env {
     // The binding is optional so local/dev deployments can point at
     // MCP_RUNNER_URL instead.
     MCP_RUNNER?: DurableObjectNamespace;
+    MCP_RUNNER_BASIC?: DurableObjectNamespace;
+    MCP_RUNNER_STANDARD_1?: DurableObjectNamespace;
+    MCP_RUNNER_STANDARD_2?: DurableObjectNamespace;
 
     // Non-secret config from wrangler.toml [vars]
     GHCR_NAMESPACE: string;
@@ -33,11 +36,16 @@ export interface Env {
     COMPILER_MODEL_TERTIARY: string;
     MCP_RUNNER_URL?: string;
     MCP_RUNNER_INSTANCES?: string;
+    MCP_RUNNER_BASIC_INSTANCES?: string;
+    MCP_RUNNER_STANDARD_1_INSTANCES?: string;
+    MCP_RUNNER_STANDARD_2_INSTANCES?: string;
     MCP_RUNNER_SHUTDOWN_AFTER_REQUEST?: string;
 
     // Secrets (set via `wrangler secret put`)
     RUNTIME_INTERNAL_SECRET: string;
     MONGO_DB_API_KEY: string;
+    GHCR_GITHUB_PAT?: string;
+    GITHUB_GHCR_PAT?: string;
     GHCR_TOKEN?: string;
     CF_API_TOKEN?: string;
     COINGECKO_API_KEY?: string;

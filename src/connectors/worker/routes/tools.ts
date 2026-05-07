@@ -14,7 +14,7 @@ import {
     resolveServerSlug,
     getTools,
     getCredentials,
-    hasReviewedEmbedding,
+    hasReviewedCatalogEntry,
     type ServerRow,
 } from "../../catalog/d1.js";
 import { getSpawnConfigs } from "../../catalog/spawn.js";
@@ -22,21 +22,29 @@ import { callServerTool, listServerTools } from "../broker.js";
 import { requireInternalSecret } from "../auth.js";
 import { runInspect } from "../../workflows/inspect.js";
 import { embedTexts, rerankDocuments } from "../../catalog/embeddings.js";
-import { isServedCatalogStatus } from "../../workflows/candidates.js";
+import { isServedCatalogStatus, type ServedCatalogStatus } from "../../workflows/candidates.js";
 
 const app = new Hono<{ Bindings: Env }>();
+const CATALOG_CACHE_CONTROL = "public, max-age=60, s-maxage=3600";
+const SEARCH_CACHE_CONTROL = "public, max-age=30, s-maxage=300";
 
 app.get("/", async (c) => {
     const limitParam = c.req.query("limit");
     const offset = parseInt(c.req.query("offset") || "0", 10) || 0;
-    const status = c.req.query("status") as undefined | "live" | "credential_gated" | "inspecting" | "verified" | "metadata_reviewed" | "embedded" | "shadowed" | "quarantined" | "deprecated";
+    const category = (c.req.query("category") || "").trim() || undefined;
+    const statusParam = c.req.query("status");
     const limit = Math.min(limitParam ? Math.max(1, parseInt(limitParam, 10) || 0) : 50, 200);
-    if (status && !isServedCatalogStatus(status)) {
-        return c.json({ total: 0, offset, limit: 0, servers: [] });
+    c.header("Cache-Control", CATALOG_CACHE_CONTROL);
+    let status: ServedCatalogStatus | undefined;
+    if (statusParam) {
+        if (!isServedCatalogStatus(statusParam)) {
+            return c.json({ total: 0, offset, limit: 0, servers: [] });
+        }
+        status = statusParam;
     }
     const { rows, total } = await listServers(c.env, status
-        ? { origin: "tools", status, servedOnly: true, limit, offset }
-        : { origin: "tools", statuses: ["live", "credential_gated"], servedOnly: true, limit, offset });
+        ? { origin: "tools", status, category, servedOnly: true, limit, offset }
+        : { origin: "tools", statuses: ["live", "credential_gated"], category, servedOnly: true, limit, offset });
     return c.json({
         total,
         offset,
@@ -57,9 +65,18 @@ app.get("/", async (c) => {
     });
 });
 
-app.get("/categories", async (c) => c.json({ categories: await listCategories(c.env) }));
-app.get("/tags", async (c) => c.json({ tags: await listTags(c.env) }));
-app.get("/meta", async (c) => c.json(await meta(c.env)));
+app.get("/categories", async (c) => {
+    c.header("Cache-Control", CATALOG_CACHE_CONTROL);
+    return c.json({ categories: await listCategories(c.env) });
+});
+app.get("/tags", async (c) => {
+    c.header("Cache-Control", CATALOG_CACHE_CONTROL);
+    return c.json({ tags: await listTags(c.env) });
+});
+app.get("/meta", async (c) => {
+    c.header("Cache-Control", CATALOG_CACHE_CONTROL);
+    return c.json(await meta(c.env));
+});
 
 /**
  * GET /tools/search?q=...&limit=...
@@ -68,7 +85,8 @@ app.get("/meta", async (c) => c.json(await meta(c.env)));
  */
 app.get("/search", async (c) => {
     const q = (c.req.query("q") || "").toLowerCase().trim();
-    const limit = Math.max(1, Math.min(parseInt(c.req.query("limit") || "30", 10) || 30, 500));
+    const limit = Math.max(1, Math.min(parseInt(c.req.query("limit") || "30", 10) || 30, 50));
+    c.header("Cache-Control", SEARCH_CACHE_CONTROL);
     if (!q) {
         return c.json({ query: "", total: 0, servers: [] });
     }
@@ -115,7 +133,7 @@ app.get("/search", async (c) => {
                 id: s.slug,
                 text: `${s.name}\n${s.description}\n${parseTags(s.tags).join(", ")}`,
             })),
-            Math.min(limit, 20),
+            limit,
         );
         const ranked = reranked.map((item) => bySlug.get(item.id)).filter((row): row is ServerRow => Boolean(row));
         const top = ranked.slice(0, limit).map((s) => ({
@@ -145,16 +163,17 @@ app.get("/search", async (c) => {
 
 app.get("/:slug", async (c) => {
     const slug = await resolveServerSlug(c.env, c.req.param("slug"));
+    c.header("Cache-Control", CATALOG_CACHE_CONTROL);
     if (!slug) return c.json({ error: { code: "MCP_CONFIG_NOT_FOUND", message: "server not found", retryable: false } }, 404);
     const server = await getServer(c.env, slug);
     if (!server) return c.json({ error: { code: "MCP_CONFIG_NOT_FOUND", message: "server not found", retryable: false } }, 404);
-    const reviewedAndEmbedded = isServedCatalogStatus(server.status)
-        ? await hasReviewedEmbedding(c.env, slug)
+    const reviewed = isServedCatalogStatus(server.status)
+        ? await hasReviewedCatalogEntry(c.env, slug)
         : false;
-    if (!reviewedAndEmbedded) {
+    if (!reviewed) {
         return c.json({ error: { code: "SERVER_QUARANTINED", message: "server is not in the final served catalog", retryable: false } }, 404);
     }
-    const tools = reviewedAndEmbedded ? await getTools(c.env, slug) : [];
+    const tools = reviewed ? await getTools(c.env, slug) : [];
     const credentials = await getCredentials(c.env, slug);
 
     return c.json({
@@ -168,7 +187,7 @@ app.get("/:slug", async (c) => {
         repoUrl: server.repo_url,
         image: server.image,
         status: server.status,
-        available: reviewedAndEmbedded,
+        available: reviewed,
         statefulness: server.statefulness,
         cardVersion: server.card_version,
         compiledAt: server.compiled_at,
@@ -197,7 +216,7 @@ app.get("/:slug/spawn", async (c) => {
     const slug = await resolveServerSlug(c.env, c.req.param("slug"));
     if (!slug) return c.json({ error: { code: "MCP_CONFIG_NOT_FOUND", message: "server not found", retryable: false } }, 404);
     const server = await getServer(c.env, slug);
-    if (!server || !isServedCatalogStatus(server.status) || !(await hasReviewedEmbedding(c.env, slug))) {
+    if (!server || !isServedCatalogStatus(server.status) || !(await hasReviewedCatalogEntry(c.env, slug))) {
         return c.json({ error: { code: "SERVER_QUARANTINED", message: "server is not in the final served catalog", retryable: false } }, 404);
     }
     const configs = await getSpawnConfigs(c.env, slug);
