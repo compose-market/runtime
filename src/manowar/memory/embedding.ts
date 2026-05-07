@@ -9,6 +9,17 @@
  * Auth and quota are handled by `MONGO_DB_API_KEY`; no separate Voyage key
  * is required (the gateway proxies Voyage transparently).
  *
+ * `input_type` matters: Voyage's voyage-3+ family was trained with
+ * asymmetric query/document encoding. Passing `"query"` for retrieval
+ * queries vs `"document"` for indexed content yields measurably better
+ * recall@K — the spec demands it. Default is `"document"` so legacy
+ * callers (indexing paths) keep their semantics; the search path passes
+ * `"query"` explicitly.
+ *
+ * Cache key includes `input_type` so a query and a document with identical
+ * text get distinct embeddings (which they should — they're different
+ * vectors per Voyage).
+ *
  * Configurable via:
  *   - MONGO_DB_API_KEY                 (required)
  *   - MONGO_DB_EMBEDDING_API_BASE_URL  (optional, defaults to https://ai.mongodb.com/v1)
@@ -25,6 +36,8 @@ const EMBEDDING_DIMENSIONS = Number.parseInt(process.env.MEMORY_EMBEDDING_DIMENS
 const EMBEDDING_TIMEOUT_MS = Number.parseInt(process.env.MEMORY_EMBEDDING_TIMEOUT_MS || "8000", 10);
 const VOYAGE_URL = `${String(process.env.MONGO_DB_EMBEDDING_API_BASE_URL || "https://ai.mongodb.com/v1").replace(/\/+$/u, "")}/embeddings`;
 
+export type EmbeddingInputType = "document" | "query";
+
 interface VoyageEmbeddingResponse {
     object: string;
     data: Array<{ object: string; embedding: number[]; index: number }>;
@@ -40,7 +53,7 @@ function requireVoyageApiKey(): string {
     return key;
 }
 
-async function callVoyage(input: string | string[]): Promise<number[][]> {
+async function callVoyage(input: string | string[], inputType: EmbeddingInputType): Promise<number[][]> {
     const apiKey = requireVoyageApiKey();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), EMBEDDING_TIMEOUT_MS);
@@ -54,7 +67,7 @@ async function callVoyage(input: string | string[]): Promise<number[][]> {
             body: JSON.stringify({
                 input,
                 model: EMBEDDING_MODEL,
-                input_type: "document",
+                input_type: inputType,
                 output_dimension: EMBEDDING_DIMENSIONS,
             }),
             signal: controller.signal,
@@ -76,10 +89,18 @@ async function callVoyage(input: string | string[]): Promise<number[][]> {
     }
 }
 
-async function readCachedEmbedding(text: string): Promise<EmbeddingResult | null> {
+function cacheKey(text: string, inputType: EmbeddingInputType): string {
+    // input_type is part of the embedding; cache key MUST distinguish them
+    // or a query and a document with same text would collide.
+    return inputType === "query"
+        ? `embedding:q:${createContentHash(text)}`
+        : `embedding:${createContentHash(text)}`;
+}
+
+async function readCachedEmbedding(text: string, inputType: EmbeddingInputType): Promise<EmbeddingResult | null> {
     try {
         const redis = await getRedisClient();
-        const cached = await redis.get(`embedding:${createContentHash(text)}`);
+        const cached = await redis.get(cacheKey(text, inputType));
         if (!cached) return null;
         const parsed = JSON.parse(cached) as { embedding: number[] };
         return {
@@ -93,11 +114,11 @@ async function readCachedEmbedding(text: string): Promise<EmbeddingResult | null
     }
 }
 
-async function writeCachedEmbedding(text: string, embedding: number[]): Promise<void> {
+async function writeCachedEmbedding(text: string, embedding: number[], inputType: EmbeddingInputType): Promise<void> {
     try {
         const redis = await getRedisClient();
         await redis.setEx(
-            `embedding:${createContentHash(text)}`,
+            cacheKey(text, inputType),
             EMBEDDING_CACHE_TTL_SECONDS,
             JSON.stringify({ embedding }),
         );
@@ -106,11 +127,16 @@ async function writeCachedEmbedding(text: string, embedding: number[]): Promise<
     }
 }
 
-export async function getEmbedding(text: string): Promise<EmbeddingResult> {
-    const cached = await readCachedEmbedding(text);
+/**
+ * Embed a single text. `inputType` defaults to "document" so legacy callers
+ * (indexing paths) keep their semantics. Retrieval callers MUST pass "query"
+ * to honor Voyage's asymmetric encoding contract.
+ */
+export async function getEmbedding(text: string, inputType: EmbeddingInputType = "document"): Promise<EmbeddingResult> {
+    const cached = await readCachedEmbedding(text, inputType);
     if (cached) return cached;
-    const [embedding] = await callVoyage(text);
-    await writeCachedEmbedding(text, embedding);
+    const [embedding] = await callVoyage(text, inputType);
+    await writeCachedEmbedding(text, embedding, inputType);
     return {
         embedding,
         provider: "voyage",
@@ -119,7 +145,7 @@ export async function getEmbedding(text: string): Promise<EmbeddingResult> {
     };
 }
 
-export async function getEmbeddingsBatch(texts: string[]): Promise<EmbeddingResult[]> {
+export async function getEmbeddingsBatch(texts: string[], inputType: EmbeddingInputType = "document"): Promise<EmbeddingResult[]> {
     if (texts.length === 0) return [];
 
     const results: EmbeddingResult[] = new Array(texts.length);
@@ -127,7 +153,7 @@ export async function getEmbeddingsBatch(texts: string[]): Promise<EmbeddingResu
     const uncachedTexts: string[] = [];
 
     for (let i = 0; i < texts.length; i += 1) {
-        const cached = await readCachedEmbedding(texts[i]);
+        const cached = await readCachedEmbedding(texts[i], inputType);
         if (cached) {
             results[i] = cached;
         } else {
@@ -138,7 +164,7 @@ export async function getEmbeddingsBatch(texts: string[]): Promise<EmbeddingResu
 
     if (uncachedTexts.length === 0) return results;
 
-    const embeddings = await callVoyage(uncachedTexts);
+    const embeddings = await callVoyage(uncachedTexts, inputType);
     for (let j = 0; j < uncachedIndexes.length; j += 1) {
         const i = uncachedIndexes[j];
         const embedding = embeddings[j];
@@ -148,7 +174,7 @@ export async function getEmbeddingsBatch(texts: string[]): Promise<EmbeddingResu
             cached: false,
             dimensions: embedding.length,
         };
-        await writeCachedEmbedding(texts[i], embedding);
+        await writeCachedEmbedding(texts[i], embedding, inputType);
     }
 
     return results;

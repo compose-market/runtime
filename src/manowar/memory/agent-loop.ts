@@ -81,6 +81,12 @@ export interface AgentMemoryRecordResponse {
         transcript: boolean;
         working: boolean;
         vector: boolean;
+        /**
+         * Graph fact extraction is fire-and-forget (runs Gemini async,
+         * indexes into source:"fact" rows on completion). This field is
+         * therefore always `false` at response-time — facts surface in
+         * subsequent pre_turn recalls. Kept for SDK compatibility.
+         */
         graph: boolean;
     };
 }
@@ -393,7 +399,9 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
         },
     });
 
-    const [vectorResult, graphResult, sessionResult] = await Promise.allSettled([
+    // Cheap, in-band writes: vector + working buffer. These are fast (Mongo
+    // upserts only) and the response shape promises booleans for them.
+    const [vectorResult, sessionResult] = await Promise.allSettled([
         indexMemoryContent({
             content: turnContent,
             agentWallet: scope.agentWallet,
@@ -403,20 +411,6 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
             haiId: scope.haiId,
             source: "session",
             metadata,
-        }),
-        // First-party graph layer: extract durable facts via gemini-3.1-flash-lite-preview
-        // and index them as source:"fact" vectors. Replaces the old mem0 cloud round-trip.
-        indexAgentMemoryFacts({
-            agentWallet: scope.agentWallet,
-            userAddress: scope.userAddress,
-            threadId,
-            mode: scope.mode,
-            haiId: scope.haiId,
-            messages,
-            metadata: {
-                ...metadata,
-                type: "agent_memory_turn_graph",
-            },
         }),
         rememberSessionMessages({
             sessionId: buildThreadSessionId({ ...scope, threadId }),
@@ -436,6 +430,27 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
         }),
     ]);
 
+    // Fire-and-forget: graph fact extraction runs Gemini for ~1-8s and is
+    // non-critical for the Arazzo p50 < 50ms contract. Errors are logged but
+    // never block or fail the post_turn response. Facts surface in subsequent
+    // pre_turn calls once indexing completes.
+    void indexAgentMemoryFacts({
+        agentWallet: scope.agentWallet,
+        userAddress: scope.userAddress,
+        threadId,
+        mode: scope.mode,
+        haiId: scope.haiId,
+        messages,
+        metadata: {
+            ...metadata,
+            type: "agent_memory_turn_graph",
+        },
+    }).catch((error) => {
+        console.warn(
+            `[memory:agent_loop] fact extraction failed for turn ${turnId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    });
+
     return {
         workflow: {
             v: AGENT_MEMORY_WORKFLOW_VERSION,
@@ -451,8 +466,10 @@ export async function recordAgentMemoryTurn(input: unknown): Promise<AgentMemory
             transcript: true,
             working: sessionResult.status === "fulfilled",
             vector: vectorResult.status === "fulfilled" && Boolean(vectorResult.value.vectorId),
-            graph: graphResult.status === "fulfilled"
-                && (graphResult.value.factsIndexed > 0 || graphResult.value.factsBumped > 0),
+            // graph fact extraction is fire-and-forget; we report `false` for
+            // synchronous storage and let the actual fact rows surface on the
+            // next pre_turn recall. This keeps the route p50 < 50ms.
+            graph: false,
         },
     };
 }
@@ -465,9 +482,12 @@ export async function rememberAgentMemory(input: unknown): Promise<AgentMemoryRe
         throw new AgentMemoryInputError("content is required");
     }
     const factHash = createContentHash(`${scope.agentWallet}|${(scope.userAddress || "_").toLowerCase()}|${content.toLowerCase().trim()}`);
-    const VALID_FACT_TYPES = new Set(["preference", "identity", "context", "skill", "relationship", "event", "other"]);
+    const VALID_FACT_TYPES = new Set(["preference", "identity", "context", "skill", "relationship", "event"]);
     const requestedType = asString(body.type);
-    const factType = requestedType && VALID_FACT_TYPES.has(requestedType) ? requestedType : "other";
+    // Default to "context" (a real, ranker-aware bucket) when caller omits
+    // or sends an unknown type — never "other" (we removed that bucket because
+    // the parser rejected it anyway and ranker priorities don't include it).
+    const factType = requestedType && VALID_FACT_TYPES.has(requestedType) ? requestedType : "context";
     const metadata = {
         type: requestedType ?? "explicit_save",
         source: "agent_loop",

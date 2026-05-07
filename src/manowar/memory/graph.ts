@@ -37,7 +37,7 @@ const FACT_EXTRACTION_TIMEOUT_MS = Number.parseInt(process.env.MEMORY_FACT_EXTRA
 const FACT_MAX_PER_TURN = Math.max(1, Number.parseInt(process.env.MEMORY_FACT_MAX_PER_TURN || "5", 10));
 const FACT_MIN_CONFIDENCE = Math.max(0, Math.min(1, Number.parseFloat(process.env.MEMORY_FACT_MIN_CONFIDENCE || "0.6")));
 const FACT_MAX_CHARS = Math.max(40, Number.parseInt(process.env.MEMORY_FACT_MAX_CHARS || "240", 10));
-const FACT_TYPES = ["preference", "identity", "context", "skill", "relationship", "event", "other"] as const;
+const FACT_TYPES = ["preference", "identity", "context", "skill", "relationship", "event"] as const;
 type FactType = typeof FACT_TYPES[number];
 const FACT_TAG_MAX_CHARS = 40;
 
@@ -155,9 +155,9 @@ function parseExtractedFacts(raw: string): ExtractedFact[] {
         if (confidence < FACT_MIN_CONFIDENCE) continue;
         const typeRaw = typeof record.type === "string" ? record.type.toLowerCase() : "";
         if (!(FACT_TYPES as readonly string[]).includes(typeRaw)) {
-            // Reject unknown / disallowed types (notably "other"). The model is
-            // explicitly instructed to drop facts that don't fit, but we enforce
-            // here too — junk types correlate strongly with omnibus rows.
+            // Reject types not in the typed list. Removing "other" from
+            // FACT_TYPES (vs accepting + filtering) means the LLM never
+            // emits it in the first place — cleaner extraction.
             continue;
         }
         const type: FactType = typeRaw as FactType;

@@ -348,7 +348,7 @@ export async function searchVectors(params: HybridSearchParams): Promise<SearchR
         return cached;
     }
 
-    const queryEmbedding = await getEmbedding(query);
+    const queryEmbedding = await getEmbedding(query, "query");
 
     const rawResults = await hybridVectorSearch({
         query,
