@@ -156,7 +156,10 @@ export async function startWorkflowTemporalWorkers(): Promise<void> {
 
     const connection = await NativeConnection.connect({
         address: getTemporalAddress(),
-        apiKey: getTemporalApiKey(),
+        metadata: {
+            "temporal-namespace": getTemporalNamespace(),
+            authorization: `Bearer ${getTemporalApiKey()}`,
+        },
         tls: true,
     });
     const namespace = getTemporalNamespace();

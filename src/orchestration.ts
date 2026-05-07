@@ -101,6 +101,13 @@ import {
 } from "./temporal/memory/schedules.js";
 import { extractRuntimeSessionHeaders, isRuntimeInternalRequest } from "./auth.js";
 import {
+    parseCalPlan,
+    runCalPlan,
+    type InterpreterContext,
+} from "./manowar/harness/index.js";
+import { createAgentTools } from "./manowar/agent/tools.js";
+import { defaultBindResolver } from "./manowar/agent/tools.js";
+import {
     indexWorkspaceDocuments,
     normalizeKnowledgeLimit,
     normalizeWorkspaceDocuments,
@@ -267,6 +274,75 @@ export function registerOrchestrationRoutes(app: RouteRegistrar): void {
                 deployment: temporalStatus.deployment,
             },
         });
+    }));
+
+    // ============================================================================
+    // Harness — Compose Agent Loop (cal) direct executor
+    // ============================================================================
+    //
+    // POST /internal/workflow/cal/run
+    // Body: { yaml?: string, plan?: object, agentWallet: string,
+    //         userAddress?: string, composeRunId?: string,
+    //         pluginIds?: string[] }
+    //
+    // Executes a cal plan as if it were emitted by an agent. The harness
+    // tools (task / delegate / search_* / scratchpad_* / synthesize) are
+    // bound automatically. Used for QA, integration tests, and external
+    // power users who want to script multi-agent workflows.
+    //
+    // Models are resolved per-step from each registered agent's on-chain
+    // card. Raw-model calls live in the `model_tool` plugin.
+    //
+    // Internal-secret guard: requires the same x-internal-secret header
+    // that agent delegation already uses.
+    app.post("/cal/run", asyncHandler(async (req: Request, res: Response) => {
+        if (!isRuntimeInternalRequest(req)) {
+            res.status(401).json({ error: "internal secret required" });
+            return;
+        }
+        const body = (req.body || {}) as {
+            yaml?: string;
+            plan?: unknown;
+            agentWallet?: string;
+            userAddress?: string;
+            composeRunId?: string;
+            pluginIds?: string[];
+        };
+        const agentWallet = (body.agentWallet || "harness:adhoc").toString();
+        const composeRunId = body.composeRunId
+            || `cal-adhoc:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
+        let parsedPlan;
+        try {
+            parsedPlan = parseCalPlan(body.yaml ?? body.plan);
+        } catch (error) {
+            res.status(400).json({
+                error: "invalid cal plan",
+                detail: error instanceof Error ? error.message : String(error),
+            });
+            return;
+        }
+        const tools = await createAgentTools(
+            body.pluginIds ?? [],
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            body.userAddress,
+        );
+        const bindResolver = defaultBindResolver(tools);
+        // Model resolution is automatic: every task/delegate step targets
+        // a registered on-chain agent (Phase 3.1 enforcement) whose card
+        // declares its model. The interpreter looks it up directly.
+        // Raw-model calls live in the model_tool plugin (Phase 4.7).
+        const ctx: InterpreterContext = {
+            agentWallet,
+            composeRunId,
+            userAddress: body.userAddress,
+            resolveTools: async ({ bind }) => bindResolver(bind),
+            directTools: new Map(tools.map((t) => [t.name, t] as const)),
+        };
+        const result = await runCalPlan(parsedPlan, ctx);
+        res.json(result);
     }));
 
     // ============================================================================

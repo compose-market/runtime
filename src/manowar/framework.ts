@@ -12,6 +12,7 @@ import { getAgentExecutionContext, runWithAgentExecutionContext } from "./agent/
 import { persistAgentConversationTurn, retrieveAgentMemory } from "./agent/memory.js";
 import { resolveMemoryScope } from "./agent/memory-scope.js";
 import { peekAgentIdentity, renderIdentitySection, resolveAgentIdentity, type AgentIdentity } from "./agent/identity.js";
+import { readToolCallsFromRecord, readToolCallChunksFromRecord } from "./agent/tool-calls.js";
 import { ensureGenesisKnowledge } from "./knowledge/genesis.js";
 import {
   buildApiInternalHeaders,
@@ -274,7 +275,7 @@ function buildPromptContext(config: AgentConfig): string | undefined {
     sections.push(memoryPrompt);
   }
 
-  const sessionContext = config.sessionContext;
+  const sessionContext = config.sessionContext ?? getAgentExecutionContext()?.sessionContext;
   if (sessionContext) {
     const sessionLines: string[] = [];
     if (sessionContext.sessionActive) {
@@ -294,9 +295,25 @@ function buildPromptContext(config: AgentConfig): string | undefined {
     }
   }
 
-  // Discipline: one terse line. Models are smart — more rules = more drift.
+  // Discipline footer. Tight, imperative, agent-fabric aware.
+  // Honors the canonical contracts:
+  //   - Memory contract (memory.arazzo.yaml): the ranker pre-injects above;
+  //     the agent does NOT pick layers and does NOT call a recall tool.
+  //   - A2A contract (a2a.arazzo.yaml): peer agents are first-class
+  //     specialists, callable over x402 envelopes; budgets are pre-negotiated.
+  //   - Loop contract (graph.ts budget gate): wall + failures + batches.
+  //
+  // Models are smart — short directive list beats prose. ~140 tokens.
   sections.push(
-    "Use tools when the task needs live data, on-chain action, or memory. Continue calling tools across multiple steps until the task is complete; only stop when you have a final answer.",
+    [
+      "Operating rules:",
+      "1. Tools are how you act. Use them whenever the task needs live data, computation, on-chain action, or coordination with another agent. Keep calling tools across many steps; do not stop early.",
+      "2. Memory above is curated for you by the ranker — treat it as ground truth. Do not ask for recall; do not duplicate it back to the user.",
+      "3. Peer agents are specialists. When the task fits another agent's expertise, call them via the a2a tool surface; their budget is already covered by the envelope.",
+      "4. State changes (writes, payments, deploys) require a verifiable result before you stop. State reads can be summarised.",
+      "5. Stop only when you have a complete final answer or when the runtime signals budget exhaustion. Never promise future work you have not actually scheduled.",
+      "6. If a tool fails repeatedly with the same arguments, stop retrying — discover the right inputs first or report the exact blocker.",
+    ].join("\n"),
   );
 
   return sections.length > 0 ? sections.join("\n\n") : undefined;
@@ -323,7 +340,10 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   const composeTools = await createAgentTools(
     config.plugins || [],
     config.wallet,
-    () => config.sessionContext,
+    // Resolver: prefer per-request sessionContext from AsyncLocalStorage
+    // (set by executeAgentCore / streamAgentCore), fall back to the
+    // baked-in agent.config.sessionContext (for cron / pre-warmed agents).
+    () => getAgentExecutionContext()?.sessionContext ?? config.sessionContext,
     undefined,
     config.chainId,
     config.userAddress,
@@ -666,72 +686,27 @@ function formatToolInvocation(name: string, input: unknown): string {
  * `tool_call_chunks` arrays with partial args being typed token-by-token.
  * SOTA pattern (Codex `response.function_call_arguments.delta`,
  * Claude Code `input_json_delta`).
+ *
+ * Single source of truth: `readToolCallChunksFromRecord` in
+ * `agent/tool-calls.ts`.
  */
 function extractToolCallChunks(value: unknown): Array<{ id?: string; name?: string; args?: string; index?: number }> {
-  const out: Array<{ id?: string; name?: string; args?: string; index?: number }> = [];
-  const candidates = [value, asRecord(value)?.kwargs, asRecord(value)?.lc_kwargs];
-  for (const candidate of candidates) {
-    const record = asRecord(candidate);
-    if (!record) continue;
-    const chunks = record.tool_call_chunks ?? record.toolCallChunks;
-    if (!Array.isArray(chunks)) continue;
-    for (const raw of chunks) {
-      const chunk = asRecord(raw);
-      if (!chunk) continue;
-      const id = readRecordString(chunk, "id", "tool_call_id");
-      const name = readRecordString(chunk, "name");
-      const args = readRecordString(chunk, "args", "arguments");
-      const indexValue = chunk.index;
-      const index = typeof indexValue === "number" ? indexValue : undefined;
-      if (!id && !name && !args) continue;
-      out.push({ id, name, args, index });
-    }
-    if (out.length > 0) break;
-  }
-  return out;
+  return readToolCallChunksFromRecord(value);
 }
 
 function extractStreamToolCalls(value: unknown): Array<{ id: string; name: string; args?: unknown }> {
+  // Walk every message-like wrapper in the stream event and run the shared
+  // leaf-level extractor. Dedup is handled inside the extractor; we still
+  // dedup across wrappers in case the same call appears in multiple paths.
   const calls: Array<{ id: string; name: string; args?: unknown }> = [];
   const seen = new Set<string>();
-  const push = (call: { id: string; name: string; args?: unknown }) => {
-    const key = toolCallKey(call);
-    if (seen.has(key)) return;
-    seen.add(key);
-    calls.push(call);
-  };
-
   for (const item of collectMessageLikeValues(value)) {
-    const record = asRecord(item);
-    if (!record) continue;
-    const additional = nestedRecord(record, "additional_kwargs");
-    const lcKwargs = nestedRecord(record, "lc_kwargs");
-    const kwargs = nestedRecord(record, "kwargs");
-    const kwargsAdditional = kwargs ? nestedRecord(kwargs, "additional_kwargs") : null;
-    const rawCalls = record.tool_calls
-      ?? record.toolCalls
-      ?? additional?.tool_calls
-      ?? lcKwargs?.tool_calls
-      ?? kwargs?.tool_calls
-      ?? kwargsAdditional?.tool_calls;
-    if (!Array.isArray(rawCalls)) continue;
-    rawCalls.forEach((raw, index) => {
-      const call = asRecord(raw);
-      const fn = call ? asRecord(call.function) : null;
-      const name = call
-        ? readRecordString(call, "name")
-        ?? (fn ? readRecordString(fn, "name") : undefined)
-        : undefined;
-      if (!name) return;
-      const id = call
-        ? readRecordString(call, "id", "tool_call_id")
-        ?? `${name}:${index}`
-        : `${name}:${index}`;
-      const args = call
-        ? call.args ?? call.arguments ?? (fn ? parseToolArgs(fn.arguments) : undefined)
-        : undefined;
-      push({ id, name, args });
-    });
+    for (const call of readToolCallsFromRecord(item)) {
+      const key = toolCallKey(call);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      calls.push(call);
+    }
   }
   return calls;
 }
@@ -902,9 +877,10 @@ async function executeAgentCore(
   const start = Date.now();
 
   try {
-    if (options.sessionContext) {
-      agent.config.sessionContext = options.sessionContext;
-    }
+    // NOTE: do NOT mutate agent.config.sessionContext here. The agent
+    // instance is module-cached and shared across concurrent requests;
+    // mutation races between users. The session context flows via
+    // AsyncLocalStorage (set on runWithAgentExecutionContext below).
 
     const usageTracker = new AgentMemoryTracker(agentWallet, threadId);
     const callbacks = [usageTracker];
@@ -924,6 +900,7 @@ async function executeAgentCore(
         workflowWallet,
         memoryPrompt,
         lastUserMessage: message,
+        sessionContext: options.sessionContext,
       },
       async () =>
         agent.executor.invoke(
@@ -1010,9 +987,9 @@ async function* streamAgentCore(
   options: ExecuteOptions,
 ): AsyncGenerator<any> {
   const agentWallet = agent.config.agentWallet;
-  if (options.sessionContext) {
-    agent.config.sessionContext = options.sessionContext;
-  }
+  // NOTE: do NOT mutate agent.config.sessionContext here. Session context
+  // flows through AsyncLocalStorage (set in runWithAgentExecutionContext
+  // below) so concurrent requests cannot race on shared instance state.
 
   const threadId = resolveExecutionThreadId(agentWallet, options);
   const userAddress = options.userAddress;
@@ -1046,6 +1023,7 @@ async function* streamAgentCore(
         workflowWallet,
         memoryPrompt,
         lastUserMessage: message,
+        sessionContext: options.sessionContext,
       },
       async () =>
         agent.executor.streamEvents(

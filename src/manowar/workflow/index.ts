@@ -112,15 +112,9 @@ export {
     initTriggersForWorkflow,
 } from "./triggers.js";
 
-// Agentic models
-export {
-    coordinatorModels,
-    getAgenticModel,
-    getAgenticModelIds,
-    isAgenticCoordinatorModel,
-    getDefaultCoordinatorModel,
-    type AgenticModel,
-} from "./agentic.js";
+// Agentic coordinator models — moved to harness/coordinators.ts which
+// reads dynamically from /v1/models/all and filters by capabilities.
+// (workflow/agentic.ts deleted in Phase 1.8: hardcoded list was stale.)
 
 // Task Planning
 export {
