@@ -59,6 +59,28 @@ CREATE TABLE IF NOT EXISTS candidate_screenings (
 
 CREATE INDEX IF NOT EXISTS idx_candidate_screenings_status ON candidate_screenings(status, updated_at);
 
+-- ─── candidate_retry_queue ───────────────────────────────────────────────
+-- Retryable verification outcomes are parked outside RAW/candidates so the
+-- first-pass verify stage can exhaust active candidates. A dispatcher can
+-- later requeue these rows when their retry policy is ready.
+CREATE TABLE IF NOT EXISTS candidate_retry_queue (
+    server_slug     TEXT NOT NULL,
+    source_hash     TEXT NOT NULL,
+    source_version  TEXT NOT NULL,
+    raw_key         TEXT NOT NULL,
+    candidate_key   TEXT NOT NULL,
+    retry_class     TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    next_retry_at   TEXT NOT NULL,
+    last_error      TEXT,
+    parked_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (server_slug, source_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_retry_queue_next
+    ON candidate_retry_queue(next_retry_at, retry_class, updated_at);
+
 -- ─── metadata_agent_reviews ──────────────────────────────────────────────
 -- Agent-authored metadata artifacts. The three model-backed metadata agents
 -- write here after respawning MCPs themselves. The deterministic publisher
@@ -163,12 +185,56 @@ CREATE TABLE IF NOT EXISTS transports (
     last_failure_at   TEXT,
     failure_streak    INTEGER NOT NULL DEFAULT 0,
     median_latency_ms INTEGER,
+    runner_profile    TEXT,
+    deadline_ms       INTEGER,
     priority          REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (server_slug, kind),
     FOREIGN KEY (server_slug) REFERENCES servers(slug) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_transports_priority ON transports(server_slug, priority DESC);
+
+-- ─── spawn_attempts ─────────────────────────────────────────────────────
+-- Per transport/profile evidence from verify and metadata respawns.
+CREATE TABLE IF NOT EXISTS spawn_attempts (
+    id                 TEXT PRIMARY KEY,
+    server_slug        TEXT NOT NULL,
+    source_hash        TEXT NOT NULL,
+    source_version     TEXT NOT NULL,
+    stage              TEXT NOT NULL CHECK (stage IN ('verify', 'metadata')),
+    transport_kind     TEXT NOT NULL,
+    runner_profile     TEXT,
+    deadline_ms        INTEGER,
+    attempt_no         INTEGER NOT NULL DEFAULT 1,
+    status             TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+    retry_class        TEXT NOT NULL,
+    error_code         TEXT,
+    error_message      TEXT,
+    latency_ms         INTEGER,
+    observed_tools     INTEGER NOT NULL DEFAULT 0,
+    attempted_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_spawn_attempts_candidate ON spawn_attempts(server_slug, source_hash, stage, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_spawn_attempts_status ON spawn_attempts(status, retry_class, attempted_at);
+
+-- ─── catalog_stage_errors ────────────────────────────────────────────────
+-- Per-item stage failures that should not fail a worker workflow or erase
+-- completed upstream state. Reconciliation can retry rows after next_retry_at.
+CREATE TABLE IF NOT EXISTS catalog_stage_errors (
+    item_id        TEXT NOT NULL,
+    item_version   TEXT NOT NULL DEFAULT '',
+    stage          TEXT NOT NULL CHECK (stage IN ('seed', 'verify', 'metadata', 'publish', 'embed')),
+    error_message  TEXT NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 1,
+    next_retry_at  TEXT,
+    first_seen_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (item_id, item_version, stage)
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_stage_errors_retry
+    ON catalog_stage_errors(stage, next_retry_at, updated_at);
 
 -- ─── tools ────────────────────────────────────────────────────────────────
 -- Tool descriptors observed during inspect. Schema is JSON-serialized.
@@ -266,6 +332,9 @@ CREATE TABLE IF NOT EXISTS seed_cursor (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     cursor      TEXT,
     page_offset INTEGER NOT NULL DEFAULT 0,
+    registry_complete INTEGER NOT NULL DEFAULT 0,
+    ghcr_offset INTEGER NOT NULL DEFAULT 0,
+    ghcr_complete INTEGER NOT NULL DEFAULT 0,
     complete    INTEGER NOT NULL DEFAULT 0,
     completed_at TEXT,
     updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
