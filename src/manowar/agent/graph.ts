@@ -11,28 +11,73 @@ import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { FileSystemCheckpointSaver } from "./checkpoint.js";
 import type { RunnableConfig } from "@langchain/core/runnables";
+import { readToolCallsFromRecord, type NormalizedToolCall } from "./tool-calls.js";
 
 const TOOL_REPAIR_MARKER = "[compose:tool-repair]";
 const MAX_TOOL_REPAIR_ATTEMPTS = 3;
-const DEFAULT_MAX_BOUND_TOOLS = 12;
-/**
- * Hard cap on tool batches per user turn. After this many successful tool batches
- * the agent MUST emit a final answer with no further tool calls. This is the
- * canonical "outer loop bound" used by Codex (~50 calls/task), Claude Code
- * (recursionLimit), and Manus (max ~50 tool calls/task — but per turn we want
- * a tighter bound so settlement always lands within the Cloud Run window).
- *
- * Without this bound the model can recurse indefinitely on tool calls, the
- * runtime never emits `done`, the gateway never settles the x402 payment, and
- * the Cloud Run hits its 5-minute timeout. SOTA bound = 6 tool batches/turn.
- */
-const MAX_TOOL_BATCHES_PER_TURN = 6;
 
-type ToolCallSnapshot = {
-    id: string;
-    name: string;
-    args?: unknown;
-};
+/**
+ * Per-turn budget gate.
+ *
+ * The previous design used a single hard cap (`MAX_TOOL_BATCHES_PER_TURN = 6`)
+ * which was the load-bearing terminator and the SOTA bottleneck — Manus
+ * averages ~50 tool calls per task, Codex runs hundreds. We've moved to a
+ * three-axis budget that lets long-horizon tasks complete while keeping
+ * runaway loops bounded:
+ *
+ *   1. WALL TIME ─ wall-clock cap from `configurable.startTime`. Default
+ *      4 min so Cloud Run's 5-min window always settles. Override via
+ *      `COMPOSE_AGENT_MAX_WALL_MS_PER_TURN`.
+ *   2. CONSECUTIVE FAILURES ─ if the last N tool batches all errored, we
+ *      stop. Distinct from `repairAttemptsExhausted`, which is repair-marker
+ *      driven. Default 4. Override via
+ *      `COMPOSE_AGENT_MAX_TOOL_FAILURES_IN_ROW`.
+ *   3. SAFETY CEILING ─ a Manus-grade hard cap on total tool batches per
+ *      turn (default 50). Override via
+ *      `COMPOSE_AGENT_MAX_TOOL_BATCHES_PER_TURN`. Lower this for cost-
+ *      sensitive deployments.
+ *
+ * Token budgets are NOT enforced here. `api/inference/metering.ts` +
+ * x402 envelopes already cap spend per call; duplicating in the graph
+ * would race the facilitator. Tokens-per-turn lives at the payment
+ * boundary, batches at the loop boundary. Clean separation.
+ */
+const DEFAULT_MAX_WALL_MS_PER_TURN = 4 * 60_000;
+const DEFAULT_MAX_TOOL_FAILURES_IN_ROW = 4;
+const DEFAULT_MAX_TOOL_BATCHES_PER_TURN = 50;
+
+function configuredMaxWallMs(): number {
+    const parsed = Number.parseInt(process.env.COMPOSE_AGENT_MAX_WALL_MS_PER_TURN || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_WALL_MS_PER_TURN;
+}
+
+function configuredMaxFailuresInRow(): number {
+    const parsed = Number.parseInt(process.env.COMPOSE_AGENT_MAX_TOOL_FAILURES_IN_ROW || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOOL_FAILURES_IN_ROW;
+}
+
+function configuredMaxToolBatches(): number {
+    const parsed = Number.parseInt(process.env.COMPOSE_AGENT_MAX_TOOL_BATCHES_PER_TURN || "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOOL_BATCHES_PER_TURN;
+}
+
+// ----------------------------------------------------------------------------
+// Stable tool binding (Manus / KV-cache discipline).
+//
+// We bind the FULL tool list every turn. The previous design re-scored and
+// pruned to 12 tools per iteration, which mutated the bound-tool set across
+// iterations of the same turn and invalidated the KV cache the model relies
+// on for prompt-prefix reuse. Manus, deepagents, and Claude Code all keep
+// bound tools stable; selection is constrained via system prompt + tool-name
+// prefixes (e.g. `compose_*`, `memory_*`, `a2a_*`), not via mutation.
+//
+// If an agent legitimately has too many tools, cap at agent-build time in
+// `createAgentTools` rather than per-turn here.
+// ----------------------------------------------------------------------------
+
+// ToolCallSnapshot was the previous local type; now uses the shared
+// NormalizedToolCall from tool-calls.ts. Alias kept for in-file readability.
+type ToolCallSnapshot = NormalizedToolCall;
 
 type ToolFailureSnapshot = {
     toolName: string;
@@ -82,93 +127,6 @@ function contentText(message: BaseMessage): string {
     }
 }
 
-function configuredMaxBoundTools(): number {
-    const parsed = Number.parseInt(process.env.COMPOSE_AGENT_MAX_BOUND_TOOLS || "", 10);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_BOUND_TOOLS;
-}
-
-function tokenize(value: string): Set<string> {
-    const normalized = value
-        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ");
-    const tokens = new Set<string>();
-    for (const raw of normalized.split(/\s+/)) {
-        if (raw.length < 2) continue;
-        tokens.add(raw);
-        if (raw.endsWith("s") && raw.length > 3) {
-            tokens.add(raw.slice(0, -1));
-        }
-    }
-    return tokens;
-}
-
-function lastHumanText(messages: BaseMessage[]): string {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messageType(messages[i]) === "human") {
-            return contentText(messages[i]);
-        }
-    }
-    return messages.map(contentText).join(" ");
-}
-
-function calledToolNames(messages: BaseMessage[]): Set<string> {
-    const names = new Set<string>();
-    for (const message of messages) {
-        for (const call of extractToolCalls(message)) {
-            names.add(call.name);
-        }
-        const toolName = (message as { name?: unknown }).name
-            ?? (message as { lc_kwargs?: { name?: unknown } }).lc_kwargs?.name;
-        if (typeof toolName === "string" && toolName.length > 0) {
-            names.add(toolName);
-        }
-    }
-    return names;
-}
-
-function toolSearchText(tool: DynamicStructuredTool): string {
-    return `${tool.name} ${tool.description || ""}`;
-}
-
-function selectBoundTools(tools: DynamicStructuredTool[], messages: BaseMessage[]): DynamicStructuredTool[] {
-    const maxTools = configuredMaxBoundTools();
-    if (tools.length <= maxTools) {
-        return tools;
-    }
-
-    const queryTokens = tokenize(lastHumanText(messages));
-    const priorToolNames = calledToolNames(messages);
-    const scored = tools.map((tool, index) => {
-        if (priorToolNames.has(tool.name)) {
-            return { tool, index, score: Number.MAX_SAFE_INTEGER };
-        }
-
-        const nameTokens = tokenize(tool.name);
-        const searchTokens = tokenize(toolSearchText(tool));
-        let score = 0;
-        for (const token of queryTokens) {
-            if (nameTokens.has(token)) score += 6;
-            if (searchTokens.has(token)) score += 1;
-        }
-        return { tool, index, score };
-    });
-
-    const relevant = scored
-        .filter((item) => item.score > 0)
-        .sort((a, b) => b.score - a.score || a.index - b.index)
-        .slice(0, maxTools)
-        .map((item) => item.tool);
-
-    if (relevant.length > 0) {
-        return relevant;
-    }
-    if (process.env.COMPOSE_AGENT_BIND_ALL_TOOLS_ON_NO_MATCH === "true") {
-        return tools;
-    }
-    return tools.slice(0, maxTools);
-}
-
 function normalizeForSignature(value: unknown): string {
     if (typeof value === "string") {
         return value.replace(/\s+/g, " ").trim().slice(0, 600);
@@ -180,72 +138,9 @@ function normalizeForSignature(value: unknown): string {
     }
 }
 
-function parseToolArgs(value: unknown): unknown {
-    if (typeof value !== "string") {
-        return value;
-    }
-    try {
-        return JSON.parse(value);
-    } catch {
-        return value;
-    }
-}
-
-function toolCallDedupeKey(call: ToolCallSnapshot): string {
-    if (call.id) {
-        return `id:${call.id}`;
-    }
-    return `sig:${call.name}:${normalizeForSignature(call.args)}`;
-}
-
 function extractToolCalls(message: BaseMessage): ToolCallSnapshot[] {
-    const candidate = message as {
-        tool_calls?: Array<{ id?: unknown; name?: unknown; args?: unknown }>;
-        additional_kwargs?: { tool_calls?: Array<{ id?: unknown; function?: { name?: unknown; arguments?: unknown } }> };
-        lc_kwargs?: {
-            tool_calls?: Array<{ id?: unknown; name?: unknown; args?: unknown }>;
-            additional_kwargs?: { tool_calls?: Array<{ id?: unknown; function?: { name?: unknown; arguments?: unknown } }> };
-        };
-    };
-    const direct = Array.isArray(candidate.tool_calls) ? candidate.tool_calls : [];
-    const lcDirect = Array.isArray(candidate.lc_kwargs?.tool_calls) ? candidate.lc_kwargs?.tool_calls ?? [] : [];
-    const additional = Array.isArray(candidate.additional_kwargs?.tool_calls)
-        ? candidate.additional_kwargs?.tool_calls ?? []
-        : Array.isArray(candidate.lc_kwargs?.additional_kwargs?.tool_calls)
-            ? candidate.lc_kwargs?.additional_kwargs?.tool_calls ?? []
-            : [];
-
-    const calls: ToolCallSnapshot[] = [];
-    const seen = new Set<string>();
-    const push = (call: ToolCallSnapshot) => {
-        const key = toolCallDedupeKey(call);
-        if (seen.has(key)) return;
-        seen.add(key);
-        calls.push(call);
-    };
-
-    for (const call of [...direct, ...lcDirect]) {
-        if (typeof call.name !== "string") {
-            continue;
-        }
-        push({
-            id: typeof call.id === "string" ? call.id : `${call.name}:${calls.length}`,
-            name: call.name,
-            args: call.args,
-        });
-    }
-    for (const call of additional) {
-        const name = call.function?.name;
-        if (typeof name !== "string") {
-            continue;
-        }
-        push({
-            id: typeof call.id === "string" ? call.id : `${name}:${calls.length}`,
-            name,
-            args: parseToolArgs(call.function?.arguments),
-        });
-    }
-    return calls;
+    // Single source of truth for tool-call extraction.
+    return readToolCallsFromRecord(message);
 }
 
 function toolCallId(message: BaseMessage): string | undefined {
@@ -355,10 +250,7 @@ function repairAttemptsExhausted(messages: BaseMessage[]): boolean {
 
 /**
  * Count how many tool batches the model has issued in the current user turn.
- * A "batch" is one assistant message that emitted >= 1 tool_call. Used to
- * enforce MAX_TOOL_BATCHES_PER_TURN — once exhausted the agent loop terminates
- * with a final-answer turn (no tools bound), which guarantees a `done` event
- * and therefore on-chain settlement.
+ * A "batch" is one assistant message that emitted >= 1 tool_call.
  */
 function toolBatchCount(messages: BaseMessage[]): number {
     let count = 0;
@@ -369,8 +261,71 @@ function toolBatchCount(messages: BaseMessage[]): number {
     return count;
 }
 
-function toolBudgetExhausted(messages: BaseMessage[]): boolean {
-    return toolBatchCount(messages) >= MAX_TOOL_BATCHES_PER_TURN;
+/**
+ * Count consecutive failed tool batches at the tail of the current turn.
+ * A "failed batch" is one whose tool messages contain at least one error.
+ * Counting stops at the first successful batch (or non-tool message).
+ */
+function consecutiveFailedBatches(messages: BaseMessage[]): number {
+    const turn = currentTurnMessages(messages);
+    let count = 0;
+    let i = turn.length - 1;
+    while (i >= 0) {
+        // Skip trailing AI messages without tool calls (model recovered).
+        while (i >= 0 && messageType(turn[i]) !== "tool") i -= 1;
+        if (i < 0) break;
+        // Walk back through this batch's tool messages.
+        let batchHasError = false;
+        let batchStart = i;
+        while (batchStart >= 0 && messageType(turn[batchStart]) === "tool") {
+            if (isToolError(turn[batchStart])) batchHasError = true;
+            batchStart -= 1;
+        }
+        if (batchHasError) {
+            count += 1;
+            i = batchStart;
+        } else {
+            // Found a successful batch — streak broken.
+            break;
+        }
+    }
+    return count;
+}
+
+type BudgetExhaustion = { kind: "wall"; elapsedMs: number; capMs: number }
+    | { kind: "failures"; count: number; cap: number }
+    | { kind: "batches"; count: number; cap: number };
+
+function checkTurnBudget(messages: BaseMessage[], startTime: number | undefined): BudgetExhaustion | null {
+    const wallCap = configuredMaxWallMs();
+    if (typeof startTime === "number" && Number.isFinite(startTime)) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= wallCap) {
+            return { kind: "wall", elapsedMs: elapsed, capMs: wallCap };
+        }
+    }
+    const failuresCap = configuredMaxFailuresInRow();
+    const failures = consecutiveFailedBatches(messages);
+    if (failures >= failuresCap) {
+        return { kind: "failures", count: failures, cap: failuresCap };
+    }
+    const batchesCap = configuredMaxToolBatches();
+    const batches = toolBatchCount(messages);
+    if (batches >= batchesCap) {
+        return { kind: "batches", count: batches, cap: batchesCap };
+    }
+    return null;
+}
+
+function describeBudgetExhaustion(b: BudgetExhaustion): string {
+    switch (b.kind) {
+        case "wall":
+            return `Wall-time budget exhausted (${(b.elapsedMs / 1000).toFixed(1)}s of ${(b.capMs / 1000).toFixed(0)}s). Stop calling tools.`;
+        case "failures":
+            return `Consecutive tool failures (${b.count} of ${b.cap}). Stop calling tools and explain the blocker.`;
+        case "batches":
+            return `Tool-batch ceiling reached (${b.count} of ${b.cap}). Stop calling tools.`;
+    }
 }
 
 function shouldInjectToolRepair(state: typeof MessagesAnnotation.State): boolean {
@@ -438,11 +393,13 @@ export function createAgentGraph(
         // on tool calls, the runtime never emits `done`, the API gateway never settles,
         // and on-chain x402 payment never lands.
         //
-        // Three ramps, all SOTA:
+        // Two ramps:
         //   1. Repair attempts exhausted (same arg-shape failure 3x in a row).
-        //   2. Tool-batch budget exhausted (>= MAX_TOOL_BATCHES_PER_TURN successful
-        //      batches in this user turn) — Codex/Manus/Claude Code style.
+        //   2. Per-turn budget exhausted (wall time / consecutive failures /
+        //      Manus-grade hard ceiling on total tool batches). See
+        //      `checkTurnBudget` for the three axes.
         let boundTools: DynamicStructuredTool[];
+        const turnStartTime = (config?.configurable as { startTime?: number } | undefined)?.startTime;
         if (repairAttemptsExhausted(messages)) {
             boundTools = [];
             messages = [
@@ -453,18 +410,23 @@ export function createAgentGraph(
                     "Write a single, honest final answer that names the exact tool blocker and what input was missing.",
                 ].join("\n")),
             ];
-        } else if (toolBudgetExhausted(messages)) {
-            boundTools = [];
-            messages = [
-                ...messages,
-                new SystemMessage([
-                    "[compose:tool-budget-exhausted]",
-                    `Tool budget exhausted (${MAX_TOOL_BATCHES_PER_TURN} batches used in this turn). Stop calling tools.`,
-                    "Write a single, concise final answer summarising what you have so far for the user.",
-                ].join("\n")),
-            ];
         } else {
-            boundTools = selectBoundTools(tools, messages);
+            const exhausted = checkTurnBudget(messages, turnStartTime);
+            if (exhausted) {
+                boundTools = [];
+                messages = [
+                    ...messages,
+                    new SystemMessage([
+                        "[compose:tool-budget-exhausted]",
+                        describeBudgetExhaustion(exhausted),
+                        "Write a single, concise final answer summarising what you have so far for the user.",
+                    ].join("\n")),
+                ];
+            } else {
+                // Stable bind: full tool list, never re-scored or pruned.
+                // KV cache stays warm across iterations of the same turn.
+                boundTools = tools;
+            }
         }
         const modelWithTools = model.bindTools(boundTools);
         const response = await modelWithTools.invoke(messages.map(normalizeToolMessage), config);

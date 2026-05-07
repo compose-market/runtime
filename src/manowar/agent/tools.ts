@@ -10,7 +10,7 @@ import type { AgentWallet } from "../../agent-wallet.js";
 import { getAgentExecutionContext } from "./context.js";
 import { resolveMemoryScope } from "./memory-scope.js";
 import { searchKnowledge } from "../knowledge/index.js";
-import { DEFAULT_AGENT_MEMORY_LAYERS, persistExplicitAgentMemory, retrieveAgentMemory } from "./memory.js";
+import { persistExplicitAgentMemory } from "./memory.js";
 import { searchMemoryLayers } from "../memory/index.js";
 import { shouldEnforceCloudPermissions } from "../mode.js";
 import { executeGoatTool, getPlugin } from "../../connectors/index.js";
@@ -812,6 +812,7 @@ export async function createAgentTools(
     }
 
     if (!pluginIds || pluginIds.length === 0) {
+        appendHarnessTools(tools, usedToolNames, agentWallet?.address, userAddress);
         return tools;
     }
 
@@ -945,8 +946,45 @@ export async function createAgentTools(
         }
     }
 
+    appendHarnessTools(tools, usedToolNames, agentWallet?.address, userAddress);
     console.log(`[createAgentTools] Created ${tools.length} tools from ${pluginIds.length} plugins`);
     return tools;
+}
+
+/**
+ * Append harness tools (task / delegate / compose_plan / search_* /
+ * scratchpad_* / synthesize) to the agent's tool list. The harness needs
+ * an opaque agent identity for scratchpad scoping; if the caller didn't
+ * provide one (raw-model agents) we synthesize a stable per-process label.
+ */
+function appendHarnessTools(
+    tools: DynamicStructuredTool[],
+    usedToolNames: Set<string>,
+    agentWallet: string | undefined,
+    userAddress: string | undefined,
+): void {
+    const identity = agentWallet && agentWallet.length > 0
+        ? agentWallet
+        : `agent:anonymous:${process.pid}`;
+    // Capability tools first so the cal harness can reference them by name
+    // through bind.composeTools without callers needing to know they exist.
+    for (const tool of createCapabilityTools()) {
+        if (usedToolNames.has(tool.name)) continue;
+        tools.push(tool);
+        usedToolNames.add(tool.name);
+    }
+    const resolveTools = defaultBindResolver(tools);
+    const harness = createHarnessTools({
+        agentWallet: identity,
+        userAddress,
+        resolveTools,
+        directTools: () => new Map(tools.map((t) => [t.name, t] as const)),
+    });
+    for (const tool of harness) {
+        if (usedToolNames.has(tool.name)) continue;
+        tools.push(tool);
+        usedToolNames.add(tool.name);
+    }
 }
 
 async function fetchBackpackConnections(userAddress: string): Promise<BackpackConnectedAccount[]> {
@@ -1130,12 +1168,16 @@ function createBackpackTools(input: {
 // =============================================================================
 
 /**
- * Compose memory tools — minimal 0-fuck-ups surface.
+ * Compose memory tools — minimal surface (Phase 1.5).
  *
- * Two tools, one each for recall and remember. The cross-layer ranker behind
- * `memory_recall` automatically considers all 6 layers (working, scene,
- * graph, patterns, archives, vectors) and shortlists the top items into a
- * <900-char prompt block. Agents do NOT pick layers; the framework does.
+ * Recall is server-side and automatic per the `memory.arazzo.yaml` contract:
+ * the cross-layer ranker considers all 6 layers (working, scene, graph,
+ * patterns, archives, vectors) and pre-injects up to 6 items / 900 chars
+ * into the system prompt before each turn. Agents do NOT pick layers and
+ * do NOT call a recall tool — that would duplicate the ranker.
+ *
+ * Only `memory_remember` is exposed: explicit user-stated facts that the
+ * auto-extractor (gemini-3.1-flash-lite-preview) sometimes misses.
  */
 export function createMemoryTools(agentWallet: string, userAddress?: string, workflowWallet?: string): DynamicStructuredTool[] {
     function resolveToolText(value: string | undefined, field: "content" | "query"): string {
@@ -1152,32 +1194,13 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
         throw new Error(`memory tool requires ${field} (or a non-empty user message in scope)`);
     }
 
-    const memoryRecall = new DynamicStructuredTool({
-        name: "memory_recall",
-        description: "Recall what you remember about the user. Searches all 6 memory layers (working, scene, graph, patterns, archives, vectors) in parallel and returns the top-ranked durable facts and recent context. Use this whenever the user asks 'what do you remember', 'do you know', 'who am I', or anything that benefits from prior conversational context.",
-        schema: z.object({
-            query: z.string().optional().describe("What you want to recall. Free-form natural language; the framework handles ranking across layers."),
-        }),
-        func: async ({ query }: { query?: string }) => {
-            try {
-                const effectiveQuery = resolveToolText(query, "query");
-                const scope = resolveMemoryScope({
-                    agentWallet,
-                    userAddress,
-                    workflowWallet,
-                    context: getAgentExecutionContext(),
-                });
-                const { summary } = await retrieveAgentMemory({
-                    query: effectiveQuery,
-                    scope,
-                    limit: 8,
-                });
-                return summary || "No relevant memories found.";
-            } catch (error) {
-                return `Runtime memory unavailable: ${error instanceof Error ? error.message : String(error)}`;
-            }
-        },
-    });
+    // Note: a `memory_recall` tool was deliberately removed (Phase 1.5).
+    // The memory.arazzo.yaml contract states "ranker picks for you" — every
+    // agent turn pre-injects up to 6 ranked items / 900 chars via
+    // retrieveAgentMemory + buildPromptContext. Letting the model
+    // second-guess the ranker mid-turn duplicates work and contradicts
+    // the contract. `memory_remember` stays because explicit user-stated
+    // facts (auto-extractor misses ~5%) are an orthogonal need.
 
     const memoryRemember = new DynamicStructuredTool({
         name: "memory_remember",
@@ -1204,5 +1227,911 @@ export function createMemoryTools(agentWallet: string, userAddress?: string, wor
         },
     });
 
-    return [memoryRecall, memoryRemember];
+    return [memoryRemember];
+}
+
+// =============================================================================
+// Harness Tools — task / delegate / compose_plan / search_* / scratchpad_* / synthesize
+// =============================================================================
+
+/**
+ * Cal harness tool surface, exposed to every agent by default. Wired
+ * through createAgentTools so the entire harness (sub-agents, parallel
+ * fan-out, deterministic step interpreter, vector discovery) is available
+ * via standard LangChain function-calling.
+ *
+ * Resolver wiring:
+ *  - resolveTools: returns the LangChain tool subset for a sub-agent given
+ *    a BindSpec. Default implementation here filters the parent's already
+ *    loaded tools by name; hosts can swap in semantic-bind logic.
+ *
+ * Model resolution is automatic: every `task`/`delegate` step targets a
+ * registered on-chain agent (Phase 3.1 enforcement), and the interpreter
+ * looks up that agent's card model directly. No host hook needed. Raw
+ * model calls live in the `model_tool` plugin (Phase 4.7), where models
+ * are TOOLS within an agent's turn — not swarm participants.
+ *
+ * Pricing/cost is NOT touched here. Tools emit usage in their JSON results;
+ * the api layer aggregates / settles separately.
+ */
+export interface HarnessToolWiring {
+    /** Parent run id used for scratchpad scoping + sub-agent runKey chain. */
+    composeRunId?: string;
+    /** Parent agent identity. */
+    agentWallet: string;
+    /** End-user identity propagated into sub-agents. */
+    userAddress?: string;
+    /**
+     * Returns the LangChain tool list to bind to a sub-agent given the
+     * BindSpec. Typical implementation: filter already-loaded parent tools
+     * by name. Hosts can plug in semantic-bind retrieval here.
+     */
+    resolveTools: (bind: HarnessBindSpec | undefined) => Promise<DynamicStructuredTool[]>;
+    /**
+     * Direct-tool registry used by `op: tool` cal steps. Defaults to the
+     * full parent tool list; pass an explicit Map for tighter sandboxing.
+     */
+    directTools?: () => Map<string, DynamicStructuredTool>;
+}
+
+// Re-import from the harness module — kept inside the file body so the
+// existing imports section above remains untouched.
+import {
+    parseCalPlan as harnessParseCalPlan,
+    runCalPlan as harnessRunCalPlan,
+    runSubAgent as harnessRunSubAgent,
+    runIsolatedSubAgent as harnessRunIsolatedSubAgent,
+    searchAgents as harnessSearchAgents,
+    searchModels as harnessSearchModels,
+    searchTools as harnessSearchTools,
+    createScratchpad as harnessCreateScratchpad,
+    createConclaveBus as harnessCreateConclaveBus,
+    type BindSpec as HarnessBindSpec,
+    type CalPlan as HarnessCalPlan,
+    type InterpreterContext as HarnessInterpreterContext,
+    type SubAgentSpec as HarnessSubAgentSpec,
+} from "../harness/index.js";
+import { createModel as createHarnessModel } from "../framework.js";
+import { peekAgentIdentity as harnessPeekAgentIdentity, resolveAgentIdentity as harnessResolveAgentIdentity } from "./identity.js";
+import { HumanMessage as HarnessHumanMessage, SystemMessage as HarnessSystemMessage } from "@langchain/core/messages";
+
+/**
+ * Resolve a registered agent's card model, sync-cache first then IPFS.
+ * Mirrors `harness/interpreter.ts:resolveStepModel` for the parallel
+ * tool-surface path. Returns undefined when the wallet isn't registered
+ * or the card has no model.
+ */
+async function resolveAgentCardModel(agentWallet: string | undefined): Promise<string | undefined> {
+    if (!agentWallet || agentWallet.length === 0) return undefined;
+    const cached = harnessPeekAgentIdentity(agentWallet);
+    if (cached?.model && cached.model.length > 0) return cached.model;
+    try {
+        const identity = await harnessResolveAgentIdentity(agentWallet);
+        if (identity.model && identity.model.length > 0) return identity.model;
+    } catch {
+        // Fall through to undefined.
+    }
+    return undefined;
+}
+
+const HARNESS_BUDGET_SCHEMA = z
+    .object({
+        maxToolBatches: z.number().int().positive().optional(),
+        maxTokens: z.number().int().positive().optional(),
+        maxWallMs: z.number().int().positive().optional(),
+        maxDepth: z.number().int().positive().optional(),
+    })
+    .optional();
+
+const HARNESS_BIND_SCHEMA = z
+    .object({
+        composeTools: z.array(z.string()).optional(),
+        agentTools: z.array(z.string()).optional(),
+        memory: z.boolean().optional(),
+        knowledge: z.boolean().optional(),
+        semanticBind: z
+            .object({
+                query: z.string().min(1),
+                topK: z.number().int().positive().optional(),
+            })
+            .optional(),
+    })
+    .optional();
+
+function harnessRunId(wiring: HarnessToolWiring): string {
+    return wiring.composeRunId
+        ?? getAgentExecutionContext()?.composeRunId
+        ?? `cal:${Date.now().toString(36)}`;
+}
+
+function harnessInterpreterCtx(wiring: HarnessToolWiring): HarnessInterpreterContext {
+    const composeRunId = harnessRunId(wiring);
+    return {
+        agentWallet: wiring.agentWallet,
+        composeRunId,
+        // Inherit the layer-0 root from the parent execution context when
+        // present (we're running inside a depth-N sub-agent's tool call);
+        // fall back to our own composeRunId when we ARE the layer-0
+        // coordinator. Either way, every layer of the same swarm gets
+        // the SAME rootComposeRunId, which keys `compose_conclave_*`.
+        rootComposeRunId: getAgentExecutionContext()?.rootComposeRunId ?? composeRunId,
+        userAddress: wiring.userAddress ?? getAgentExecutionContext()?.userAddress,
+        resolveTools: async ({ bind }) => wiring.resolveTools(bind),
+        parentExecutionContext: getAgentExecutionContext(),
+        directTools: wiring.directTools?.(),
+    };
+}
+
+/**
+ * Default `resolveTools` implementation: filter parent's pre-loaded tool
+ * list by name. Memory + knowledge tools are added by the engine based on
+ * bind.memory / bind.knowledge, so we only handle compose/agent tool name
+ * filtering here.
+ */
+export function defaultBindResolver(parentTools: DynamicStructuredTool[]): (bind: HarnessBindSpec | undefined) => Promise<DynamicStructuredTool[]> {
+    const byName = new Map(parentTools.map((t) => [t.name, t] as const));
+    return async (bind) => {
+        if (!bind) return [];
+        const wanted = new Set<string>();
+        for (const name of bind.composeTools ?? []) wanted.add(name);
+        for (const name of bind.agentTools ?? []) wanted.add(name);
+        const out: DynamicStructuredTool[] = [];
+        for (const name of wanted) {
+            const tool = byName.get(name);
+            if (tool) out.push(tool);
+        }
+        return out;
+    };
+}
+
+/**
+ * Build the harness tool surface. Append to whatever the rest of
+ * createAgentTools already produced.
+ */
+export function createHarnessTools(wiring: HarnessToolWiring): DynamicStructuredTool[] {
+    const composePlanTool = new DynamicStructuredTool({
+        name: "compose_plan",
+        description:
+            "Execute a typed Compose Agent Loop (cal) plan written in YAML. " +
+            "Use this whenever you need multiple steps, parallel sub-agents, " +
+            "or deterministic tool dispatch. The plan is parsed and executed " +
+            "by the runtime — you never re-read prompts about how to use it. " +
+            "Steps: task | delegate | fanout | tool | search_tools | " +
+            "search_agents | search_models | if | loop | scratch | " +
+            "synthesize | stop | ask_user. Save outputs with saveAs and " +
+            "reference them via {{stepId}} mustache syntax.",
+        schema: z.object({
+            yaml: z.string().min(1).describe("The cal plan as YAML text. Must contain a top-level `steps:` array."),
+        }),
+        func: async ({ yaml }: { yaml: string }) => {
+            let plan: HarnessCalPlan;
+            try {
+                plan = harnessParseCalPlan(yaml);
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
+            const result = await harnessRunCalPlan(plan, harnessInterpreterCtx(wiring));
+            return formatToolResultForAgent({
+                success: result.success,
+                output: result.output,
+                stopReason: result.stopReason,
+                error: result.error,
+                steps: result.steps.map((s) => ({
+                    op: s.op,
+                    saveAs: s.saveAs,
+                    success: s.success,
+                    error: s.error,
+                })),
+                aggregate: result.aggregateUsage,
+                planId: result.planId,
+            });
+        },
+    });
+
+    const taskTool = new DynamicStructuredTool({
+        name: "task",
+        description:
+            "Spawn a focused sub-agent for a single bounded task. The sub-agent " +
+            "runs with its own scoped tool subset, fresh memory scope, and a " +
+            "tool/wall budget — its chain-of-thought never pollutes your own. " +
+            "Use this for deep research, side investigations, or anything you " +
+            "want to keep out of your main context. Returns a distilled answer.",
+        schema: z.object({
+            prompt: z.string().min(1).describe("What the sub-agent should accomplish."),
+            model: z.string().optional().describe("Specific model id. Falls back to the target agent's card model."),
+            agentWallet: z.string().optional().describe("Optional opaque target identity (typically a registered agent wallet)."),
+            bind: HARNESS_BIND_SCHEMA,
+            budget: HARNESS_BUDGET_SCHEMA,
+            isolated: z.boolean().optional().describe("Run inside a Daytona sandbox."),
+            systemPrompt: z.string().optional(),
+        }),
+        func: async (input) => {
+            const ctx = harnessInterpreterCtx(wiring);
+            const model = input.model ?? (await resolveAgentCardModel(input.agentWallet));
+            if (!model) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: "task requires `model` (or the target agentWallet's card must declare one)",
+                });
+            }
+            const subId = `task_${Date.now().toString(36)}`;
+            const spec: HarnessSubAgentSpec = {
+                parentRunId: ctx.composeRunId,
+                subId,
+                depth: 1,
+                agentWallet: input.agentWallet,
+                userAddress: ctx.userAddress,
+                model,
+                systemPrompt: input.systemPrompt,
+                prompt: input.prompt,
+                bind: input.bind,
+                budget: input.budget,
+                isolated: input.isolated === true,
+            };
+            const result = spec.isolated
+                ? await harnessRunIsolatedSubAgent(spec, {
+                    resolveTools: async ({ bind }) => wiring.resolveTools(bind),
+                    parentExecutionContext: getAgentExecutionContext(),
+                })
+                : await harnessRunSubAgent(spec, {
+                    resolveTools: async ({ bind }) => wiring.resolveTools(bind),
+                    parentExecutionContext: getAgentExecutionContext(),
+                });
+            return formatToolResultForAgent({
+                success: result.success,
+                output: result.output,
+                stopReason: result.stopReason,
+                error: result.error,
+                usage: result.usage,
+                toolBatches: result.toolBatches,
+                wallMs: result.wallMs,
+                runKey: result.runKey,
+            });
+        },
+    });
+
+    const delegateTool = new DynamicStructuredTool({
+        name: "delegate",
+        description:
+            "Delegate a request to another registered agent identified by " +
+            "wallet (or any opaque identity the host understands). The " +
+            "receiving agent runs with its own tools, memory, and reputation.",
+        schema: z.object({
+            agentWallet: z.string().min(1).describe("Opaque target identity (typically a registered agent wallet)."),
+            prompt: z.string().min(1),
+            model: z.string().optional(),
+            budget: HARNESS_BUDGET_SCHEMA,
+        }),
+        func: async (input) => {
+            const ctx = harnessInterpreterCtx(wiring);
+            const model = input.model ?? (await resolveAgentCardModel(input.agentWallet));
+            if (!model) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: "delegate requires `model` (or the target agentWallet's card must declare one)",
+                });
+            }
+            const subId = `delegate_${Date.now().toString(36)}`;
+            const spec: HarnessSubAgentSpec = {
+                parentRunId: ctx.composeRunId,
+                subId,
+                depth: 1,
+                agentWallet: input.agentWallet,
+                userAddress: ctx.userAddress,
+                model,
+                prompt: input.prompt,
+                budget: input.budget,
+            };
+            const result = await harnessRunSubAgent(spec, {
+                resolveTools: async ({ bind }) => wiring.resolveTools(bind),
+                parentExecutionContext: getAgentExecutionContext(),
+            });
+            return formatToolResultForAgent({
+                success: result.success,
+                output: result.output,
+                stopReason: result.stopReason,
+                error: result.error,
+                usage: result.usage,
+                toolBatches: result.toolBatches,
+                wallMs: result.wallMs,
+                runKey: result.runKey,
+            });
+        },
+    });
+
+    const searchToolsTool = new DynamicStructuredTool({
+        name: "search_tools",
+        description:
+            "Semantic search over the connectors MCP catalog. Returns top-K " +
+            "candidates ranked by Voyage embeddings + rerank. Use this BEFORE " +
+            "calling task/delegate when you need a tool you don't already " +
+            "have bound — it costs no LLM tokens.",
+        schema: z.object({
+            query: z.string().min(1),
+            topK: z.number().int().min(1).max(50).optional(),
+        }),
+        func: async ({ query, topK }) => {
+            const hits = await harnessSearchTools(query, topK);
+            return formatToolResultForAgent(hits);
+        },
+    });
+
+    const searchAgentsTool = new DynamicStructuredTool({
+        name: "search_agents",
+        description:
+            "Semantic search over the Compose agent marketplace. Returns " +
+            "wallet addresses + skills + plugins for top-K specialist agents " +
+            "matching the query. Pair with `delegate` to dispatch work.",
+        schema: z.object({
+            query: z.string().min(1),
+            topK: z.number().int().min(1).max(50).optional(),
+        }),
+        func: async ({ query, topK }) => {
+            const hits = await harnessSearchAgents(query, topK);
+            return formatToolResultForAgent(hits);
+        },
+    });
+
+    const searchModelsTool = new DynamicStructuredTool({
+        name: "search_models",
+        description:
+            "Semantic search over Compose's model catalog (vectorized " +
+            "models.json). Use to pick a coordinator/specialist model. " +
+            "Optional capability filter (reasoning, vision, tools, agentic, " +
+            "computer-use, ...).",
+        schema: z.object({
+            query: z.string().min(1),
+            topK: z.number().int().min(1).max(50).optional(),
+            capability: z.string().optional(),
+        }),
+        func: async ({ query, topK, capability }) => {
+            const hits = await harnessSearchModels(query, { topK, capability });
+            return formatToolResultForAgent(hits);
+        },
+    });
+
+    const synthesizeTool = new DynamicStructuredTool({
+        name: "synthesize",
+        description:
+            "Combine multiple text artifacts into a single coherent answer " +
+            "using a chosen model. Useful after a fanout to merge branch " +
+            "outputs without re-prompting yourself with the raw text.",
+        schema: z.object({
+            instruction: z.string().min(1),
+            artifacts: z.array(z.object({ label: z.string(), text: z.string() })).min(1),
+            model: z.string().optional(),
+        }),
+        func: async ({ instruction, artifacts, model }) => {
+            const ctx = harnessInterpreterCtx(wiring);
+            // No agentWallet on synthesize — it's a coordinator-side LLM
+            // glue call. Phase 3.4 will default to a dynamic coordinator
+            // from harness/coordinators.listAgenticCoordinators. Today,
+            // an explicit `model` is required.
+            const modelId = model;
+            if (!modelId) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: "synthesize requires `model` (no fallback configured)",
+                });
+            }
+            const inputs = artifacts.map((a) => `### ${a.label}\n${a.text}`).join("\n\n");
+            const llm = createHarnessModel(modelId, 0.2);
+            const response = await llm.invoke([
+                new HarnessSystemMessage(
+                    "You are a synthesizer. Combine the input artifacts into a single coherent answer. Do not invent facts; only use what's provided.",
+                ),
+                new HarnessHumanMessage(`# INSTRUCTION\n${instruction}\n\n# INPUTS\n${inputs}`),
+            ]);
+            return typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+        },
+    });
+
+    const scratchpadWrite = new DynamicStructuredTool({
+        name: "scratchpad_write",
+        description:
+            "Persist a value to the per-run scratchpad under `key`. Keyed by " +
+            "(agentWallet, composeRunId), TTL 1h. Use for cross-step notes " +
+            "without polluting your prompt context.",
+        schema: z.object({
+            key: z.string().min(1),
+            value: z.union([z.string(), z.number(), z.boolean(), z.record(z.string(), z.any()), z.array(z.any())]),
+        }),
+        func: async ({ key, value }) => {
+            const pad = harnessCreateScratchpad({
+                agentWallet: wiring.agentWallet,
+                composeRunId: harnessRunId(wiring),
+            });
+            await pad.write(key, value);
+            return formatToolResultForAgent({ ok: true, key });
+        },
+    });
+
+    const scratchpadRead = new DynamicStructuredTool({
+        name: "scratchpad_read",
+        description: "Read a previously-written scratchpad value by key.",
+        schema: z.object({ key: z.string().min(1) }),
+        func: async ({ key }) => {
+            const pad = harnessCreateScratchpad({
+                agentWallet: wiring.agentWallet,
+                composeRunId: harnessRunId(wiring),
+            });
+            const value = await pad.read(key);
+            return formatToolResultForAgent({ key, value });
+        },
+    });
+
+    const scratchpadList = new DynamicStructuredTool({
+        name: "scratchpad_list",
+        description: "List the keys currently stored in the per-run scratchpad.",
+        schema: z.object({}),
+        func: async () => {
+            const pad = harnessCreateScratchpad({
+                agentWallet: wiring.agentWallet,
+                composeRunId: harnessRunId(wiring),
+            });
+            const keys = await pad.list();
+            return formatToolResultForAgent({ keys });
+        },
+    });
+
+    // ── Conclave bus ── (Phase 3.2)
+    //
+    // SHARED state across every layer of the swarm. Whereas
+    // `scratchpad_*` is private to ONE agent's run, `compose_conclave_*`
+    // is the operational hand-off bus that the layer-0 coordinator and
+    // every depth-N child read and write together. Use for:
+    //   - todo / plan markdowns (Manus-style recitation)
+    //   - intermediate artifacts a downstream specialist needs
+    //   - status flags ("phase=editing", "phase=review")
+    //   - hot-persisted swarm state for crash resume
+    //
+    // Authorship is automatic: every write carries `writtenBy` (the
+    // agentWallet of the writer) so the coordinator can audit which
+    // specialist contributed which artifact. Version counter monotonic
+    // across writes for cheap change detection.
+
+    const conclaveFor = () => {
+        const ctx = getAgentExecutionContext();
+        // Layer-0 case: ctx.rootComposeRunId is undefined, fall back to
+        // the current composeRunId. Layer-1+ inherits a real root.
+        const rootComposeRunId = ctx?.rootComposeRunId ?? ctx?.composeRunId ?? harnessRunId(wiring);
+        return harnessCreateConclaveBus({
+            rootComposeRunId,
+            writtenBy: wiring.agentWallet,
+        });
+    };
+
+    const conclaveWrite = new DynamicStructuredTool({
+        name: "compose_conclave_write",
+        description:
+            "Write a value to the SHARED swarm conclave under `key`. " +
+            "Visible to every agent in the same swarm (coordinator + every " +
+            "depth-N specialist). Use for hand-off artifacts, plan / todo " +
+            "markdowns, and coordination state. Authorship is recorded " +
+            "automatically. TTL 24h.",
+        schema: z.object({
+            key: z.string().min(1).describe("Conclave key. Use stable names like 'plan.md', 'phase', 'draft.html'."),
+            value: z.union([z.string(), z.number(), z.boolean(), z.record(z.string(), z.any()), z.array(z.any())]),
+        }),
+        func: async ({ key, value }) => {
+            const cv = conclaveFor();
+            const entry = await cv.write(key, value);
+            return formatToolResultForAgent({
+                ok: true,
+                key,
+                version: entry.version,
+                writtenBy: entry.writtenBy,
+                ts: entry.ts,
+            });
+        },
+    });
+
+    const conclaveRead = new DynamicStructuredTool({
+        name: "compose_conclave_read",
+        description:
+            "Read a SHARED conclave value by key. Returns the value, the " +
+            "agentWallet that wrote it, the timestamp, and the monotonic " +
+            "version. null when the key is missing or expired.",
+        schema: z.object({ key: z.string().min(1) }),
+        func: async ({ key }) => {
+            const cv = conclaveFor();
+            const entry = await cv.read(key);
+            return formatToolResultForAgent({ key, entry });
+        },
+    });
+
+    const conclaveList = new DynamicStructuredTool({
+        name: "compose_conclave_list",
+        description:
+            "List all live keys in the shared swarm conclave. Use to " +
+            "discover what artifacts the coordinator (or peer specialists) " +
+            "already wrote.",
+        schema: z.object({}),
+        func: async () => {
+            const cv = conclaveFor();
+            const keys = await cv.list();
+            return formatToolResultForAgent({ keys });
+        },
+    });
+
+    const conclaveDelete = new DynamicStructuredTool({
+        name: "compose_conclave_delete",
+        description:
+            "Delete a key from the shared swarm conclave. Use sparingly " +
+            "— other agents may be reading the key. Returns true when the " +
+            "key existed.",
+        schema: z.object({ key: z.string().min(1) }),
+        func: async ({ key }) => {
+            const cv = conclaveFor();
+            const removed = await cv.delete(key);
+            return formatToolResultForAgent({ key, removed });
+        },
+    });
+
+    return [
+        composePlanTool,
+        taskTool,
+        delegateTool,
+        searchToolsTool,
+        searchAgentsTool,
+        searchModelsTool,
+        synthesizeTool,
+        scratchpadWrite,
+        scratchpadRead,
+        scratchpadList,
+        conclaveWrite,
+        conclaveRead,
+        conclaveList,
+        conclaveDelete,
+    ];
+}
+
+// =============================================================================
+// Capability Tools — compose_search / compose_fetch_url / compose_run_code / compose_browser
+// =============================================================================
+//
+// These belong to the harness surface but live in tools.ts because every
+// agent gets them by default through createAgentTools (appendHarnessTools
+// composes them in alongside the cal toolkit).
+//
+// Provider config:
+//   - compose_search: Linkup structured search (LINKUP_API_KEY) with
+//     graceful fallback to Perplexity (PERPLEXITY_API_KEY) when Linkup is
+//     unavailable.
+//   - compose_fetch_url: plain fetch + HTML→text reduction.
+//   - compose_run_code: Daytona conclave sandbox (DAYTONA_API_KEY).
+//   - compose_browser: Daytona conclave sandbox running headless Chromium.
+//
+// All four NEVER touch pricing. Usage signals (latency, byte counts, exit
+// codes) flow back as JSON in the tool result; api/ is responsible for any
+// settlement.
+
+import {
+    createDaytonaClient as composeDaytonaClient,
+    loadDaytonaConfig as composeLoadDaytonaConfig,
+    runConclaveSandbox as composeRunConclaveSandbox,
+} from "../../mesh/sandbox.js";
+
+interface LinkupSearchResult {
+    name?: string;
+    url?: string;
+    content?: string;
+    snippet?: string;
+}
+
+async function searchViaLinkup(query: string, depth: "standard" | "deep"): Promise<{ results: LinkupSearchResult[]; provider: "linkup" }> {
+    const apiKey = process.env.LINKUP_API_KEY;
+    if (!apiKey) throw new Error("LINKUP_API_KEY missing");
+    const response = await fetch("https://api.linkup.so/v1/search", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            q: query,
+            depth,
+            outputType: "searchResults",
+        }),
+        signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Linkup ${response.status}: ${detail.slice(0, 300)}`);
+    }
+    const body = (await response.json()) as { results?: LinkupSearchResult[] };
+    return { results: Array.isArray(body.results) ? body.results : [], provider: "linkup" };
+}
+
+async function searchViaPerplexity(query: string): Promise<{ results: LinkupSearchResult[]; provider: "perplexity" }> {
+    const apiKey = process.env.PERPLEXITY_API_KEY;
+    if (!apiKey) throw new Error("PERPLEXITY_API_KEY missing");
+    const response = await fetch("https://api.perplexity.ai/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            model: "sonar",
+            messages: [{ role: "user", content: query }],
+        }),
+        signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Perplexity ${response.status}: ${detail.slice(0, 300)}`);
+    }
+    const body = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+        citations?: string[];
+    };
+    const summary = body.choices?.[0]?.message?.content ?? "";
+    const citations = Array.isArray(body.citations) ? body.citations : [];
+    return {
+        results: [
+            { name: "perplexity-summary", content: summary },
+            ...citations.map((url) => ({ url, name: url })),
+        ],
+        provider: "perplexity",
+    };
+}
+
+function htmlToText(html: string, maxChars: number): string {
+    const stripped = html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<\/(p|div|li|h[1-6]|br|tr)>/gi, "\n")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    if (stripped.length <= maxChars) return stripped;
+    return `${stripped.slice(0, maxChars)}... [truncated ${stripped.length - maxChars} chars]`;
+}
+
+/**
+ * Capability tools. Appended to every agent by appendHarnessTools.
+ */
+export function createCapabilityTools(): DynamicStructuredTool[] {
+    const composeSearch = new DynamicStructuredTool({
+        name: "compose_search",
+        description:
+            "Web search. Returns a ranked list of {name, url, content} hits. " +
+            "Uses Linkup when available, falls back to Perplexity. Use this " +
+            "to ground answers in fresh information when memory + knowledge " +
+            "tools are insufficient.",
+        schema: z.object({
+            query: z.string().min(1),
+            depth: z.enum(["standard", "deep"]).optional().describe("Linkup depth. Ignored by other providers."),
+        }),
+        func: async ({ query, depth }) => {
+            const errors: string[] = [];
+            try {
+                const out = await searchViaLinkup(query, depth ?? "standard");
+                return formatToolResultForAgent(out);
+            } catch (error) {
+                errors.push(`linkup: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            try {
+                const out = await searchViaPerplexity(query);
+                return formatToolResultForAgent(out);
+            } catch (error) {
+                errors.push(`perplexity: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            return formatToolResultForAgent({ success: false, error: errors.join("; ") });
+        },
+    });
+
+    const composeFetchUrl = new DynamicStructuredTool({
+        name: "compose_fetch_url",
+        description:
+            "Fetch a URL and return readable text. Strips HTML, scripts, and " +
+            "styles. Use after compose_search or when given a direct URL.",
+        schema: z.object({
+            url: z.string().url(),
+            maxChars: z.number().int().min(500).max(50_000).optional(),
+        }),
+        func: async ({ url, maxChars }) => {
+            try {
+                const response = await fetch(url, {
+                    method: "GET",
+                    headers: {
+                        Accept: "text/html, application/xhtml+xml, text/plain, */*",
+                        "User-Agent": "Compose-Harness/1.0",
+                    },
+                    signal: AbortSignal.timeout(15000),
+                    redirect: "follow",
+                });
+                if (!response.ok) {
+                    return formatToolResultForAgent({
+                        success: false,
+                        status: response.status,
+                        error: `HTTP ${response.status} ${response.statusText}`,
+                    });
+                }
+                const contentType = response.headers.get("content-type") ?? "";
+                const body = await response.text();
+                const cap = maxChars ?? 12_000;
+                const text = contentType.includes("html")
+                    ? htmlToText(body, cap)
+                    : body.length <= cap
+                        ? body
+                        : `${body.slice(0, cap)}... [truncated ${body.length - cap} chars]`;
+                return formatToolResultForAgent({
+                    success: true,
+                    url: response.url,
+                    contentType,
+                    bytes: body.length,
+                    text,
+                });
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
+        },
+    });
+
+    const composeRunCode = new DynamicStructuredTool({
+        name: "compose_run_code",
+        description:
+            "Execute code in a Daytona sandbox. Per-call container, fire-and-" +
+            "kill. Returns {exitCode, stdout, stderr, wallMs}. Use for " +
+            "calculations, data transforms, or anything you'd run in a shell. " +
+            "Network access is allowed by default; pass allowNetwork:false to " +
+            "block egress.",
+        schema: z.object({
+            language: z.enum(["bash", "python", "node", "typescript"]).default("bash"),
+            code: z.string().min(1),
+            timeoutMs: z.number().int().min(1000).max(15 * 60_000).optional(),
+            allowNetwork: z.boolean().optional(),
+        }),
+        func: async ({ language, code, timeoutMs, allowNetwork }) => {
+            let config;
+            try {
+                config = composeLoadDaytonaConfig();
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: `Daytona not configured: ${error instanceof Error ? error.message : String(error)}`,
+                });
+            }
+            const client = composeDaytonaClient(config);
+            const startedAt = Date.now();
+            const command = buildCodeCommand(language, code);
+            try {
+                const receipt = await composeRunConclaveSandbox(client, config, {
+                    conclaveId: `tool-run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+                    command,
+                    labels: { kind: "compose_run_code", language },
+                    networkBlockAll: allowNetwork === false,
+                    timeoutMs,
+                });
+                return formatToolResultForAgent({
+                    success: receipt.exitCode === 0,
+                    exitCode: receipt.exitCode,
+                    stdout: receipt.stdout,
+                    stderr: receipt.stderr,
+                    wallMs: receipt.finishedAt - receipt.startedAt,
+                });
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error),
+                    wallMs: Date.now() - startedAt,
+                });
+            }
+        },
+    });
+
+    const composeBrowser = new DynamicStructuredTool({
+        name: "compose_browser",
+        description:
+            "Drive a headless Chromium tab in a Daytona sandbox. Single-shot: " +
+            "navigate to a URL, optionally run a small JS evaluator, return " +
+            "page text + screenshot path. For multi-step browsing, call this " +
+            "tool repeatedly inside a `task` sub-agent so each step has its " +
+            "own short-lived sandbox.",
+        schema: z.object({
+            url: z.string().url(),
+            evaluate: z.string().optional().describe("Optional JS expression evaluated against the document. Returns the stringified result."),
+            timeoutMs: z.number().int().min(1000).max(10 * 60_000).optional(),
+            waitMs: z.number().int().min(0).max(60_000).optional().describe("Idle wait after navigation, ms."),
+        }),
+        func: async ({ url, evaluate, timeoutMs, waitMs }) => {
+            let config;
+            try {
+                config = composeLoadDaytonaConfig();
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: `Daytona not configured: ${error instanceof Error ? error.message : String(error)}`,
+                });
+            }
+            const client = composeDaytonaClient(config);
+            const startedAt = Date.now();
+            const command = buildBrowserCommand(url, evaluate, waitMs ?? 1500);
+            try {
+                const receipt = await composeRunConclaveSandbox(client, config, {
+                    conclaveId: `tool-browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+                    command,
+                    labels: { kind: "compose_browser" },
+                    networkBlockAll: false,
+                    timeoutMs,
+                });
+                return formatToolResultForAgent({
+                    success: receipt.exitCode === 0,
+                    exitCode: receipt.exitCode,
+                    stdout: receipt.stdout,
+                    stderr: receipt.stderr,
+                    wallMs: receipt.finishedAt - receipt.startedAt,
+                });
+            } catch (error) {
+                return formatToolResultForAgent({
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error),
+                    wallMs: Date.now() - startedAt,
+                });
+            }
+        },
+    });
+
+    return [composeSearch, composeFetchUrl, composeRunCode, composeBrowser];
+}
+
+function buildCodeCommand(language: "bash" | "python" | "node" | "typescript", code: string): string {
+    const here64 = Buffer.from(code, "utf8").toString("base64");
+    switch (language) {
+        case "bash":
+            return `set -euo pipefail; printf %s "${here64}" | base64 -d | bash`;
+        case "python":
+            return `set -euo pipefail; printf %s "${here64}" | base64 -d | python3 -`;
+        case "node":
+            return `set -euo pipefail; printf %s "${here64}" | base64 -d > /tmp/main.js && node /tmp/main.js`;
+        case "typescript":
+            return `set -euo pipefail; printf %s "${here64}" | base64 -d > /tmp/main.ts && npx --yes tsx /tmp/main.ts`;
+    }
+}
+
+function buildBrowserCommand(url: string, evaluate: string | undefined, waitMs: number): string {
+    // Boots a tiny headless-Chromium driver via puppeteer-core (assumed in
+    // the Daytona snapshot). When puppeteer is missing we degrade to curl so
+    // the tool still returns a useful body.
+    const script = [
+        `const url = ${JSON.stringify(url)};`,
+        `const waitMs = ${waitMs};`,
+        `const evaluate = ${evaluate ? JSON.stringify(evaluate) : "null"};`,
+        `(async () => {`,
+        `  let pup;`,
+        `  try { pup = await import("puppeteer"); } catch { try { pup = await import("puppeteer-core"); } catch { pup = null; } }`,
+        `  if (!pup) {`,
+        `    const r = await fetch(url, { redirect: "follow" });`,
+        `    process.stdout.write(JSON.stringify({ provider: "fetch", status: r.status, body: (await r.text()).slice(0, 50000) }));`,
+        `    return;`,
+        `  }`,
+        `  const browser = await pup.default.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });`,
+        `  const page = await browser.newPage();`,
+        `  await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });`,
+        `  await new Promise((r) => setTimeout(r, waitMs));`,
+        `  const text = await page.evaluate(() => document.body && document.body.innerText ? document.body.innerText : "");`,
+        `  let evalResult = null;`,
+        `  if (evaluate) { try { evalResult = await page.evaluate(evaluate); } catch (e) { evalResult = { error: String(e) }; } }`,
+        `  await browser.close();`,
+        `  process.stdout.write(JSON.stringify({ provider: "puppeteer", url: page.url(), text: text.slice(0, 30000), evalResult }));`,
+        `})().catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });`,
+    ].join("\n");
+    const here64 = Buffer.from(script, "utf8").toString("base64");
+    return `set -euo pipefail; printf %s "${here64}" | base64 -d > /tmp/browse.mjs && node /tmp/browse.mjs`;
 }
